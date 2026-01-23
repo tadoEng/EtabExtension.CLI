@@ -5,6 +5,50 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AssemblyName>etab-cli</AssemblyName>
+    <Description>A command-line tool for automating ETABS operations, designed to be called from a Rust Tauri backend application.</Description>
+
+    <!-- Enable Code Analysis -->
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisMode>Recommended</AnalysisMode>
+
+    <!-- Suppress specific warnings -->
+    <NoWarn>CA1852</NoWarn>
+    
+    <!-- Publishing Options for Tauri Integration -->
+    <!-- ⚠️ IMPORTANT: NativeAOT might not work with COM Interop (ETABS API) -->
+    <!-- If you get COM errors, disable PublishAot and use PublishTrimmed instead -->
+    <PublishAot>false</PublishAot>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- Optimization -->
+    <OptimizationPreference>Speed</OptimizationPreference>
+
+    <!-- Faster startup for single-file -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+
+    <!-- Keep debugging support for development -->
+    <DebuggerSupport Condition="'$(Configuration)' == 'Debug'">true</DebuggerSupport>
+    <DebuggerSupport Condition="'$(Configuration)' == 'Release'">false</DebuggerSupport>
+
+    <!-- Event Source Support -->
+    <EventSourceSupport>true</EventSourceSupport>
+
+   
+    
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
   </PropertyGroup>
 
   <ItemGroup>
