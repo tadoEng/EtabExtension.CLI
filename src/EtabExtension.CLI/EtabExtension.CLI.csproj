@@ -14,6 +14,8 @@
 
     <!-- Suppress specific warnings -->
     <NoWarn>CA1852</NoWarn>
+    <NoWarn>IDE0073</NoWarn>
+    <NoWarn>IDE0011</NoWarn>
     
     <!-- Publishing Options for Tauri Integration -->
     <!-- ⚠️ IMPORTANT: NativeAOT might not work with COM Interop (ETABS API) -->

@@ -1,5 +1,6 @@
 using EtabSharp.Core;
 using ETABSv1;
+using System.Runtime.Versioning;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsConnection;
 
@@ -17,6 +18,7 @@ public class EtabsConnection : IEtabsConnection
     /// Check if ETABS is installed (via COM registration)
     /// Does NOT require ETABS to be running
     /// </summary>
+    [SupportedOSPlatform("windows")]
     public async Task<bool> IsEtabsInstalledAsync()
     {
         await Task.CompletedTask;

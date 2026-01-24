@@ -1,4 +1,4 @@
-﻿using System.CommandLine;
+using System.CommandLine;
 using EtabExtension.CLI.Shared.Common;
 using Microsoft.Extensions.DependencyInjection;
 

@@ -1,4 +1,4 @@
-﻿using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsConnection;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsFileOperations;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.GenerateE2KFile;
@@ -45,7 +45,7 @@ public class GenerateE2KService : IGenerateE2KService
                     Messages = messages
                 };
 
-                return Result<GenerateE2KData>.Fail("Input file not found") with { Data = data };
+                return Result.Fail<GenerateE2KData>("Input file not found") with { Data = data };
             }
 
             messages.Add($"✓ Input file exists: {Path.GetFileName(inputFilePath)}");
@@ -65,7 +65,7 @@ public class GenerateE2KService : IGenerateE2KService
                     Messages = messages
                 };
 
-                return Result<GenerateE2KData>.Fail("Invalid input file type. Only .edb files can be converted to .e2k")
+                return Result.Fail<GenerateE2KData>("Invalid input file type. Only .edb files can be converted to .e2k")
                     with
                 { Data = data };
             }
@@ -100,7 +100,7 @@ public class GenerateE2KService : IGenerateE2KService
                     Messages = messages
                 };
 
-                return Result<GenerateE2KData>.Fail("Output file already exists") with { Data = data };
+                return Result.Fail<GenerateE2KData>("Output file already exists") with { Data = data };
             }
 
             if (outputExists)
@@ -130,7 +130,7 @@ public class GenerateE2KService : IGenerateE2KService
                         Messages = messages
                     };
 
-                    return Result<GenerateE2KData>.Fail("Failed to create output directory") with { Data = data };
+                    return Result.Fail<GenerateE2KData>("Failed to create output directory") with { Data = data };
                 }
             }
 
@@ -155,7 +155,7 @@ public class GenerateE2KService : IGenerateE2KService
                         Messages = messages
                     };
 
-                    return Result<GenerateE2KData>.Fail("Could not connect to ETABS") with { Data = data };
+                    return Result.Fail<GenerateE2KData>("Could not connect to ETABS") with { Data = data };
                 }
 
                 messages.Add("✓ Connected to ETABS");
@@ -196,7 +196,7 @@ public class GenerateE2KService : IGenerateE2KService
                     Messages = messages
                 };
 
-                return Result<GenerateE2KData>.Fail("E2K generation failed") with { Data = data };
+                return Result.Fail<GenerateE2KData>("E2K generation failed") with { Data = data };
             }
 
             messages.Add("✓ E2K file generated successfully");
@@ -221,11 +221,14 @@ public class GenerateE2KService : IGenerateE2KService
             if (isOriginalFileOpen && !isInputFileAlreadyOpen && originalOpenFilePath != inputFilePath)
             {
                 messages.Add($"ℹ Restoring previously open file: {Path.GetFileName(originalOpenFilePath)}");
-                var restoreResult = await _fileOperations.OpenModelAsync(originalOpenFilePath);
-
-                if (!restoreResult.Success)
+                if (originalOpenFilePath != null)
                 {
-                    messages.Add($"⚠ Warning: Could not restore original file. User may need to manually reopen: {originalOpenFilePath}");
+                    var restoreResult = await _fileOperations.OpenModelAsync(originalOpenFilePath);
+
+                    if (!restoreResult.Success)
+                    {
+                        messages.Add($"⚠ Warning: Could not restore original file. User may need to manually reopen: {originalOpenFilePath}");
+                    }
                 }
             }
 
@@ -261,7 +264,7 @@ public class GenerateE2KService : IGenerateE2KService
                 Messages = messages
             };
 
-            return Result<GenerateE2KData>.Fail($"E2K generation failed: {ex.Message}") with { Data = errorData };
+            return Result.Fail<GenerateE2KData>($"E2K generation failed: {ex.Message}") with { Data = errorData };
         }
     }
 

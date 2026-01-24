@@ -1,28 +1,27 @@
-﻿using System.CommandLine;
+using System.CommandLine;
 using EtabExtension.CLI.Features.GenerateE2K;
 using EtabExtension.CLI.Features.Validation;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using Microsoft.Extensions.Hosting;
 
+// 1. Send ALL Console.WriteLine logs to stderr
+Console.SetOut(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+
 var builder = Host.CreateApplicationBuilder(args);
 
-//Register shared infrastructure
 builder.Services.AddEtabsInfrastructure();
-
-//Register features
 builder.Services.AddValidationFeature();
 builder.Services.AddGenerateE2KFeature();
 
 var app = builder.Build();
 
-//Create root command
 var rootCommand = new RootCommand("EtabExtension.CLI - Etabs Automation CLI")
 {
-    Description = "A CLI tool for automating ETABS operations, designed to be called from a Rust Tauri backend application. All commands return JSON output."
+    Description = "CLI for ETABS automation. All commands return JSON on stdout."
 };
 
-// Add all feature commands
 rootCommand.Subcommands.Add(ValidateCommand.Create(app.Services));
 rootCommand.Subcommands.Add(GenerateE2KCommand.Create(app.Services));
 
+// 2. Just invoke normally — logs stay on stderr
 return await rootCommand.Parse(args).InvokeAsync();

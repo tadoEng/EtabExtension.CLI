@@ -1,4 +1,4 @@
-﻿using System.Text.Json.Serialization;
+using System.Text.Json.Serialization;
 
 namespace EtabExtension.CLI.Shared.Common;
 
@@ -24,5 +24,19 @@ public record Result
     }
 
     public static Result Ok() => new(true, null);
-    public static Result Fail(string error) => new(false, error);
+    public static Result Fail(string error)
+    {
+        return new Result(false, error);
+    }
+
+    // ---- Generic factories ----
+    public static Result<T> Ok<T>(T data)
+    {
+        return new(true, data, null);
+    }
+
+    public static Result<T> Fail<T>(string error)
+    {
+        return new(false, default, error);
+    }
 }

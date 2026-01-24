@@ -1,4 +1,4 @@
-﻿using EtabExtension.CLI.Features.Validation.Models;
+using EtabExtension.CLI.Features.Validation.Models;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsConnection;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsFileOperations;
@@ -42,7 +42,7 @@ public class ValidationService: IValidationService
                     ValidationMessages = messages
                 };
 
-                return Result<ValidationData>.Fail("ETABS installation not found or not running") with { Data = data };
+                return Result.Fail<ValidationData>("ETABS installation not found or not running") with { Data = data };
             }
 
             messages.Add("✓ ETABS is running");
@@ -80,7 +80,7 @@ public class ValidationService: IValidationService
                     ValidationMessages = messages
                 };
 
-                return Result<ValidationData>.Fail("File not found") with { Data = data };
+                return Result.Fail<ValidationData>("File not found") with { Data = data };
             }
 
             messages.Add($"✓ File exists: {Path.GetFileName(filePath)}");
@@ -105,7 +105,7 @@ public class ValidationService: IValidationService
                     ValidationMessages = messages
                 };
 
-                return Result<ValidationData>.Fail("Invalid file type") with { Data = data };
+                return Result.Fail<ValidationData>("Invalid file type") with { Data = data };
             }
 
             messages.Add($"✓ Valid ETABS file type: {fileExtension}");
@@ -143,7 +143,7 @@ public class ValidationService: IValidationService
                         ValidationMessages = messages
                     };
 
-                    return Result<ValidationData>.Fail("Could not open file for validation") with { Data = data };
+                    return Result.Fail<ValidationData>("Could not open file for validation") with { Data = data };
                 }
             }
             else
@@ -168,10 +168,13 @@ public class ValidationService: IValidationService
             if (isOriginalFileOpen && !isUserFileAlreadyOpen && originalOpenFilePath != filePath)
             {
                 messages.Add($"ℹ Restoring previously open file: {Path.GetFileName(originalOpenFilePath)}");
-                var restoreResult = await _fileOperations.OpenModelAsync(originalOpenFilePath);
-                if (!restoreResult.Success)
+                if (originalOpenFilePath != null)
                 {
-                    messages.Add($"⚠ Warning: Could not restore original file. User may need to manually reopen: {originalOpenFilePath}");
+                    var restoreResult = await _fileOperations.OpenModelAsync(originalOpenFilePath);
+                    if (!restoreResult.Success)
+                    {
+                        messages.Add($"⚠ Warning: Could not restore original file. User may need to manually reopen: {originalOpenFilePath}");
+                    }
                 }
             }
 
@@ -200,7 +203,7 @@ public class ValidationService: IValidationService
                 ValidationMessages = messages
             };
 
-            return Result<ValidationData>.Fail($"Validation failed: {ex.Message}") with { Data = errorData };
+            return Result.Fail<ValidationData>($"Validation failed: {ex.Message}") with { Data = errorData };
         }
     }
 }

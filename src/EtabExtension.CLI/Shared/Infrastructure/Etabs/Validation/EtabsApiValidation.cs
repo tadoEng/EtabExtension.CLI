@@ -1,4 +1,4 @@
-﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsConnection;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsConnection;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsFileOperations;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Validation;
@@ -41,7 +41,10 @@ public class EtabsApiValidation : IEtabsApiValidation
             if (!_connection.IsConnected)
             {
                 var connected = await _connection.TryConnectAsync();
-                if (!connected) return false;
+                if (!connected)
+                {
+                    return false;
+                }
             }
 
             var app = _connection.GetEtabsApp();
@@ -84,7 +87,10 @@ public class EtabsApiValidation : IEtabsApiValidation
             if (!_connection.IsConnected)
             {
                 var connected = await _connection.TryConnectAsync();
-                if (!connected) return false;
+                if (!connected)
+                {
+                    return false;
+                }
             }
 
             var app = _connection.GetEtabsApp();

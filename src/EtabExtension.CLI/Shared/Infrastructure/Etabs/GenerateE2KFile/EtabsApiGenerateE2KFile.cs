@@ -1,4 +1,4 @@
-﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsConnection;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsConnection;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsFileOperations;
 using EtabSharp.Core;
 using ETABSv1;
@@ -20,7 +20,7 @@ public class EtabsApiGenerateE2KFile : IEtabsApiGenerateE2KFile
         _fileOperations = fileOperations;
     }
 
-    public async Task<bool> GenerateE2KFileAsync(string edbFilePath, string e2kOutputPath)
+    public async Task<bool> GenerateE2KFileAsync(string edbFilePath, string e2KOutputPath)
     {
         await Task.CompletedTask;
 
@@ -30,7 +30,7 @@ public class EtabsApiGenerateE2KFile : IEtabsApiGenerateE2KFile
             if (!_connection.IsConnected)
             {
                 var connected = await _connection.TryConnectAsync();
-                if (!connected) return false;
+                if (!connected) {return false;}
             }
 
             var app = _connection.GetEtabsApp();
@@ -53,7 +53,7 @@ public class EtabsApiGenerateE2KFile : IEtabsApiGenerateE2KFile
             }
 
             // Ensure output directory exists
-            var outputDirectory = Path.GetDirectoryName(e2kOutputPath);
+            var outputDirectory = Path.GetDirectoryName(e2KOutputPath);
             if (!string.IsNullOrEmpty(outputDirectory) && !Directory.Exists(outputDirectory))
             {
                 Directory.CreateDirectory(outputDirectory);
@@ -61,10 +61,10 @@ public class EtabsApiGenerateE2KFile : IEtabsApiGenerateE2KFile
 
             // Export to .e2k format using TextFile type
             // According to ETABS API: eFileTypeIO.TextFile exports to .e2k format
-            int exportRet = app.Model.Files.ExportFile(e2kOutputPath, eFileTypeIO.TextFile);
+            int exportRet = app.Model.Files.ExportFile(e2KOutputPath, eFileTypeIO.TextFile);
 
             // Verify the file was created
-            if (exportRet == 0 && File.Exists(e2kOutputPath))
+            if (exportRet == 0 && File.Exists(e2KOutputPath))
             {
                 return true;
             }
