@@ -57,7 +57,15 @@
     <PackageReference Include="EtabSharp" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Parquet.Net" />
     <PackageReference Include="System.CommandLine" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="Features\ExtractMaterials\" />
+    <Folder Include="Features\ExtractResults\" />
+    <Folder Include="Features\RunAnalysis\" />
+    <Folder Include="Features\UnlockModel\" />
   </ItemGroup>
 
 </Project>

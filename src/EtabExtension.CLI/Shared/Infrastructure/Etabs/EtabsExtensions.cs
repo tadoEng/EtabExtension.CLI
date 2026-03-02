@@ -1,27 +1,17 @@
-﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs.ExportResults;
-using EtabExtension.CLI.Shared.Infrastructure.Etabs.Validation;
-using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsConnection;
-using EtabExtension.CLI.Shared.Infrastructure.Etabs.EtabsFileOperations;
-using EtabExtension.CLI.Shared.Infrastructure.Etabs.GenerateE2KFile;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs;
 
+/// <summary>
+/// Registers shared ETABS infrastructure.
+/// Individual features register their own services via their own Extensions classes.
+/// </summary>
 public static class EtabsExtensions
 {
     public static IServiceCollection AddEtabsInfrastructure(this IServiceCollection services)
     {
-        // Register core ETABS connection management
-        services.AddSingleton<IEtabsConnection, EtabsConnection.EtabsConnection>();
-        
-        // Register file operations
-        services.AddSingleton<IEtabsFileOperations, EtabsFileOperations.EtabsFileOperations>();
-        
-        // Register feature-specific implementations
-        services.AddScoped<IEtabsApiValidation, EtabsApiValidation>();
-        services.AddScoped<IEtabsApiGenerateE2KFile, EtabsApiGenerateE2KFile>();
-        services.AddScoped<IEtabsApiExportResults, EtabsApiExportResults>();
-        
+        // Nothing shared at infra level — each feature owns its own ETABS lifecycle.
+        // Mode A and Mode B instances are created per-command, not injected as singletons.
         return services;
     }
 }

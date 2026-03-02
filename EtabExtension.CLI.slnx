@@ -4,6 +4,7 @@
     <File Path="buid-sidecar.ps1" />
     <File Path="Directory.Build.props" />
     <File Path="Directory.Packages.props" />
+    <File Path="Sidecar.md" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/EtabExtension.CLI/EtabExtension.CLI.csproj" />

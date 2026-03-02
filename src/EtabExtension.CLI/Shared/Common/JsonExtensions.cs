@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace EtabExtension.CLI.Shared.Common;
@@ -14,38 +14,34 @@ public static class JsonExtensions
     };
 
     /// <summary>
-    /// Outputs a result as JSON to the console
+    /// Writes the result as JSON to REAL stdout (not the redirected stderr).
+    /// This is the only place that should write to stdout.
     /// </summary>
-    public static void WriteJsonToConsole<T>(this Result<T> result)
+    public static void WriteJsonToStdout<T>(this Result<T> result)
     {
-        var json = JsonSerializer.Serialize(result, DefaultOptions);
-        Console.WriteLine(json);
+        using var stdout = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+        stdout.WriteLine(JsonSerializer.Serialize(result, DefaultOptions));
+    }
+
+    public static void WriteJsonToStdout(this Result result)
+    {
+        using var stdout = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+        stdout.WriteLine(JsonSerializer.Serialize(result, DefaultOptions));
     }
 
     /// <summary>
-    /// Outputs a result as JSON to the console
-    /// </summary>
-    public static void WriteJsonToConsole(this Result result)
-    {
-        var json = JsonSerializer.Serialize(result, DefaultOptions);
-        Console.WriteLine(json);
-    }
-
-    /// <summary>
-    /// Exits the application with appropriate exit code based on result
+    /// Writes JSON to stdout and returns the appropriate exit code (0=success, 1=failure).
+    /// The only place Environment.Exit() should be called.
     /// </summary>
     public static int ExitWithResult<T>(this Result<T> result)
     {
-        result.WriteJsonToConsole();
+        result.WriteJsonToStdout();
         return result.Success ? 0 : 1;
     }
 
-    /// <summary>
-    /// Exits the application with appropriate exit code based on result
-    /// </summary>
     public static int ExitWithResult(this Result result)
     {
-        result.WriteJsonToConsole();
+        result.WriteJsonToStdout();
         return result.Success ? 0 : 1;
     }
 }
