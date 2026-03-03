@@ -4,6 +4,7 @@
 using System.Diagnostics;
 using EtabExtension.CLI.Features.ExtractMaterials.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using EtabSharp.Core;
 using EtabSharp.System.Models;
@@ -44,12 +45,14 @@ public class ExtractMaterialsService : IExtractMaterialsService
             if (openRet != 0)
                 return Result.Fail<ExtractMaterialsData>($"OpenFile failed (ret={openRet})");
 
-            // Set units to US kip/ft/F — same as demo script — so values are predictable
-            // This is safe: we're in a hidden instance with no user session
-            app.Model.Units.SetPresentUnits(Units.US_Kip_Ft);
-            Console.Error.WriteLine("ℹ Units set to US kip/ft/F");
+            // ── Unit normalisation ────────────────────────────────────────────
+            // Read original units, switch to US kip/ft/F for consistent extraction.
+            // Snapshot is stored in the result so Rust knows what units the values are in.
+            var unitService = new EtabsUnitService(app);
+            var unitSnapshot = await unitService.ReadAndNormaliseAsync(EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit.Units.US_Kip_Ft);
+            Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
 
-            // ── Pull table via DatabaseTables API — mirrors demo script exactly ──
+            // ── Table extraction — mirrors demo script exactly ─────────────────
             Console.Error.WriteLine($"ℹ Fetching table: '{tableKey}'");
             var tableResult = app.Model.DatabaseTables.GetTableForDisplayArray(tableKey);
 
@@ -60,37 +63,29 @@ public class ExtractMaterialsService : IExtractMaterialsService
 
             List<string> fields = tableResult.FieldKeysIncluded;
             List<string> flatData = tableResult.TableData;
-
             int columnCount = fields.Count;
+
             if (columnCount == 0)
                 return Result.Fail<ExtractMaterialsData>(
-                    $"Table '{tableKey}' returned no fields. Is the model analyzed?");
+                    $"Table '{tableKey}' returned no fields.");
 
             int rowCount = flatData.Count / columnCount;
-
             Console.Error.WriteLine(
-                $"ℹ Table '{tableKey}': {rowCount} rows × {columnCount} cols " +
-                $"[{string.Join(", ", fields)}]");
+                $"ℹ Table: {rowCount} rows × {columnCount} cols [{string.Join(", ", fields)}]");
 
-            // Preview first rows to stderr — same as demo script PrintTableSummary
-            int previewCount = Math.Min(3, rowCount);
-            for (int r = 0; r < previewCount; r++)
-            {
-                var pairs = fields.Select((f, c) => $"{f}={flatData[r * columnCount + c]}");
-                Console.Error.WriteLine($"  Row {r + 1}: {string.Join(" | ", pairs)}");
-            }
+            // Preview rows to stderr — same as demo script
+            foreach (var (r, preview) in Enumerable.Range(0, Math.Min(3, rowCount))
+                .Select(r => (r, fields.Select((f, c) => $"{f}={flatData[r * columnCount + c]}"))))
+                Console.Error.WriteLine($"  Row {r + 1}: {string.Join(" | ", preview)}");
 
-            // ── Write parquet via shared service ──────────────────────────────
-            Console.Error.WriteLine($"ℹ Writing parquet: {outputPath}");
+            // ── Write parquet ─────────────────────────────────────────────────
             var writeResult = await _parquet.WriteAsync(outputPath, fields, flatData);
-
             if (!writeResult.Success)
-                return Result.Fail<ExtractMaterialsData>(
-                    $"Parquet write failed: {writeResult.Error}");
+                return Result.Fail<ExtractMaterialsData>($"Parquet write failed: {writeResult.Error}");
 
             stopwatch.Stop();
             Console.Error.WriteLine(
-                $"✓ Wrote {writeResult.RowCount} rows ({stopwatch.ElapsedMilliseconds} ms)");
+                $"✓ {writeResult.RowCount} rows → {outputPath} ({stopwatch.ElapsedMilliseconds} ms)");
 
             return Result.Ok(new ExtractMaterialsData
             {
@@ -98,6 +93,7 @@ public class ExtractMaterialsService : IExtractMaterialsService
                 OutputFile = outputPath,
                 TableKey = tableKey,
                 RowCount = writeResult.RowCount,
+                Units = unitSnapshot.Active,   // tells Rust: values are in these units
                 ExtractionTimeMs = stopwatch.ElapsedMilliseconds
             });
         }
