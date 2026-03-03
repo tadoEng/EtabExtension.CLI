@@ -27,4 +27,11 @@ public record GetStatusData
 
     [JsonPropertyName("isAnalyzed")]
     public bool? IsAnalyzed { get; init; }
+
+    /// <summary>
+    /// Present unit system. Tells Rust what units all extracted table values are in.
+    /// Null when ETABS is not running or no model is open.
+    /// </summary>
+    [JsonPropertyName("unitSystem")]
+    public UnitSystemInfo? UnitSystem { get; init; }
 }

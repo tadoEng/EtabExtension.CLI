@@ -13,6 +13,10 @@ public record ExtractMaterialsData
     [JsonPropertyName("outputFile")]
     public string OutputFile { get; init; } = string.Empty;
 
+    /// <summary>ETABS database table key that was extracted.</summary>
+    [JsonPropertyName("tableKey")]
+    public string TableKey { get; init; } = string.Empty;
+
     [JsonPropertyName("rowCount")]
     public int RowCount { get; init; }
 

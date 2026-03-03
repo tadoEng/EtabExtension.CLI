@@ -10,12 +10,15 @@ namespace EtabExtension.CLI.Features.RunAnalysis;
 
 public class RunAnalysisService : IRunAnalysisService
 {
-    public async Task<Result<RunAnalysisData>> RunAnalysisAsync(string filePath)
+    public async Task<Result<RunAnalysisData>> RunAnalysisAsync(
+        string filePath, List<string>? cases)
     {
         await Task.CompletedTask;
 
         if (!File.Exists(filePath))
             return Result.Fail<RunAnalysisData>($"File not found: {filePath}");
+
+        var hasSpecificCases = cases is { Count: > 0 };
 
         ETABSApplication? app = null;
         var stopwatch = Stopwatch.StartNew();
@@ -34,31 +37,87 @@ public class RunAnalysisService : IRunAnalysisService
             if (openRet != 0)
                 return Result.Fail<RunAnalysisData>($"OpenFile failed (ret={openRet})");
 
-            // Unlock if locked from previous analysis
             if (app.Model.ModelInfo.IsLocked())
             {
                 Console.Error.WriteLine("ℹ Clearing analysis lock...");
                 app.Model.ModelInfo.SetLocked(false);
             }
 
-            Console.Error.WriteLine("ℹ Running analysis (this may take several minutes)...");
-            // RunCompleteAnalysis = SetAllCasesToRun + CreateAnalysisModel + RunAnalysis
-            int loadcase = app.Model.Analyze.SetAllCasesToRun();
+            // ── Case selection ────────────────────────────────────────────────
+            if (hasSpecificCases)
+            {
+                // Step 1: skip all cases first
+                app.Model.Analyze.SetRunCaseFlag(caseName: "", run: false, all: true);
+                Console.Error.WriteLine("ℹ Set all cases to skip");
 
-            int analysisRet = app.Model.Analyze.RunCompleteAnalysis();
+                // Step 2: enable only the requested cases
+                var notFound = new List<string>();
+                foreach (var caseName in cases!)
+                {
+                    try
+                    {
+                        app.Model.Analyze.SetRunCaseFlag(caseName: caseName, run: true, all: false);
+                        Console.Error.WriteLine($"  ✓ Set case '{caseName}' to run");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"  ⚠ Case '{caseName}' not found or failed: {ex.Message}");
+                        notFound.Add(caseName);
+                    }
+                }
+
+                if (notFound.Count == cases!.Count)
+                    return Result.Fail<RunAnalysisData>(
+                        $"None of the requested cases were found: {string.Join(", ", notFound)}");
+
+                if (notFound.Count > 0)
+                    Console.Error.WriteLine(
+                        $"⚠ {notFound.Count} case(s) not found: {string.Join(", ", notFound)}");
+            }
+            else
+            {
+                // Default: run all cases (what RunCompleteAnalysis does internally)
+                Console.Error.WriteLine("ℹ Running all cases (default)");
+            }
+
+            // ── Analysis ──────────────────────────────────────────────────────
+            Console.Error.WriteLine("ℹ Running analysis (this may take several minutes)...");
+
+            // RunCompleteAnalysis = SetAllCasesToRun + CreateAnalysisModel + RunAnalysis
+            // When we set specific cases above, we call CreateAnalysisModel + RunAnalysis directly
+            // to avoid RunCompleteAnalysis resetting our case flags.
+            int analysisRet;
+            if (hasSpecificCases)
+            {
+                app.SapModel.Analyze.CreateAnalysisModel();
+                analysisRet = app.SapModel.Analyze.RunAnalysis();
+            }
+            else
+            {
+                analysisRet = app.Model.Analyze.RunCompleteAnalysis();
+            }
+
             stopwatch.Stop();
 
             if (analysisRet != 0)
-                return Result.Fail<RunAnalysisData>($"RunCompleteAnalysis failed (ret={analysisRet})")
+                return Result.Fail<RunAnalysisData>(
+                    $"Analysis failed (ret={analysisRet})")
                     with
-                { Data = new RunAnalysisData { FilePath = filePath, AnalysisTimeMs = stopwatch.ElapsedMilliseconds } };
+                {
+                    Data = new RunAnalysisData
+                    {
+                        FilePath = filePath,
+                        CasesRequested = hasSpecificCases ? cases : null,
+                        AnalysisTimeMs = stopwatch.ElapsedMilliseconds
+                    }
+                };
 
             Console.Error.WriteLine($"✓ Analysis complete ({FormatDuration(stopwatch.Elapsed)})");
 
             var caseStatuses = app.Model.Analyze.GetCaseStatus();
             var finishedCount = caseStatuses.Count(cs => cs.IsFinished);
 
-            // Critical: save so results persist in .edb when hidden instance exits
+            // Save results back into .edb — critical for extract-results to work
             Console.Error.WriteLine("ℹ Saving results into .edb...");
             int saveRet = app.Model.Files.SaveFile(filePath);
             if (saveRet != 0)
@@ -69,6 +128,7 @@ public class RunAnalysisService : IRunAnalysisService
             return Result.Ok(new RunAnalysisData
             {
                 FilePath = filePath,
+                CasesRequested = hasSpecificCases ? cases : null,
                 CaseCount = caseStatuses.Count,
                 FinishedCaseCount = finishedCount,
                 AnalysisTimeMs = stopwatch.ElapsedMilliseconds

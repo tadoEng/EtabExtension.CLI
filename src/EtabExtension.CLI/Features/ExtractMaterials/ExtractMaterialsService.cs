@@ -4,25 +4,28 @@
 using System.Diagnostics;
 using EtabExtension.CLI.Features.ExtractMaterials.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using EtabSharp.Core;
-using Parquet;
-using Parquet.Data;
-using Parquet.Schema;
+using EtabSharp.System.Models;
 
 namespace EtabExtension.CLI.Features.ExtractMaterials;
 
 public class ExtractMaterialsService : IExtractMaterialsService
 {
+    private readonly IParquetService _parquet;
+
+    public ExtractMaterialsService(IParquetService parquet)
+    {
+        _parquet = parquet;
+    }
+
     public async Task<Result<ExtractMaterialsData>> ExtractMaterialsAsync(
         string filePath,
-        string outputPath)
+        string outputPath,
+        string tableKey = "Material List by Story")
     {
         if (!File.Exists(filePath))
             return Result.Fail<ExtractMaterialsData>($"File not found: {filePath}");
-
-        var outputDir = Path.GetDirectoryName(outputPath);
-        if (!string.IsNullOrEmpty(outputDir))
-            Directory.CreateDirectory(outputDir);
 
         ETABSApplication? app = null;
         var stopwatch = Stopwatch.StartNew();
@@ -41,29 +44,60 @@ public class ExtractMaterialsService : IExtractMaterialsService
             if (openRet != 0)
                 return Result.Fail<ExtractMaterialsData>($"OpenFile failed (ret={openRet})");
 
-            Console.Error.WriteLine("ℹ Extracting material takeoff...");
-            int numItems = 0;
-            string[] storyName = [], matProp = [], matType = [];
-            double[] dryWeight = [], volume = [];
+            // Set units to US kip/ft/F — same as demo script — so values are predictable
+            // This is safe: we're in a hidden instance with no user session
+            app.Model.Units.SetPresentUnits(Units.US_Kip_Ft);
+            Console.Error.WriteLine("ℹ Units set to US kip/ft/F");
 
-            int ret = app.SapModel.Results.MaterialTakeoff(
-                ref numItems, ref storyName, ref matProp,
-                ref matType, ref dryWeight, ref volume);
+            // ── Pull table via DatabaseTables API — mirrors demo script exactly ──
+            Console.Error.WriteLine($"ℹ Fetching table: '{tableKey}'");
+            var tableResult = app.Model.DatabaseTables.GetTableForDisplayArray(tableKey);
 
-            if (ret != 0)
-                return Result.Fail<ExtractMaterialsData>($"MaterialTakeoff failed (ret={ret}). Model may not be analyzed.");
+            if (!tableResult.IsSuccess)
+                return Result.Fail<ExtractMaterialsData>(
+                    $"Failed to load table '{tableKey}': " +
+                    $"ret={tableResult.ReturnCode}, error='{tableResult.ErrorMessage}'");
 
-            Console.Error.WriteLine($"ℹ Writing {numItems} rows to parquet...");
-            await WriteParquetAsync(outputPath, numItems, storyName, matProp, matType, volume, dryWeight);
+            List<string> fields = tableResult.FieldKeysIncluded;
+            List<string> flatData = tableResult.TableData;
+
+            int columnCount = fields.Count;
+            if (columnCount == 0)
+                return Result.Fail<ExtractMaterialsData>(
+                    $"Table '{tableKey}' returned no fields. Is the model analyzed?");
+
+            int rowCount = flatData.Count / columnCount;
+
+            Console.Error.WriteLine(
+                $"ℹ Table '{tableKey}': {rowCount} rows × {columnCount} cols " +
+                $"[{string.Join(", ", fields)}]");
+
+            // Preview first rows to stderr — same as demo script PrintTableSummary
+            int previewCount = Math.Min(3, rowCount);
+            for (int r = 0; r < previewCount; r++)
+            {
+                var pairs = fields.Select((f, c) => $"{f}={flatData[r * columnCount + c]}");
+                Console.Error.WriteLine($"  Row {r + 1}: {string.Join(" | ", pairs)}");
+            }
+
+            // ── Write parquet via shared service ──────────────────────────────
+            Console.Error.WriteLine($"ℹ Writing parquet: {outputPath}");
+            var writeResult = await _parquet.WriteAsync(outputPath, fields, flatData);
+
+            if (!writeResult.Success)
+                return Result.Fail<ExtractMaterialsData>(
+                    $"Parquet write failed: {writeResult.Error}");
 
             stopwatch.Stop();
-            Console.Error.WriteLine($"✓ Wrote {numItems} rows ({stopwatch.ElapsedMilliseconds} ms)");
+            Console.Error.WriteLine(
+                $"✓ Wrote {writeResult.RowCount} rows ({stopwatch.ElapsedMilliseconds} ms)");
 
             return Result.Ok(new ExtractMaterialsData
             {
                 FilePath = filePath,
                 OutputFile = outputPath,
-                RowCount = numItems,
+                TableKey = tableKey,
+                RowCount = writeResult.RowCount,
                 ExtractionTimeMs = stopwatch.ElapsedMilliseconds
             });
         }
@@ -76,33 +110,5 @@ public class ExtractMaterialsService : IExtractMaterialsService
             app?.Application.ApplicationExit(false);
             app?.Dispose();
         }
-    }
-
-    private static async Task WriteParquetAsync(
-        string outputPath,
-        int numItems,
-        string[] storyName,
-        string[] matProp,
-        string[] matType,
-        double[] volume,
-        double[] dryWeight)
-    {
-        var schema = new ParquetSchema(
-            new DataField<string>("storyName"),
-            new DataField<string>("materialName"),
-            new DataField<string>("materialType"),
-            new DataField<double>("volumeM3"),
-            new DataField<double>("massKg")
-        );
-
-        await using var stream = File.Create(outputPath);
-        await using var writer = await ParquetWriter.CreateAsync(schema, stream);
-        await using var group = writer.CreateRowGroup();
-
-        await group.WriteColumnAsync(new DataColumn(schema.DataFields[0], storyName[..numItems]));
-        await group.WriteColumnAsync(new DataColumn(schema.DataFields[1], matProp[..numItems]));
-        await group.WriteColumnAsync(new DataColumn(schema.DataFields[2], matType[..numItems]));
-        await group.WriteColumnAsync(new DataColumn(schema.DataFields[3], volume[..numItems]));
-        await group.WriteColumnAsync(new DataColumn(schema.DataFields[4], dryWeight[..numItems]));
     }
 }

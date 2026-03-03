@@ -15,4 +15,8 @@ public record OpenModelData
 
     [JsonPropertyName("pid")]
     public int? Pid { get; init; }
+
+    /// <summary>True when the file was opened in a new hidden ETABS instance (Mode B path).</summary>
+    [JsonPropertyName("openedInNewInstance")]
+    public bool OpenedInNewInstance { get; init; }
 }

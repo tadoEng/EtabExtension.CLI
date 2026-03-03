@@ -1,3 +1,4 @@
+using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs;
@@ -12,6 +13,10 @@ public static class EtabsExtensions
     {
         // Nothing shared at infra level — each feature owns its own ETABS lifecycle.
         // Mode A and Mode B instances are created per-command, not injected as singletons.
+
+        // Shared parquet writer — singleton is fine, it is stateless
+        services.AddSingleton<IParquetService, ParquetService>();
+
         return services;
     }
 }

@@ -9,9 +9,13 @@ namespace EtabExtension.CLI.Features.RunAnalysis;
 public interface IRunAnalysisService
 {
     /// <summary>
-    /// Runs complete analysis on a snapshot .edb using a hidden ETABS instance (Mode B).
-    /// Saves results back into the .edb before exiting so they persist.
-    /// Never attaches to the user's running ETABS.
+    /// Runs analysis on a snapshot .edb using a hidden ETABS instance (Mode B).
+    /// Saves results back into the .edb before exit so they persist.
     /// </summary>
-    Task<Result<RunAnalysisData>> RunAnalysisAsync(string filePath);
+    /// <param name="filePath">Path to the .edb file.</param>
+    /// <param name="cases">
+    /// Specific load case names to run. When null or empty, all cases are run (default).
+    /// Internally: SetRunCaseFlag(all=true, run=false) first, then per-case SetRunCaseFlag(run=true).
+    /// </param>
+    Task<Result<RunAnalysisData>> RunAnalysisAsync(string filePath, List<string>? cases);
 }
