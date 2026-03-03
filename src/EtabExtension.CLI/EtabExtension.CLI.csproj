@@ -62,10 +62,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Folder Include="Features\ExtractMaterials\" />
     <Folder Include="Features\ExtractResults\" />
-    <Folder Include="Features\RunAnalysis\" />
-    <Folder Include="Features\UnlockModel\" />
   </ItemGroup>
 
 </Project>

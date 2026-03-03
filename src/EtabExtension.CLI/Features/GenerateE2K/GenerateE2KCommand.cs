@@ -8,52 +8,36 @@ public static class GenerateE2KCommand
 {
     public static Command Create(IServiceProvider services)
     {
-        var command = new Command(
-            "generate-e2k",
-            "Convert ETABS .edb file to .e2k text format"
-        );
+        var command = new Command("generate-e2k", "Export .edb to .e2k text format using a hidden ETABS instance");
 
-        var inputFileOption = new Option<string>(name: "--file")
-        {
-            Description = "Path to input ETABS file (.edb)",
-            Required = true
-        };
-        inputFileOption.Aliases.Add("-f");
+        var fileOption = new Option<string>("--file") { Description = "Path to input .edb file", Required = true };
+        fileOption.Aliases.Add("-f");
 
-        var outputFileOption = new Option<string?>(name: "--output")
-        {
-            Description = "Path for output .e2k file (optional, defaults to same directory as input)",
-            Required = false
-        };
-        outputFileOption.Aliases.Add("-o");
+        var outputOption = new Option<string?>("--output") { Description = "Path for output .e2k (default: same dir as input)" };
+        outputOption.Aliases.Add("-o");
 
-        var overwriteOption = new Option<bool>(name: "--overwrite")
-        {
-            Description = "Overwrite output file if it already exists",
-            Required = false
-        };
-        overwriteOption.Aliases.Add("--force");
+        var overwriteOption = new Option<bool>("--overwrite") { Description = "Overwrite output if it already exists" };
 
-        command.Options.Add(inputFileOption);
-        command.Options.Add(outputFileOption);
+        command.Options.Add(fileOption);
+        command.Options.Add(outputOption);
         command.Options.Add(overwriteOption);
 
         command.SetAction(async parseResult =>
         {
-            var inputFile = parseResult.GetValue(inputFileOption);
-            var outputFile = parseResult.GetValue(outputFileOption);
+            var inputFile = parseResult.GetValue(fileOption)!;
+            var outputFile = parseResult.GetValue(outputOption);
             var overwrite = parseResult.GetValue(overwriteOption);
 
-            if (string.IsNullOrEmpty(inputFile))
+            // Default output: same dir as input, .e2k extension
+            if (string.IsNullOrEmpty(outputFile))
             {
-                Console.WriteLine("Error: --file option is required");
-                Environment.Exit(1);
-                return;
+                outputFile = Path.Combine(
+                    Path.GetDirectoryName(inputFile) ?? ".",
+                    Path.GetFileNameWithoutExtension(inputFile) + ".e2k");
             }
 
             var service = services.GetRequiredService<IGenerateE2KService>();
             var result = await service.GenerateE2KAsync(inputFile, outputFile, overwrite);
-
             Environment.Exit(result.ExitWithResult());
         });
 

@@ -1,4 +1,3 @@
-﻿using EtabExtension.CLI.Features.Validation;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EtabExtension.CLI.Features.GenerateE2K;

@@ -1,4 +1,4 @@
-﻿using System.Text.Json.Serialization;
+using System.Text.Json.Serialization;
 
 namespace EtabExtension.CLI.Features.GenerateE2K.Models;
 
@@ -8,26 +8,11 @@ public record GenerateE2KData
     public string InputFile { get; init; } = string.Empty;
 
     [JsonPropertyName("outputFile")]
-    public string? OutputFile { get; init; }
-
-    [JsonPropertyName("fileExists")]
-    public bool FileExists { get; init; }
-
-    [JsonPropertyName("fileExtension")]
-    public string? FileExtension { get; init; }
-
-    [JsonPropertyName("outputExists")]
-    public bool? OutputExists { get; init; }
-
-    [JsonPropertyName("generationSuccessful")]
-    public bool? GenerationSuccessful { get; init; }
+    public string OutputFile { get; init; } = string.Empty;
 
     [JsonPropertyName("fileSizeBytes")]
-    public long? FileSizeBytes { get; init; }
+    public long FileSizeBytes { get; init; }
 
     [JsonPropertyName("generationTimeMs")]
-    public long? GenerationTimeMs { get; init; }
-
-    [JsonPropertyName("messages")]
-    public List<string> Messages { get; init; } = new();
+    public long GenerationTimeMs { get; init; }
 }
