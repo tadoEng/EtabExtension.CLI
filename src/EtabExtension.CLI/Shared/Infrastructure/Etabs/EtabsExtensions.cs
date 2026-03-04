@@ -1,3 +1,4 @@
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -16,6 +17,11 @@ public static class EtabsExtensions
 
         // Shared parquet writer — singleton is fine, it is stateless
         services.AddSingleton<IParquetService, ParquetService>();
+
+        // Factory for EtabsTableQueryService / EtabsTableEditingService.
+        // Feature services inject IEtabsTableServicesFactory and call
+        // factory.Create*(app) after they have opened the model.
+        services.AddEtabsTableServices();
 
         return services;
     }

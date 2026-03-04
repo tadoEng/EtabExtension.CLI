@@ -41,7 +41,7 @@ public class RunAnalysisService : IRunAnalysisService
 
             // ── Unit normalisation ────────────────────────────────────────────
             var unitService = new EtabsUnitService(app);
-            var unitSnapshot = await unitService.ReadAndNormaliseAsync(Units.US_Kip_Ft);
+            var unitSnapshot = await unitService.ReadAndNormaliseAsync(EtabSharp.System.Models.Units.US_Kip_Ft);
             Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
 
             if (app.Model.ModelInfo.IsLocked())

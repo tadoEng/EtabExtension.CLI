@@ -1,6 +1,6 @@
 <Project>
   <ItemGroup>
-    <PackageVersion Include="EtabSharp" Version="0.3.0-beta" />
+    <PackageVersion Include="EtabSharp" Version="0.3.1-beta" />
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.1" />
     <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.1" />
     <PackageVersion Include="Parquet.Net" Version="5.5.0" />
