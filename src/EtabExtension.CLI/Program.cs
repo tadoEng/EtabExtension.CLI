@@ -1,7 +1,7 @@
 using System.CommandLine;
 using EtabExtension.CLI.Features.CloseModel;
 using EtabExtension.CLI.Features.ExtractMaterials;
-//using EtabExtension.CLI.Features.ExtractResults;
+using EtabExtension.CLI.Features.ExtractResults;
 using EtabExtension.CLI.Features.GenerateE2K;
 using EtabExtension.CLI.Features.GetStatus;
 using EtabExtension.CLI.Features.OpenModel;
@@ -24,9 +24,8 @@ builder.Services
     .AddUnlockModelFeature()
     .AddGenerateE2KFeature()
     .AddExtractMaterialsFeature()
-    .AddRunAnalysisFeature();
-//.AddExtractResultsFeature();
-// TODO: ExtractResults is currently being build based on the new api
+    .AddRunAnalysisFeature()
+    .AddExtractResultsFeature();
 
 var app = builder.Build();
 
@@ -42,6 +41,6 @@ rootCommand.Subcommands.Add(UnlockModelCommand.Create(app.Services));
 rootCommand.Subcommands.Add(GenerateE2KCommand.Create(app.Services));
 rootCommand.Subcommands.Add(ExtractMaterialsCommand.Create(app.Services));
 rootCommand.Subcommands.Add(RunAnalysisCommand.Create(app.Services));
-//rootCommand.Subcommands.Add(ExtractResultsCommand.Create(app.Services));
+rootCommand.Subcommands.Add(ExtractResultsCommand.Create(app.Services));
 
 return await rootCommand.Parse(args).InvokeAsync();

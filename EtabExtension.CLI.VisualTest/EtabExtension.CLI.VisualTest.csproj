@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\src\EtabExtension.CLI\**\*.cs" Exclude="..\src\EtabExtension.CLI\obj\**\*.cs;..\src\EtabExtension.CLI\Program.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.Logging" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" />
+    <PackageReference Include="EtabSharp" />
+    <PackageReference Include="Parquet.Net" />
+    <PackageReference Include="System.CommandLine" />
+  </ItemGroup>
+
+</Project>

@@ -62,7 +62,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Folder Include="Features\ExtractResults\" />
     <Folder Include="Features\RunAnalysis\" />
     <Folder Include="Features\UnlockModel\" />
     <Folder Include="Features\UnlockModel\" />

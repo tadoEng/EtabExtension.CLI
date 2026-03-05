@@ -9,4 +9,7 @@
   <Folder Name="/src/">
     <Project Path="src/EtabExtension.CLI/EtabExtension.CLI.csproj" />
   </Folder>
+  <Folder Name="/Test/">
+    <Project Path="EtabExtension.CLI.VisualTest/EtabExtension.CLI.VisualTest.csproj" Id="0e474140-e006-45f8-8772-d0634eb37cbc" />
+  </Folder>
 </Solution>

@@ -61,7 +61,10 @@ public class ExtractMaterialsService : IExtractMaterialsService
 
             // ── Unit normalisation ────────────────────────────────────────────
             var unitService = new EtabsUnitService(app);
+
+            //TODO: consider allowing the caller to specify the desired normalised units in the request, rather than hardcoding US_Kip_Ft here.
             var unitSnapshot = await unitService.ReadAndNormaliseAsync(EtabSharp.System.Models.Units.US_Kip_Ft);
+
             Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
 
             // ── Table extraction via query service ────────────────────────────
