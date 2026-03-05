@@ -71,6 +71,7 @@ static class C
     public const string White = "\x1b[38;2;230;220;200m";
     public const string Faint = "\x1b[38;2;100;90;70m";
     public const string BgSel = "\x1b[48;2;60;35;0m";
+    public const string Yellow = "\x1b[38;2;255;220;60m";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -258,28 +259,36 @@ static class Tui
 
         var rows = new[]
         {
-            (Key: "storyDefinitions",              Label: "Story Definitions",               On: true),
-            (Key: "baseReactions",                 Label: "Base Reactions",                  On: true),
-            (Key: "storyForces",                   Label: "Story Forces",                    On: true),
-            (Key: "jointDrifts",                   Label: "Joint Drifts",                    On: true),
-            (Key: "pierForces",                    Label: "Pier Forces",                     On: true),
-            (Key: "pierSectionProperties",         Label: "Pier Section Properties",         On: true),
-            (Key: "modalParticipatingMassRatios",  Label: "Modal Participating Mass Ratios", On: true),
+            (Key: "storyDefinitions",             Label: "Story Definitions",               On: true,  HasLoadCases: false, HasLoadCombos: false, HasGroups: false, IsModalOnly: false),
+            (Key: "baseReactions",                Label: "Base Reactions",                  On: true,  HasLoadCases: true,  HasLoadCombos: true,  HasGroups: false, IsModalOnly: false),
+            (Key: "storyForces",                  Label: "Story Forces",                    On: true,  HasLoadCases: true,  HasLoadCombos: true,  HasGroups: false, IsModalOnly: false),
+            (Key: "jointDrifts",                  Label: "Joint Drifts",                    On: true,  HasLoadCases: true,  HasLoadCombos: true,  HasGroups: true,  IsModalOnly: false),
+            (Key: "pierForces",                   Label: "Pier Forces",                     On: true,  HasLoadCases: true,  HasLoadCombos: true,  HasGroups: true,  IsModalOnly: false),
+            (Key: "pierSectionProperties",        Label: "Pier Section Properties",         On: true,  HasLoadCases: false, HasLoadCombos: false, HasGroups: true,  IsModalOnly: false),
+            (Key: "modalParticipatingMassRatios", Label: "Modal Participating Mass Ratios", On: true,  HasLoadCases: false, HasLoadCombos: false, HasGroups: false, IsModalOnly: true),
         };
         var on = rows.Select(r => r.On).ToArray();
         int cur = 0, top = Console.CursorTop;
 
+        // Reserve lines so the picker redraws in-place without stacking
+        for (int i = 0; i < rows.Length; i++) Console.WriteLine();
+
         while (true)
         {
-            Console.SetCursorPosition(0, top);
             for (int i = 0; i < rows.Length; i++)
             {
+                Console.SetCursorPosition(0, top + i);
                 var chk = on[i] ? $"{C.Green}[✓]{C.Reset}" : $"{C.Dim}[ ]{C.Reset}";
+                var badge = rows[i].IsModalOnly ? $"  {C.Faint}[modal]{C.Reset}"
+                          : !rows[i].HasLoadCases && !rows[i].HasLoadCombos ? $"  {C.Faint}[geom]{C.Reset} "
+                          : string.Empty;
                 var lbl = i == cur
-                    ? $"{C.BgSel}{C.Gold} {rows[i].Label,-30}{C.Reset}"
-                    : $"{C.White} {rows[i].Label,-30}{C.Reset}";
-                Ln($"   {chk} {lbl}");
+                    ? $"{C.BgSel}{C.Gold} {rows[i].Label,-34}{C.Reset}"
+                    : $"{C.White} {rows[i].Label,-34}{C.Reset}";
+                Console.Write($"\x1b[2K   {chk} {lbl}{badge}");
             }
+            Console.SetCursorPosition(0, top + rows.Length);
+
             var k = Console.ReadKey(true);
             if (k.Key == ConsoleKey.UpArrow) cur = (cur - 1 + rows.Length) % rows.Length;
             else if (k.Key == ConsoleKey.DownArrow) cur = (cur + 1) % rows.Length;
@@ -287,18 +296,12 @@ static class Tui
             else if (k.Key is ConsoleKey.Enter or ConsoleKey.Escape) break;
         }
 
+        Console.SetCursorPosition(0, top + rows.Length);
         Ln();
 
         // ── Per-table filter prompts ──────────────────────────────────────────
-        // LOAD SELECTION RULES (matches TableFilter contract):
-        //   blank input  → wildcard ["*"] → select ALL from model
-        //   "X,Y"        → select exactly those names
-        //   geometry tables (storyDefinitions, pierSectionProperties)
-        //                → no load prompt, LoadCases/LoadCombos stay null
-        //
-        // null  = nothing selected  (geometry tables — no load dependency)
-        // ["*"] = select ALL        (user pressed Enter with blank input)
-        // ["X"] = select exactly X  (user typed a name)
+        Ln($"  {C.Faint}Load filter: blank = null (skip)  ·  * = ALL  ·  X,Y = specific names{C.Reset}");
+        Ln($"  {C.Faint}\"Modal\" case is always ignored (ETABS internal pseudo-case).{C.Reset}\n");
 
         var selections = new TableSelections();
 
@@ -306,8 +309,9 @@ static class Tui
         {
             if (!on[i]) continue;
 
-            var key = rows[i].Key;
-            var label = rows[i].Label;
+            var row = rows[i];
+            var key = row.Key;
+            var label = row.Label;
 
             Ln($" {C.Amber}▸ {label}{C.Reset}");
 
@@ -315,25 +319,27 @@ static class Tui
             string[]? combos = null;
             string[]? groups = null;
 
-            // Results tables: prompt for load cases
-            if (key is "baseReactions" or "storyForces" or "jointDrifts")
+            if (row.IsModalOnly)
             {
-                cases = AskLoadFilter("  Load cases (comma-sep, blank = all)");
+                Ln($"   {C.Faint}(modal — no load filter){C.Reset}");
+            }
+            else
+            {
+                if (row.HasLoadCases)
+                    cases = AskLoadFilter("  Load cases");
+
+                if (row.HasLoadCombos)
+                    combos = AskLoadFilter("  Load combos");
             }
 
-            // Results tables: prompt for load combos
-            if (key is "baseReactions" or "storyForces" or "pierForces")
-            {
-                combos = AskLoadFilter("  Load combos (comma-sep, blank = all)");
-            }
-
-            // Tables that support group scoping
-            if (key is "jointDrifts" or "pierForces" or "pierSectionProperties")
+            if (row.HasGroups)
             {
                 var raw = AskStr("  ETABS groups (comma-sep, blank = whole model)", string.Empty);
                 if (!string.IsNullOrWhiteSpace(raw))
                     groups = raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             }
+
+            Ln();
 
             var filter = new TableFilter
             {
@@ -353,8 +359,6 @@ static class Tui
                 "modalParticipatingMassRatios" => selections with { ModalParticipatingMassRatios = filter },
                 _ => selections
             };
-
-            Ln();
         }
 
         var request = new ExtractResultsRequest
@@ -367,6 +371,48 @@ static class Tui
         using var scope = sp.CreateScope();
         var svc = scope.ServiceProvider.GetRequiredService<IExtractResultsService>();
         await Invoke(() => svc.ExtractAsync(request));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LOAD FILTER HELPER
+    //
+    //   blank  → null       (select nothing — skip this category)
+    //   *      → ["*"]      (wildcard — select ALL from model)
+    //   X,Y,Z  → ["X","Y","Z"]  (exactly those names)
+    //
+    // Guard: "Modal" (case-insensitive) is always stripped — ETABS treats it
+    // as an internal pseudo-case; forwarding it corrupts the display state.
+    // ═══════════════════════════════════════════════════════════════════════════
+    static string[]? AskLoadFilter(string label)
+    {
+        Console.Write($"  {C.Cyan}{label}{C.Reset} {C.Gold}›{C.Reset} ");
+        var raw = Console.ReadLine()?.Trim() ?? string.Empty;
+
+        // blank → null
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        // "*" → wildcard
+        if (raw.Trim() == "*")
+            return [TableFilter.Wildcard];
+
+        // specific names — strip "Modal" pseudo-case
+        var names = raw
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(n => !n.Equals("Modal", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        if (names.Length == 0)
+        {
+            Ln($"  {C.Yellow}⚠ All names removed by \"Modal\" guard — treating as null.{C.Reset}");
+            return null;
+        }
+
+        var inputCount = raw.Split(',', StringSplitOptions.RemoveEmptyEntries).Length;
+        if (names.Length < inputCount)
+            Ln($"  {C.Yellow}⚠ \"Modal\" removed from selection (ETABS internal pseudo-case).{C.Reset}");
+
+        return names;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -435,21 +481,6 @@ static class Tui
     // ═══════════════════════════════════════════════════════════════════════════
     // INPUT HELPERS
     // ═══════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Prompts for a load filter input and converts to the TableFilter convention:
-    ///   blank → ["*"]  (wildcard = select ALL from model)
-    ///   "X,Y" → ["X","Y"]  (select exactly those)
-    /// Returns null only for geometry tables that skip the prompt entirely.
-    /// </summary>
-    static string[] AskLoadFilter(string label)
-    {
-        var raw = AskStr(label, string.Empty);
-        if (string.IsNullOrWhiteSpace(raw))
-            return [TableFilter.Wildcard];   // blank → select ALL
-
-        return raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-    }
 
     static string? AskPath(string label, string def)
     {
