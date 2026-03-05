@@ -30,6 +30,7 @@ public static class ExtractResultsExtensions
         services.AddSingleton<JointDriftsExtractor>();
         services.AddSingleton<PierForcesExtractor>();
         services.AddSingleton<PierSectionPropertiesExtractor>();
+        services.AddSingleton<ModalParticipatingMassRatios>();
 
         // ── Registry (singleton — just holds the ordered list) ────────────────
         services.AddSingleton<TableExtractorRegistry>();

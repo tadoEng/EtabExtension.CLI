@@ -35,7 +35,8 @@ public class TableExtractorRegistry
         StoryForcesExtractor storyForces,
         JointDriftsExtractor jointDrifts,
         PierForcesExtractor pierForces,
-        PierSectionPropertiesExtractor pierSectionProperties)
+        PierSectionPropertiesExtractor pierSectionProperties,
+        ModalParticipatingMassRatios modalParticipatingMassRatios)
     {
         Entries = new List<TableRegistration>
         {
@@ -48,6 +49,9 @@ public class TableExtractorRegistry
             new(s => s.StoryForces,    storyForces),
             new(s => s.JointDrifts,    jointDrifts),
             new(s => s.PierForces,     pierForces),
+
+            // ── Modal analysis results ────────────────────────────────────────
+            new(s => s.ModalParticipatingMassRatios, modalParticipatingMassRatios),
         };
     }
 }

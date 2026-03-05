@@ -1,7 +1,7 @@
 // Copyright (c) Thanh Tu. All rights reserved.
 // Licensed under the MIT License.
 
-using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table.Models;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using Microsoft.Extensions.Logging;
 
 namespace EtabExtension.CLI.Features.ExtractResults.Tables;
@@ -33,7 +33,6 @@ public class StoryForcesExtractor : TableExtractorBase
         {
             LoadCases = filter.LoadCases,
             LoadCombos = filter.LoadCombos,
-            LoadPatterns = filter.LoadPatterns,
             // Story forces are always whole-model — group filter ignored
             FieldKeys = filter.FieldKeys,
         };

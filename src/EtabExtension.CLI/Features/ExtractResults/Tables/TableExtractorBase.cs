@@ -3,7 +3,6 @@
 
 using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
-using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table.Models;
 using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using Microsoft.Extensions.Logging;
 using System.Diagnostics;
@@ -58,7 +57,6 @@ public abstract class TableExtractorBase : ITableExtractor
         {
             LoadCases = filter.LoadCases,
             LoadCombos = filter.LoadCombos,
-            LoadPatterns = filter.LoadPatterns,
             Groups = filter.Groups,
             FieldKeys = filter.FieldKeys,
         };

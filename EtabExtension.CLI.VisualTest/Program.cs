@@ -107,7 +107,6 @@ static class Tui
 
         while (true)
         {
-            // ── draw header + menu ────────────────────────────────────────────
             DrawHeader();
             Ln($" {C.Gold}{C.Bold}COMMANDS{C.Reset}  {C.Faint}↑ ↓ to move  ·  Enter to run  ·  Q to quit{C.Reset}\n");
 
@@ -120,7 +119,6 @@ static class Tui
                     Ln($"    {C.Amber}{name,-22}{C.Reset}  {C.Faint}{hint}{C.Reset}");
             }
 
-            // ── input ─────────────────────────────────────────────────────────
             var k = Console.ReadKey(true);
 
             if (k.Key == ConsoleKey.UpArrow) { sel = (sel - 1 + Menu.Length) % Menu.Length; continue; }
@@ -128,7 +126,6 @@ static class Tui
             if (k.Key is ConsoleKey.Q or ConsoleKey.Escape) break;
             if (k.Key != ConsoleKey.Enter) continue;
 
-            // ── dispatch ──────────────────────────────────────────────────────
             DrawHeader();
             Ln($" {C.Bold}{C.Gold}{Menu[sel].Name}{C.Reset}  {C.Faint}{Menu[sel].Hint}{C.Reset}");
             Ln($"{C.Dim}{new string('─', W)}{C.Reset}\n");
@@ -154,7 +151,7 @@ static class Tui
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // COMMAND IMPLEMENTATIONS  — each resolves its service, builds args, invokes
+    // COMMAND IMPLEMENTATIONS
     // ═══════════════════════════════════════════════════════════════════════════
 
     static async Task Do_GetStatus(IServiceProvider sp)
@@ -256,17 +253,18 @@ static class Tui
         var outDir = AskStr("Output directory", S.OutputDir);
         if (!string.IsNullOrEmpty(outDir)) S.OutputDir = outDir;
 
-        // ── Table picker (Space to toggle, Enter to confirm) ──────────────────
+        // ── Table picker ──────────────────────────────────────────────────────
         Ln($"\n {C.Cyan}Select tables:{C.Reset}  {C.Faint}Space = toggle  ·  Enter = confirm{C.Reset}\n");
 
         var rows = new[]
         {
-            (Key: "storyDefinitions",      Label: "Story Definitions",       On: true),
-            (Key: "baseReactions",         Label: "Base Reactions",          On: true),
-            (Key: "storyForces",           Label: "Story Forces",            On: true),
-            (Key: "jointDrifts",           Label: "Joint Drifts",            On: true),
-            (Key: "pierForces",            Label: "Pier Forces",             On: true),
-            (Key: "pierSectionProperties", Label: "Pier Section Properties", On: true),
+            (Key: "storyDefinitions",              Label: "Story Definitions",               On: true),
+            (Key: "baseReactions",                 Label: "Base Reactions",                  On: true),
+            (Key: "storyForces",                   Label: "Story Forces",                    On: true),
+            (Key: "jointDrifts",                   Label: "Joint Drifts",                    On: true),
+            (Key: "pierForces",                    Label: "Pier Forces",                     On: true),
+            (Key: "pierSectionProperties",         Label: "Pier Section Properties",         On: true),
+            (Key: "modalParticipatingMassRatios",  Label: "Modal Participating Mass Ratios", On: true),
         };
         var on = rows.Select(r => r.On).ToArray();
         int cur = 0, top = Console.CursorTop;
@@ -292,6 +290,16 @@ static class Tui
         Ln();
 
         // ── Per-table filter prompts ──────────────────────────────────────────
+        // LOAD SELECTION RULES (matches TableFilter contract):
+        //   blank input  → wildcard ["*"] → select ALL from model
+        //   "X,Y"        → select exactly those names
+        //   geometry tables (storyDefinitions, pierSectionProperties)
+        //                → no load prompt, LoadCases/LoadCombos stay null
+        //
+        // null  = nothing selected  (geometry tables — no load dependency)
+        // ["*"] = select ALL        (user pressed Enter with blank input)
+        // ["X"] = select exactly X  (user typed a name)
+
         var selections = new TableSelections();
 
         for (int i = 0; i < rows.Length; i++)
@@ -307,20 +315,19 @@ static class Tui
             string[]? combos = null;
             string[]? groups = null;
 
+            // Results tables: prompt for load cases
             if (key is "baseReactions" or "storyForces" or "jointDrifts")
             {
-                var raw = AskStr("  Load cases (comma-sep, blank = all)", string.Empty);
-                if (!string.IsNullOrWhiteSpace(raw))
-                    cases = raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                cases = AskLoadFilter("  Load cases (comma-sep, blank = all)");
             }
 
-            if (key is "pierForces")
+            // Results tables: prompt for load combos
+            if (key is "baseReactions" or "storyForces" or "pierForces")
             {
-                var raw = AskStr("  Load combos (comma-sep, blank = all)", string.Empty);
-                if (!string.IsNullOrWhiteSpace(raw))
-                    combos = raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                combos = AskLoadFilter("  Load combos (comma-sep, blank = all)");
             }
 
+            // Tables that support group scoping
             if (key is "jointDrifts" or "pierForces" or "pierSectionProperties")
             {
                 var raw = AskStr("  ETABS groups (comma-sep, blank = whole model)", string.Empty);
@@ -332,7 +339,7 @@ static class Tui
             {
                 LoadCases = cases,
                 LoadCombos = combos,
-                Groups = groups
+                Groups = groups,
             };
 
             selections = key switch
@@ -343,6 +350,7 @@ static class Tui
                 "jointDrifts" => selections with { JointDrifts = filter },
                 "pierForces" => selections with { PierForces = filter },
                 "pierSectionProperties" => selections with { PierSectionProperties = filter },
+                "modalParticipatingMassRatios" => selections with { ModalParticipatingMassRatios = filter },
                 _ => selections
             };
 
@@ -364,8 +372,6 @@ static class Tui
     // ═══════════════════════════════════════════════════════════════════════════
     // INVOKE WRAPPER
     // ═══════════════════════════════════════════════════════════════════════════
-    // The services write progress to Console.Error (✓ ℹ ⚠ lines).
-    // We intercept those and re-print them with color before showing the JSON.
 
     static async Task Invoke<T>(Func<Task<Result<T>>> call)
     {
@@ -396,7 +402,6 @@ static class Tui
 
         Ln($"{C.Dim}{new string('─', W)}{C.Reset}");
 
-        // Pretty-print the JSON result with simple syntax highlighting
         var json = JsonSerializer.Serialize(result,
             new JsonSerializerOptions
             {
@@ -431,6 +436,21 @@ static class Tui
     // INPUT HELPERS
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// Prompts for a load filter input and converts to the TableFilter convention:
+    ///   blank → ["*"]  (wildcard = select ALL from model)
+    ///   "X,Y" → ["X","Y"]  (select exactly those)
+    /// Returns null only for geometry tables that skip the prompt entirely.
+    /// </summary>
+    static string[] AskLoadFilter(string label)
+    {
+        var raw = AskStr(label, string.Empty);
+        if (string.IsNullOrWhiteSpace(raw))
+            return [TableFilter.Wildcard];   // blank → select ALL
+
+        return raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
     static string? AskPath(string label, string def)
     {
         while (true)
@@ -453,7 +473,9 @@ static class Tui
 
     static bool AskBool(string label, bool def)
     {
-        var hint = def ? $"[{C.Green}Y{C.Reset}/{C.Dim}n{C.Reset}]" : $"[{C.Dim}y{C.Reset}/{C.Red}N{C.Reset}]";
+        var hint = def
+            ? $"[{C.Green}Y{C.Reset}/{C.Dim}n{C.Reset}]"
+            : $"[{C.Dim}y{C.Reset}/{C.Red}N{C.Reset}]";
         Console.Write($"  {C.Cyan}{label}{C.Reset} {hint} {C.Gold}›{C.Reset} ");
         return Console.ReadLine()?.Trim().ToLowerInvariant() switch
         {
@@ -477,8 +499,12 @@ static class Tui
         Ln($"{C.Gold}║{new string(' ', pad)}{C.Bold}{C.Gold}{title}{C.Reset}{C.Gold}{new string(' ', inner - pad - title.Length)}║{C.Reset}");
         Ln($"{C.Gold}╚{new string('═', inner)}╝{C.Reset}");
 
-        var edbStr = string.IsNullOrEmpty(S.EdbPath) ? $"{C.Faint}(not set){C.Reset}" : $"{C.White}{Trunc(S.EdbPath, 62)}{C.Reset}";
-        var outStr = string.IsNullOrEmpty(S.OutputDir) ? $"{C.Faint}(not set){C.Reset}" : $"{C.White}{Trunc(S.OutputDir, 62)}{C.Reset}";
+        var edbStr = string.IsNullOrEmpty(S.EdbPath)
+            ? $"{C.Faint}(not set){C.Reset}"
+            : $"{C.White}{Trunc(S.EdbPath, 62)}{C.Reset}";
+        var outStr = string.IsNullOrEmpty(S.OutputDir)
+            ? $"{C.Faint}(not set){C.Reset}"
+            : $"{C.White}{Trunc(S.OutputDir, 62)}{C.Reset}";
         Ln($" {C.Dim}edb :{C.Reset} {edbStr}");
         Ln($" {C.Dim}out :{C.Reset} {outStr}");
         Ln($"{C.Dim}{new string('─', W)}{C.Reset}");
@@ -489,7 +515,7 @@ static class Tui
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// STDERR COLORIZER  — intercepts service progress output, applies ANSI color
+// STDERR COLORIZER
 // ═══════════════════════════════════════════════════════════════════════════════
 class ColorStderrWriter(TextWriter inner) : TextWriter
 {

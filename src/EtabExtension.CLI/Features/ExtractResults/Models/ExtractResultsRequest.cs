@@ -69,6 +69,9 @@ public record TableSelections
 
     [JsonPropertyName("pierSectionProperties")]
     public TableFilter? PierSectionProperties { get; init; }
+
+    [JsonPropertyName("modalParticipatingMassRatios")]
+    public TableFilter? ModalParticipatingMassRatios { get; init; }
 }
 
 /// <summary>
