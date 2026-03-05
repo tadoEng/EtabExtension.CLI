@@ -35,6 +35,11 @@ public abstract class TableExtractorBase : ITableExtractor
     /// <inheritdoc />
     public abstract string Label { get; }
 
+    /// <inheritdoc />
+    /// Default is true — results tables require an analyzed, locked model.
+    /// Geometry/definition extractors override this to false.
+    public virtual bool RequiresAnalysis => true;
+
     /// <summary>
     /// The ETABS database table key exactly as ETABS expects it.
     /// e.g. "Base Reactions", "Story Forces", "Pier Forces"

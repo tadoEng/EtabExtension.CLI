@@ -104,11 +104,31 @@ public class ExtractResultsService : IExtractResultsService
 
             // ── Normalise units ───────────────────────────────────────────────
             var unitService = new EtabsUnitService(app);
-
-            //TODO: consider allowing caller to specify target units (currently hardcoded to kip/ft)
             var unitSnapshot = await unitService.ReadAndNormaliseAsync(EtabSharp.System.Models.Units.US_Kip_Ft);
-
             Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
+
+            // ── Check analysis state ──────────────────────────────────────────
+            // Results tables (Base Reactions, Story Forces, etc.) require the
+            // model to have been analyzed and locked.  Geometry tables
+            // (Story Definitions, Pier Section Properties) are always available.
+            //
+            // If the model is not analyzed we still run — geometry tables will
+            // succeed and results tables get a clear "no results" error rather
+            // than a cryptic ETABS Return code: 1.
+            bool isAnalyzed = app.Model.Analyze.AreAllCasesFinished();
+            bool isLocked = app.Model.ModelInfo.IsLocked();
+
+            if (!isAnalyzed || !isLocked)
+            {
+                Console.Error.WriteLine(
+                    $"⚠ Model is {(isLocked ? "locked" : "unlocked")} / " +
+                    $"{(isAnalyzed ? "analyzed" : "NOT analyzed")} — " +
+                    "results tables will be skipped (geometry tables will still run)");
+            }
+            else
+            {
+                Console.Error.WriteLine("ℹ Model is analyzed and locked — all tables available");
+            }
 
             // ── Build query service (single instance for all tables) ──────────
             var queryService = _tableFactory.CreateQueryService(app);
@@ -128,8 +148,22 @@ public class ExtractResultsService : IExtractResultsService
                 Console.Error.WriteLine(
                     $"ℹ [{outcomes.Count + 1}/{planned.Count}] Extracting: {entry.Extractor.Label}");
 
-                var outcome = await entry.Extractor.ExtractAsync(
-                    filter, outputDir, queryService, _parquet);
+                // Skip results-dependent tables when model has not been analyzed.
+                // This prevents ETABS from entering a corrupted display state
+                // that would poison all subsequent table queries in this session.
+                TableExtractionOutcome outcome;
+                if (entry.Extractor.RequiresAnalysis && (!isAnalyzed || !isLocked))
+                {
+                    outcome = TableExtractionOutcome.Fail(
+                        "Model has no analysis results. Run analysis first (run-analysis command).");
+                    Console.Error.WriteLine(
+                        $"  ⚠ Skipped — model not analyzed");
+                }
+                else
+                {
+                    outcome = await entry.Extractor.ExtractAsync(
+                        filter, outputDir, queryService, _parquet);
+                }
 
                 outcomes[entry.Extractor.Slug] = outcome;
 

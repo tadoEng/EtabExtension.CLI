@@ -24,8 +24,14 @@ public record RunAnalysisData
     public long AnalysisTimeMs { get; init; }
 
     /// <summary>
-    /// Units that were active when analysis ran and results were saved into the .edb.
-    /// Downstream extract-results commands should normalise to the same unit system.
+    /// Units that were active when analysis ran.
+    ///
+    /// NOTE: We do NOT call SaveFile() after analysis — ETABS writes results
+    /// directly into sidecar files (.Y*, .K_*, .msh) during the run.
+    /// Calling SaveFile() would delete those sidecar files.
+    ///
+    /// The .EDB unit system is whatever the model was saved with originally.
+    /// Downstream extract-results commands normalise to kip/ft regardless.
     /// </summary>
     [JsonPropertyName("units")]
     public UnitInfo? Units { get; init; }

@@ -1,13 +1,11 @@
 // Copyright (c) Thanh Tu. All rights reserved.
 // Licensed under the MIT License.
 
+using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table.Models;
 using EtabSharp.Core;
 using EtabSharp.DatabaseTables.Models;
 using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.Generic;
-using System.Text;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 
@@ -32,22 +30,21 @@ public class EtabsTableQueryService : IEtabsTableQueryService
             return TableQueryResult.Fail(string.Empty, "request cannot be null");
 
         _logger.LogInformation(
-            "QueryAsync: table='{TableKey}' cases={Cases} combos={Combos} patterns={Patterns} groups={Groups}",
+            "QueryAsync: table='{TableKey}' cases={CasesMode} combos={CombosMode} groups={Groups}",
             request.TableKey,
-            request.LoadCases?.Length ?? 0,
-            request.LoadCombos?.Length ?? 0,
-            request.LoadPatterns?.Length ?? 0,
+            DescribeFilter(request.LoadCases),
+            DescribeFilter(request.LoadCombos),
             request.Groups?.Length ?? 0);
 
         try
         {
-            // ── Step 1: apply load selection ─────────────────────────────────
+            // ── Step 1: apply load selection ──────────────────────────────────
             await ApplyLoadSelectionAsync(request);
 
-            // ── Step 2: fetch — once per group, or once with no group ─────────
+            // ── Step 2: fetch — once per group, or once for the whole model ───
             var groups = request.Groups is { Length: > 0 }
                 ? request.Groups
-                : new string?[] { null };   // single fetch, no group filter
+                : new string?[] { null };
 
             List<string> fieldKeys = new();
             int tableVersion = 0;
@@ -60,14 +57,12 @@ public class EtabsTableQueryService : IEtabsTableQueryService
 
                 if (!raw.IsSuccess)
                 {
-                    // A missing/empty group is not fatal — log and skip
                     _logger.LogWarning(
-                        "Group '{Group}' returned no data for table '{TableKey}': {Error}",
+                        "Group '{Group}' returned no data for '{TableKey}': {Error}",
                         group ?? "(none)", request.TableKey, raw.ErrorMessage);
                     continue;
                 }
 
-                // All groups share the same schema; capture from the first hit
                 if (fieldKeys.Count == 0)
                 {
                     fieldKeys = raw.FieldKeysIncluded;
@@ -81,18 +76,15 @@ public class EtabsTableQueryService : IEtabsTableQueryService
                         groupsQueried.Add(group);
                 }
                 else
-                {
-                    _logger.LogDebug(
-                        "Group '{Group}' returned 0 rows for table '{TableKey}' — discarded",
+                    _logger.LogDebug("Group '{Group}' returned 0 rows for '{TableKey}'",
                         group ?? "(none)", request.TableKey);
-                }
             }
 
             // ── Step 3: de-duplicate rows from overlapping groups ─────────────
             var dedupedRows = DeduplicateRows(allRows, fieldKeys);
             var beforeFilter = dedupedRows.Count;
 
-            // ── Step 4: discard rows where every field value is empty ─────────
+            // ── Step 4: discard rows where every value is empty ───────────────
             if (request.DiscardEmptyRows)
                 dedupedRows = dedupedRows
                     .Where(row => row.Values.Any(v => !string.IsNullOrEmpty(v)))
@@ -101,8 +93,7 @@ public class EtabsTableQueryService : IEtabsTableQueryService
             var discarded = beforeFilter - dedupedRows.Count;
 
             if (discarded > 0)
-                _logger.LogDebug(
-                    "Discarded {Count} empty row(s) from table '{TableKey}'",
+                _logger.LogDebug("Discarded {Count} empty row(s) from '{TableKey}'",
                     discarded, request.TableKey);
 
             _logger.LogInformation(
@@ -128,56 +119,127 @@ public class EtabsTableQueryService : IEtabsTableQueryService
         }
         finally
         {
-            // ── Step 5: always reset load selection ───────────────────────────
-            // Leave the model in a clean state regardless of success/failure.
-            await ClearLoadSelectionAsync();
+            // ── Step 5: reset selection — leave ETABS in a clean state ────────
+            await ResetSelectionAsync();
         }
     }
 
-    // ── Low-level load selection ─────────────────────────────────────────────
+    // ── Public helpers ───────────────────────────────────────────────────────
 
     /// <inheritdoc />
-    public async Task SelectLoadCasesAsync(IEnumerable<string> caseNames)
+    public async Task ClearLoadSelectionAsync() => await ResetSelectionAsync();
+
+    // ── Model enumeration ────────────────────────────────────────────────────
+
+    private string[] GetAllLoadCaseNames()
     {
-        await Task.CompletedTask;
-        var names = caseNames?.ToArray() ?? Array.Empty<string>();
-        if (names.Length == 0) return;
-        _app.Model.DatabaseTables.SetLoadCasesSelectedForDisplay(names);
-        _logger.LogDebug("Selected {Count} load case(s): [{Cases}]",
-            names.Length, string.Join(", ", names));
+        try
+        {
+            var names = _app.Model.LoadCases.GetNameList();
+            _logger.LogDebug("GetAllLoadCaseNames: {Count}", names?.Length ?? 0);
+            return names ?? Array.Empty<string>();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("GetAllLoadCaseNames failed: {Error}", ex.Message);
+            return Array.Empty<string>();
+        }
     }
 
-    /// <inheritdoc />
-    public async Task SelectLoadCombosAsync(IEnumerable<string> comboNames)
+    private string[] GetAllLoadComboNames()
     {
-        await Task.CompletedTask;
-        var names = comboNames?.ToArray() ?? Array.Empty<string>();
-        if (names.Length == 0) return;
-        _app.Model.DatabaseTables.SetLoadCombinationsSelectedForDisplay(names);
-        _logger.LogDebug("Selected {Count} load combo(s): [{Combos}]",
-            names.Length, string.Join(", ", names));
+        try
+        {
+            var names = _app.Model.LoadCombinations.GetNameList();
+            _logger.LogDebug("GetAllLoadComboNames: {Count}", names?.Length ?? 0);
+            return names ?? Array.Empty<string>();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("GetAllLoadComboNames failed: {Error}", ex.Message);
+            return Array.Empty<string>();
+        }
     }
 
-    /// <inheritdoc />
-    public async Task SelectLoadPatternsAsync(IEnumerable<string> patternNames)
+    // ── Selection logic ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Resolves and applies load selection for cases and combos.
+    ///
+    /// RULE — same for both categories:
+    ///   null / omitted  → select NOTHING  (do not call Set)
+    ///   ["*"]           → select ALL      (enumerate model, call Set with full list)
+    ///   ["X","Y",...]   → select EXACTLY  (call Set with those names)
+    /// </summary>
+    private async Task ApplyLoadSelectionAsync(TableQueryRequest request)
     {
         await Task.CompletedTask;
-        var names = patternNames?.ToArray() ?? Array.Empty<string>();
-        if (names.Length == 0) return;
-        _app.Model.DatabaseTables.SetLoadPatternsSelectedForDisplay(names);
-        _logger.LogDebug("Selected {Count} load pattern(s)", names.Length);
+
+        ApplyFilter(
+            filter: request.LoadCases,
+            getAll: GetAllLoadCaseNames,
+            setSelected: n => _app.Model.DatabaseTables.SetLoadCasesSelectedForDisplay(n),
+            category: "cases");
+
+        ApplyFilter(
+            filter: request.LoadCombos,
+            getAll: GetAllLoadComboNames,
+            setSelected: n => _app.Model.DatabaseTables.SetLoadCombinationsSelectedForDisplay(n),
+            category: "combos");
     }
 
-    /// <inheritdoc />
-    public async Task ClearLoadSelectionAsync()
+    private void ApplyFilter(
+        string[]? filter,
+        Func<string[]> getAll,
+        Action<string[]> setSelected,
+        string category)
     {
-        // Passing a single empty string tells ETABS to revert to "show all"
-        // for that category.  Reset all three so no stale selection lingers.
+        if (filter is null)
+        {
+            // null → nothing selected — don't call Set at all
+            _logger.LogDebug("{Category}: null → nothing selected", category);
+            return;
+        }
+
+        if (IsWildcard(filter))
+        {
+            // ["*"] → select everything in the model
+            var all = getAll();
+            if (all.Length > 0)
+            {
+                setSelected(all);
+                _logger.LogDebug("{Category}: wildcard → selected ALL {Count}", category, all.Length);
+            }
+            else
+                _logger.LogDebug("{Category}: wildcard but none found in model", category);
+
+            return;
+        }
+
+        // Specific names → select exactly those
+        setSelected(filter);
+        _logger.LogDebug("{Category}: selected {Count} specific — [{Names}]",
+            category, filter.Length, string.Join(", ", filter));
+    }
+
+    /// <summary>
+    /// Resets the ETABS display selection back to all cases and all combos
+    /// after every query, so the next table in the session starts from a
+    /// known clean state.
+    /// </summary>
+    private async Task ResetSelectionAsync()
+    {
         await Task.CompletedTask;
-        _app.Model.DatabaseTables.SetLoadCasesSelectedForDisplay(new[] { "" });
-        _app.Model.DatabaseTables.SetLoadCombinationsSelectedForDisplay(new[] { "" });
-        _app.Model.DatabaseTables.SetLoadPatternsSelectedForDisplay(new[] { "" });
-        _logger.LogDebug("Load selection cleared (all cases/combos/patterns will be shown)");
+
+        var allCases = GetAllLoadCaseNames();
+        if (allCases.Length > 0)
+            _app.Model.DatabaseTables.SetLoadCasesSelectedForDisplay(allCases);
+
+        var allCombos = GetAllLoadComboNames();
+        if (allCombos.Length > 0)
+            _app.Model.DatabaseTables.SetLoadCombinationsSelectedForDisplay(allCombos);
+
+        _logger.LogDebug("Reset: {Cases} cases, {Combos} combos", allCases.Length, allCombos.Length);
     }
 
     // ── Low-level raw fetch ──────────────────────────────────────────────────
@@ -207,29 +269,22 @@ public class EtabsTableQueryService : IEtabsTableQueryService
         return result;
     }
 
-    // ── Private helpers ──────────────────────────────────────────────────────
+    // ── Helpers ──────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Applies load case / combo / pattern selection from the request.
-    /// Categories with no entries are skipped — ETABS keeps its current
-    /// selection for that category, which means "show all" in a fresh session.
-    /// </summary>
-    private async Task ApplyLoadSelectionAsync(TableQueryRequest request)
+    /// <summary>Returns true if the filter is the wildcard sentinel ["*"].</summary>
+    private static bool IsWildcard(string[] filter) =>
+        filter.Length == 1 && filter[0] == TableFilter.Wildcard;
+
+    /// <summary>Readable description for log output.</summary>
+    private static string DescribeFilter(string[]? filter) => filter switch
     {
-        if (request.LoadCases is { Length: > 0 })
-            await SelectLoadCasesAsync(request.LoadCases);
-
-        if (request.LoadCombos is { Length: > 0 })
-            await SelectLoadCombosAsync(request.LoadCombos);
-
-        if (request.LoadPatterns is { Length: > 0 })
-            await SelectLoadPatternsAsync(request.LoadPatterns);
-    }
+        null => "nothing (null)",
+        var f when f.Length == 1 && f[0] == "*" => "ALL (*)",
+        _ => $"{filter.Length} specific"
+    };
 
     /// <summary>
-    /// Removes exact-duplicate rows that appear when multiple groups overlap
-    /// (e.g. a joint belonging to both "WindJoints" and "SeismicJoints").
-    /// Equality is determined by all field values in schema order.
+    /// Removes exact-duplicate rows that appear when multiple groups overlap.
     /// </summary>
     private static List<Dictionary<string, string>> DeduplicateRows(
         List<Dictionary<string, string>> rows,
@@ -242,7 +297,6 @@ public class EtabsTableQueryService : IEtabsTableQueryService
 
         foreach (var row in rows)
         {
-            // Build a canonical key from all values in field order
             var key = string.Join('\x1F', fieldKeys.Select(f =>
                 row.TryGetValue(f, out var v) ? v : string.Empty));
 

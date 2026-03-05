@@ -106,17 +106,26 @@ public class RunAnalysisService : IRunAnalysisService
             var caseStatuses = app.Model.Analyze.GetCaseStatus();
             var finishedCount = caseStatuses.Count(cs => cs.IsFinished);
 
-            // Restore original units before saving — so the .edb is not permanently
-            // re-unitised by this hidden instance. Downstream commands normalise anyway.
-            await unitService.RestoreAsync(unitSnapshot);
-            Console.Error.WriteLine("ℹ Units restored before save");
-
-            Console.Error.WriteLine("ℹ Saving results into .edb...");
-            int saveRet = app.Model.Files.SaveFile(filePath);
-            if (saveRet != 0)
-                Console.Error.WriteLine($"⚠ SaveFile returned {saveRet} — results may not persist");
-            else
-                Console.Error.WriteLine("✓ Saved");
+            // ── DO NOT call SaveFile() ────────────────────────────────────────
+            //
+            // ETABS stores analysis results in sidecar files alongside the .EDB:
+            //   .Y, .Y01, .Y03, .Y09, .Y0A   — displacement / force result sets
+            //   .K_I, .K_J, .K_M             — stiffness matrices
+            //   .msh                          — mesh data
+            //
+            // These files are written directly to disk by ETABS during the
+            // analysis run.  The .EDB itself is updated to record "analyzed"
+            // status when analysis completes.
+            //
+            // Calling SaveFile() on a hidden instance AFTER analysis causes ETABS
+            // to overwrite the .EDB from its in-memory model state — which does
+            // not include the sidecar files.  The save deletes all sidecar files,
+            // leaving a model that says "analyzed" but has no results on disk.
+            //
+            // The correct behavior: let ETABS exit normally via ApplicationExit().
+            // The sidecar files and the updated .EDB lock state persist naturally.
+            Console.Error.WriteLine(
+                "ℹ Results written to sidecar files — skipping SaveFile() to preserve them");
 
             return Result.Ok(new RunAnalysisData
             {
@@ -134,6 +143,9 @@ public class RunAnalysisService : IRunAnalysisService
         }
         finally
         {
+            // ApplicationExit(false) — ETABS handles its own cleanup.
+            // The sidecar result files written during analysis are already on disk
+            // and will NOT be touched by a normal exit.
             app?.Application.ApplicationExit(false);
             app?.Dispose();
         }

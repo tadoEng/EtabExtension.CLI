@@ -4,8 +4,6 @@
 using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using EtabExtension.CLI.Shared.Infrastructure.Parquet;
-using global::EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
-using global::EtabExtension.CLI.Shared.Infrastructure.Parquet;
 
 namespace EtabExtension.CLI.Features.ExtractResults.Tables;
 
@@ -35,6 +33,16 @@ public interface ITableExtractor
     /// e.g. "Base Reactions", "Joint Drifts"
     /// </summary>
     string Label { get; }
+
+    /// <summary>
+    /// True when this table requires the model to have been analyzed and locked.
+    /// False for geometry/definition tables that are always available.
+    ///
+    /// When false: extracted even on unanalyzed models (Story Definitions, Pier Section Properties).
+    /// When true:  skipped with a clear error if model is not analyzed/locked,
+    ///             preventing ETABS from entering a corrupted display state.
+    /// </summary>
+    bool RequiresAnalysis { get; }
 
     /// <summary>
     /// Extract the table, write a .parquet file to <paramref name="outputDir"/>,

@@ -22,6 +22,9 @@ public class StoryDefinitionsExtractor : TableExtractorBase
 
     public override string Slug => "story_definitions";
     public override string Label => "Story Definitions";
+    /// Geometry table — always available, even on unanalyzed models.
+    public override bool RequiresAnalysis => false;
+
     protected override string EtabsTableKey => "Story Definitions";
 
     protected override TableQueryRequest BuildRequest(

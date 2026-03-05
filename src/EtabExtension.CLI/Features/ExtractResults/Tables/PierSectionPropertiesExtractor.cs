@@ -26,6 +26,9 @@ public class PierSectionPropertiesExtractor : TableExtractorBase
 
     public override string Slug => "pier_section_properties";
     public override string Label => "Pier Section Properties";
+    /// Geometry table — always available, even on unanalyzed models.
+    public override bool RequiresAnalysis => false;
+
     protected override string EtabsTableKey => "Pier Section Properties";
 
     protected override TableQueryRequest BuildRequest(
