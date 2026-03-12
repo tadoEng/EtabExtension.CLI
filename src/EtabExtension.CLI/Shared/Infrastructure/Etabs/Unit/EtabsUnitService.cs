@@ -1,7 +1,6 @@
 // Copyright (c) Thanh Tu. All rights reserved.
 // Licensed under the MIT License.
 
-using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using EtabSharp.Core;
 using EtabSharp.System.Models;
 using ETABSv1;
@@ -9,26 +8,18 @@ using ETABSv1;
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 
 /// <summary>
-/// Implementation of IEtabsUnitService.
+/// Manages the ETABS unit system within a Mode B command session.
 ///
-/// Constructed per-command (not injected as singleton) because it needs an active
-/// ETABSApplication instance. The service does not own the app — it only reads and
-/// sets units on the model the caller already opened.
+/// Normalises to a caller-supplied unit preset before extraction so all
+/// extracted values are in a known, consistent unit system. Records the
+/// original units so they can be restored before SaveFile() if needed.
 ///
-/// Typical usage in a Mode B service:
-///
-///   app = ETABSWrapper.CreateNew();
-///   app.Application.Hide();
-///   app.Model.Files.OpenFile(filePath);
-///
-///   var unitService = new EtabsUnitService(app);
-///   var snapshot    = await unitService.ReadAndNormaliseAsync(Units.US_Kip_Ft);
-///   Console.Error.WriteLine(unitService.FormatSnapshot(snapshot));
-///
-///   // ... extraction ...
-///
-///   await unitService.RestoreAsync(snapshot);  // restores before save
-///   app.Model.Files.SaveFile(filePath);
+/// USAGE PATTERN:
+///   var unitService  = new EtabsUnitService(app);
+///   var unitSnapshot = await unitService.ReadAndNormaliseAsync(EtabsUnitPreset.Resolve("US_Kip_Ft").Units);
+///   Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
+///   // ... extract ...
+///   // optionally: await unitService.RestoreAsync(unitSnapshot);
 /// </summary>
 public class EtabsUnitService : IEtabsUnitService
 {
@@ -40,22 +31,19 @@ public class EtabsUnitService : IEtabsUnitService
     }
 
     /// <inheritdoc />
-    public async Task<UnitSnapshot> ReadAndNormaliseAsync(object targetUnits)
+    public async Task<UnitSnapshot> ReadAndNormaliseAsync(Units targetUnits)
     {
         await Task.CompletedTask;
 
         var original = ReadCurrent();
 
-        // Convert the Units preset to the underlying eUnits enum so we can
-        // check if the model is already in the target system
-        var targetEnum = UnitsPresetToEnum(targetUnits);
-        var alreadySet = original.RawUnitEnum == (int)targetEnum;
+        // Check whether units are already set to avoid a redundant COM call
+        var alreadySet = original.RawForce == (int)targetUnits.Force
+                      && original.RawLength == (int)targetUnits.Length
+                      && original.RawTemperature == (int)targetUnits.Temperature;
 
         if (!alreadySet)
-        {
-            // targetUnits is passed as-is to SetPresentUnits; it should be compatible with EtabSharp's Units type
-            _app.Model.Units.SetPresentUnits((dynamic)targetUnits);
-        }
+            _app.Model.Units.SetPresentUnits(targetUnits);
 
         var active = alreadySet ? original : ReadCurrent();
 
@@ -72,11 +60,14 @@ public class EtabsUnitService : IEtabsUnitService
     {
         await Task.CompletedTask;
 
-        if (!snapshot.WasChanged) return; // nothing to undo
+        if (!snapshot.WasChanged) return;
 
-        // Restore via the raw enum value that was captured at snapshot time
-        var originalEnum = (eUnits)snapshot.Original.RawUnitEnum;
-        _app.SapModel.SetPresentUnits(originalEnum);
+        _app.Model.Units.SetPresentUnits(new Units
+        {
+            Force = (eForce)snapshot.Original.RawForce,
+            Length = (eLength)snapshot.Original.RawLength,
+            Temperature = (eTemperature)snapshot.Original.RawTemperature
+        });
     }
 
     /// <inheritdoc />
@@ -91,7 +82,6 @@ public class EtabsUnitService : IEtabsUnitService
     private UnitInfo ReadCurrent()
     {
         var units = _app.Model.Units.GetPresentUnits();
-        var rawEnum = _app.SapModel.GetPresentUnits(); // returns int eUnits value
 
         return new UnitInfo
         {
@@ -100,13 +90,16 @@ public class EtabsUnitService : IEtabsUnitService
             Temperature = ToTemperatureSymbol(units.Temperature),
             IsUS = units.IsUS,
             IsMetric = units.IsMetric,
-            RawUnitEnum = (int)rawEnum
+            // Store raw enum ints so RestoreAsync can round-trip back exactly
+            RawForce = (int)units.Force,
+            RawLength = (int)units.Length,
+            RawTemperature = (int)units.Temperature,
         };
     }
 
     /// <summary>
     /// Formats a UnitSnapshot as a single stderr progress line.
-    /// Example: "ℹ Units: kip/ft/F (isUS=True) → was kN/m/C (isMetric=True), normalised"
+    /// e.g. "ℹ Units normalised: kN/m/C → kip/ft/F (isUS=True)"
     /// </summary>
     public static string FormatSnapshot(UnitSnapshot snapshot)
     {
@@ -120,7 +113,7 @@ public class EtabsUnitService : IEtabsUnitService
         return $"ℹ Units normalised: {original} → {active}";
     }
 
-    // ── Symbol helpers — same as demo script ─────────────────────────────────
+    // ── Symbol helpers ────────────────────────────────────────────────────────
 
     private static string ToForceSymbol(eForce force) => force switch
     {
@@ -148,24 +141,5 @@ public class EtabsUnitService : IEtabsUnitService
         eTemperature.F => "F",
         eTemperature.C => "C",
         _ => temperature.ToString()
-    };
-
-    /// <summary>
-    /// Maps the EtabSharp Units preset constants back to the underlying ETABSv1.eUnits enum.
-    /// Only the presets actually used in the codebase are listed — extend as needed.
-    /// </summary>
-    private static eUnits UnitsPresetToEnum(object preset) => preset switch
-    {
-        var u when u == Units.US_Kip_Ft => eUnits.kip_ft_F,
-        var u when u == Units.US_Kip_In => eUnits.kip_in_F,
-        var u when u == Units.US_Lb_In => eUnits.lb_in_F,
-        var u when u == Units.US_Lb_Ft => eUnits.lb_ft_F,
-        var u when u == Units.SI_kN_m => eUnits.kN_m_C,
-        var u when u == Units.SI_kN_mm => eUnits.kN_mm_C,
-        var u when u == Units.SI_N_m => eUnits.N_m_C,
-        var u when u == Units.SI_N_mm => eUnits.N_mm_C,
-        var u when u == Units.SI_kgf_m => eUnits.kgf_m_C,
-        var u when u == Units.SI_tonf_m => eUnits.Ton_m_C,
-        _ => eUnits.kip_ft_F   // safe default
     };
 }

@@ -1,7 +1,6 @@
 // Copyright (c) Thanh Tu. All rights reserved.
 // Licensed under the MIT License.
 
-using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabSharp.DatabaseTables.Models;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
@@ -16,17 +15,17 @@ namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 ///                      Properties) that have no load dependency.
 ///
 ///   ["*"]            → select ALL items of that category from the model.
-///                      Use <see cref="TableFilter.Wildcard"/> constant.
+///                      Use <see cref="Wildcard"/> constant.
 ///
 ///   ["X","Y",...]    → select exactly those named items.
 ///
 /// EXAMPLES:
 ///
-///   // All cases + all combos — use wildcard sentinel
+///   // All cases + all combos
 ///   new TableQueryRequest("Base Reactions")
 ///   {
-///       LoadCases  = [TableFilter.Wildcard],
-///       LoadCombos = [TableFilter.Wildcard]
+///       LoadCases  = [TableQueryRequest.Wildcard],
+///       LoadCombos = [TableQueryRequest.Wildcard]
 ///   }
 ///
 ///   // Specific cases only, no combos
@@ -35,26 +34,23 @@ namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 ///       LoadCases = ["DEAD", "LIVE", "EQX", "EQY"]
 ///   }
 ///
-///   // Specific combos only, no cases — with group scope
-///   new TableQueryRequest("Pier Forces")
-///   {
-///       LoadCombos = ["ENV-LRFD-MAX", "ENV-LRFD-MIN"],
-///       Groups     = ["Piers"]
-///   }
-///
 ///   // Geometry table — no load selection at all
 ///   new TableQueryRequest("Story Definitions")
-///
-///   // All cases + 1 combo — mixed wildcard and specific
-///   new TableQueryRequest("Joint Drifts")
-///   {
-///       LoadCases  = [TableFilter.Wildcard],
-///       LoadCombos = ["ENV-DBE"],
-///       Groups     = ["DriftJoints"]
-///   }
 /// </summary>
 public record TableQueryRequest
 {
+    /// <summary>
+    /// Wildcard sentinel — pass as the single element of LoadCases or LoadCombos
+    /// to select ALL items of that category from the model.
+    /// e.g. LoadCases = [TableQueryRequest.Wildcard]
+    ///
+    /// NOTE: This constant lives in the infrastructure layer intentionally.
+    /// Features that define their own TableFilter models (ExtractResults) mirror
+    /// it as TableFilter.Wildcard = "*" for JSON serialisation convenience, but
+    /// the actual ETABS behaviour is driven by this value in EtabsTableQueryService.
+    /// </summary>
+    public const string Wildcard = "*";
+
     public TableQueryRequest(string tableKey)
     {
         if (string.IsNullOrWhiteSpace(tableKey))
@@ -88,10 +84,7 @@ public record TableQueryRequest
     /// </summary>
     public string[]? Groups { get; init; }
 
-    /// <summary>
-    /// Specific columns to retrieve.
-    /// null → all columns.
-    /// </summary>
+    /// <summary>Specific columns to retrieve. null → all columns.</summary>
     public string[]? FieldKeys { get; init; }
 
     /// <summary>
@@ -108,7 +101,6 @@ public record TableQueryResult
 {
     public bool IsSuccess { get; init; }
     public string? ErrorMessage { get; init; }
-
     public string TableKey { get; init; } = string.Empty;
 
     /// <summary>Groups that contributed rows. Empty when no group filter was used.</summary>
@@ -120,9 +112,7 @@ public record TableQueryResult
     /// <summary>Row count after empty-row filtering.</summary>
     public int RowCount { get; init; }
 
-    /// <summary>
-    /// Structured rows: one Dictionary per row mapping fieldKey → value string.
-    /// </summary>
+    /// <summary>Structured rows: one Dictionary per row mapping fieldKey → value string.</summary>
     public List<Dictionary<string, string>> Rows { get; init; } = new();
 
     /// <summary>Rows dropped because every value was empty.</summary>
@@ -147,30 +137,11 @@ public record TableQueryResult
 ///   3. Merge and de-duplicate rows across groups.
 ///   4. Discard rows where every field value is empty (configurable).
 ///   5. Reset ETABS display selection back to all-selected.
-///
-/// Most callers should use <see cref="QueryAsync"/> directly.
-/// <see cref="GetTableArrayAsync"/> is available for low-level access.
 /// </summary>
 public interface IEtabsTableQueryService
 {
-    /// <summary>
-    /// Executes a full query: resolves load selection, fetches and merges
-    /// across groups, discards empty rows, then resets display state.
-    /// </summary>
     Task<TableQueryResult> QueryAsync(TableQueryRequest request);
-
-    /// <summary>
-    /// Resets ETABS display selection to all cases and all combos.
-    /// Called automatically by <see cref="QueryAsync"/> — only needed if
-    /// using <see cref="GetTableArrayAsync"/> directly.
-    /// </summary>
     Task ClearLoadSelectionAsync();
-
-    /// <summary>
-    /// Raw fetch — no filtering, no group merge, no empty-row discard.
-    /// Caller is responsible for setting up display selection beforehand
-    /// and calling <see cref="ClearLoadSelectionAsync"/> afterward.
-    /// </summary>
     Task<TableDataArrayResult> GetTableArrayAsync(
         string tableKey,
         string? groupName = null,

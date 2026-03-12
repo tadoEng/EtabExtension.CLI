@@ -1,6 +1,7 @@
 // Copyright (c) Thanh Tu. All rights reserved.
 // Licensed under the MIT License.
 
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using System.Text.Json.Serialization;
 
 namespace EtabExtension.CLI.Features.ExtractResults.Models;
@@ -15,22 +16,15 @@ namespace EtabExtension.CLI.Features.ExtractResults.Models;
 /// {
 ///   "filePath":  "C:\\models\\building.edb",
 ///   "outputDir": "C:\\output\\results",
+///   "units":     "US_Kip_Ft",
 ///   "tables": {
-///     // All cases + all combos
-///     "baseReactions":  { "loadCases": ["*"], "loadCombos": ["*"] },
-///
-///     // Specific cases only, no combos
-///     "storyForces":    { "loadCases": ["DEAD","LIVE","EQX","EQY"] },
-///
-///     // Specific combos only, no cases
-///     "pierForces":     { "loadCombos": ["ENV-LRFD-MAX","ENV-LRFD-MIN"], "groups": ["Piers"] },
-///
-///     // 2 cases + 1 combo
-///     "jointDrifts":    { "loadCases": ["EQX","EQY"], "loadCombos": ["ENV-DBE"], "groups": ["DriftJoints"] },
-///
-///     // Geometry table — no load filter needed
-///     "storyDefinitions":      {},
-///     "pierSectionProperties": {}
+///     "baseReactions":           { "loadCases": ["*"], "loadCombos": ["*"] },
+///     "storyForces":             { "loadCases": ["DEAD","LIVE","EQX","EQY"] },
+///     "pierForces":              { "loadCombos": ["ENV-LRFD-MAX","ENV-LRFD-MIN"], "groups": ["Piers"] },
+///     "jointDrifts":             { "loadCases": ["EQX","EQY"], "loadCombos": ["ENV-DBE"], "groups": ["DriftJoints"] },
+///     "storyDefinitions":        {},
+///     "pierSectionProperties":   {},
+///     "modalParticipatingMassRatios": {}
 ///   }
 /// }
 /// </summary>
@@ -41,6 +35,15 @@ public record ExtractResultsRequest
 
     [JsonPropertyName("outputDir")]
     public string OutputDir { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Unit preset to normalise to before extraction.
+    /// null / omitted → defaults to "US_Kip_Ft".
+    /// Valid values: US_Kip_Ft, US_Kip_In, US_Lb_Ft, US_Lb_In,
+    ///               SI_kN_m, SI_kN_mm, SI_N_m, SI_N_mm, SI_kgf_m, SI_tonf_m
+    /// </summary>
+    [JsonPropertyName("units")]
+    public string? Units { get; init; }
 
     [JsonPropertyName("tables")]
     public TableSelections Tables { get; init; } = new();
@@ -75,68 +78,45 @@ public record TableSelections
 }
 
 /// <summary>
-/// Filter for a single table extraction.
+/// Per-table load filter for JSON deserialisation from Rust.
 ///
 /// LOAD SELECTION RULES — same logic for both LoadCases and LoadCombos:
 ///
 ///   null or omitted      → select NOTHING for that category.
-///                          No rows for that category will appear in the output.
-///
 ///   ["*"]                → select ALL items of that category from the model.
-///                          Use <see cref="TableFilter.All"/> as a convenience.
-///
 ///   ["DEAD","LIVE",...]  → select exactly those named items.
 ///
-/// The wildcard "*" is the only special value. Any other string is treated as
-/// a literal name. Mixed arrays like ["DEAD","*"] are not supported — if "*"
-/// is present, all items are selected regardless of other entries.
+/// The wildcard "*" is the only special value; it mirrors
+/// <see cref="TableQueryRequest.Wildcard"/> which drives the actual ETABS behaviour.
+/// Mixed arrays like ["DEAD","*"] are not supported.
 ///
 /// EXAMPLES:
-///   {}                                               // geometry tables — no load filter
+///   {}                                               // geometry tables
 ///   { "loadCases": ["*"], "loadCombos": ["*"] }     // all cases + all combos
 ///   { "loadCases": ["DEAD","LIVE"] }                 // 2 cases, no combos
 ///   { "loadCombos": ["ENV-LRFD"] }                   // no cases, 1 combo
-///   { "loadCases": ["EQX"], "loadCombos": ["ENV"] }  // 1 case + 1 combo
 /// </summary>
 public record TableFilter
 {
-    /// <summary>Wildcard sentinel — pass as the only element to select all items.</summary>
-    public const string Wildcard = "*";
+    /// <summary>
+    /// Wildcard sentinel for JSON serialisation.
+    /// Mirrors <see cref="TableQueryRequest.Wildcard"/> — same value, separate constant
+    /// so feature models don't take a compile-time dependency on the infra layer.
+    /// </summary>
+    public const string Wildcard = TableQueryRequest.Wildcard;
 
     /// <summary>Convenience factory: select all load cases and all combos.</summary>
-    public static TableFilter All => new()
-    {
-        LoadCases = [Wildcard],
-        LoadCombos = [Wildcard],
-    };
+    public static TableFilter All => new() { LoadCases = [Wildcard], LoadCombos = [Wildcard] };
 
-    /// <summary>
-    /// Load case names to select.
-    /// null / omitted = select nothing.
-    /// ["*"]          = select all cases in the model.
-    /// ["X","Y"]      = select exactly those cases.
-    /// </summary>
     [JsonPropertyName("loadCases")]
     public string[]? LoadCases { get; init; }
 
-    /// <summary>
-    /// Load combination names to select.
-    /// null / omitted = select nothing.
-    /// ["*"]          = select all combos in the model.
-    /// ["X","Y"]      = select exactly those combos.
-    /// </summary>
     [JsonPropertyName("loadCombos")]
     public string[]? LoadCombos { get; init; }
 
-    /// <summary>
-    /// ETABS group names to scope the query.
-    /// Multiple groups are fetched and merged (duplicates removed).
-    /// null = entire model.
-    /// </summary>
     [JsonPropertyName("groups")]
     public string[]? Groups { get; init; }
 
-    /// <summary>Specific columns to include. null = all columns.</summary>
     [JsonPropertyName("fieldKeys")]
     public string[]? FieldKeys { get; init; }
 }

@@ -3,6 +3,7 @@
 
 using System.CommandLine;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EtabExtension.CLI.Features.RunAnalysis;
@@ -22,29 +23,48 @@ public static class RunAnalysisCommand
         };
         fileOption.Aliases.Add("-f");
 
-        // Accept multiple case names: --cases "DEAD" "LIVE" "EX"
-        // When omitted, all cases run (default behaviour).
         var casesOption = new Option<string[]?>("--cases")
         {
             Description =
-                "Load case names to run. Repeat the flag or pass space-separated values. " +
+                "Load case names to run (space-separated or repeat flag). " +
                 "When omitted, all cases run (default).",
             Required = false,
             AllowMultipleArgumentsPerToken = true
         };
         casesOption.Aliases.Add("-c");
 
+        var unitsOption = new Option<string?>("--units")
+        {
+            Description =
+                $"Unit preset to normalise to before running analysis. " +
+                $"Default: {EtabsUnitPreset.Default}. " +
+                $"Valid: {string.Join(", ", EtabsUnitPreset.All)}",
+            Required = false
+        };
+        unitsOption.Aliases.Add("-u");
+
         command.Options.Add(fileOption);
         command.Options.Add(casesOption);
+        command.Options.Add(unitsOption);
 
         command.SetAction(async parseResult =>
         {
             var filePath = parseResult.GetValue(fileOption)!;
             var casesArray = parseResult.GetValue(casesOption);
             var cases = casesArray is { Length: > 0 } ? casesArray.ToList() : null;
+            var units = parseResult.GetValue(unitsOption);
+
+            // Validate units before starting ETABS
+            var (_, unitsError) = EtabsUnitPreset.Resolve(units);
+            if (unitsError is not null)
+            {
+                var fail = Result.Fail<EtabExtension.CLI.Features.RunAnalysis.Models.RunAnalysisData>(unitsError);
+                Environment.Exit(fail.ExitWithResult());
+                return;
+            }
 
             var service = services.GetRequiredService<IRunAnalysisService>();
-            var result = await service.RunAnalysisAsync(filePath, cases);
+            var result = await service.RunAnalysisAsync(filePath, cases, units);
             Environment.Exit(result.ExitWithResult());
         });
 

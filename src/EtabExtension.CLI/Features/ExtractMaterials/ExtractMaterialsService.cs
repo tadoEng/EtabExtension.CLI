@@ -4,15 +4,24 @@
 using EtabExtension.CLI.Features.ExtractMaterials.Models;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
-using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table.Models;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using EtabSharp.Core;
-using EtabSharp.System.Models;
 using System.Diagnostics;
 
 namespace EtabExtension.CLI.Features.ExtractMaterials;
 
+/// <summary>
+/// Extracts one ETABS database table to a .parquet file via a hidden ETABS instance (Mode B).
+///
+/// ALIGNED WITH ExtractResultsService:
+///   • Takes an ExtractMaterialsRequest (not loose parameters).
+///   • Output dir, not output file — filename is {tableSlug}.parquet derived from the table key.
+///   • Unit preset via request.Units — not hardcoded.
+///   • LoadCases / LoadCombos intentionally null — material/geometry tables have no load dependency.
+///   • 0-row result is Result.Ok (not an error), OutputFile is null in that case.
+///   • Progress to Console.Error; JSON result to stdout via ExitWithResult().
+/// </summary>
 public class ExtractMaterialsService : IExtractMaterialsService
 {
     private readonly IParquetService _parquet;
@@ -27,25 +36,37 @@ public class ExtractMaterialsService : IExtractMaterialsService
     }
 
     public async Task<Result<ExtractMaterialsData>> ExtractMaterialsAsync(
-        string filePath,
-        string outputPath,
-        string tableKey = "Material List by Story")
+        ExtractMaterialsRequest request)
     {
-        if (!File.Exists(filePath))
-            return Result.Fail<ExtractMaterialsData>($"File not found: {filePath}");
+        // ── Pre-flight ────────────────────────────────────────────────────────
+        if (!File.Exists(request.FilePath))
+            return Result.Fail<ExtractMaterialsData>($"File not found: {request.FilePath}");
 
-        // If the caller passed a directory (or a path with no .parquet extension),
-        // derive a filename from the .edb stem + table key so the output is always
-        // a concrete file path.  Examples:
-        //   --output "C:\out"                 → C:\out\1350_FS.material_list_by_story.parquet
-        //   --output "C:\out\results.parquet" → C:\out\results.parquet  (unchanged)
-        outputPath = ResolveOutputPath(outputPath, filePath, tableKey);
-        Console.Error.WriteLine($"ℹ Output: {outputPath}");
+        if (string.IsNullOrWhiteSpace(request.OutputDir))
+            return Result.Fail<ExtractMaterialsData>("OutputDir cannot be empty");
+
+        // ── Resolve units (fail fast before starting ETABS) ───────────────────
+        var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(request.Units);
+        if (unitsError is not null)
+            return Result.Fail<ExtractMaterialsData>(unitsError);
+
+        var tableKey = string.IsNullOrWhiteSpace(request.TableKey)
+                             ? "Material List by Story"
+                             : request.TableKey;
+        var tableSlug = ToSlug(tableKey);
+        var outputFile = Path.Combine(request.OutputDir, $"{tableSlug}.parquet");
+
+        Directory.CreateDirectory(request.OutputDir);
+
+        Console.Error.WriteLine(
+            $"ℹ extract-materials: '{tableKey}' → {outputFile}");
 
         ETABSApplication? app = null;
-        var stopwatch = Stopwatch.StartNew();
+        var sw = Stopwatch.StartNew();
+
         try
         {
+            // ── Start ETABS ───────────────────────────────────────────────────
             Console.Error.WriteLine("ℹ Starting ETABS (hidden)...");
             app = ETABSWrapper.CreateNew();
             if (app is null)
@@ -54,25 +75,30 @@ public class ExtractMaterialsService : IExtractMaterialsService
             app.Application.Hide();
             Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
 
-            Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");
-            int openRet = app.Model.Files.OpenFile(filePath);
+            // ── Open file ─────────────────────────────────────────────────────
+            Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(request.FilePath)}");
+            int openRet = app.Model.Files.OpenFile(request.FilePath);
             if (openRet != 0)
                 return Result.Fail<ExtractMaterialsData>($"OpenFile failed (ret={openRet})");
 
-            // ── Unit normalisation ────────────────────────────────────────────
+            // ── Normalise units ───────────────────────────────────────────────
             var unitService = new EtabsUnitService(app);
-
-            //TODO: consider allowing the caller to specify the desired normalised units in the request, rather than hardcoding US_Kip_Ft here.
-            var unitSnapshot = await unitService.ReadAndNormaliseAsync(EtabSharp.System.Models.Units.US_Kip_Ft);
-
+            var unitSnapshot = await unitService.ReadAndNormaliseAsync(targetUnits);
             Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
 
-            // ── Table extraction via query service ────────────────────────────
-            // Material List by Story has no load case / combo dependency.
+            // ── Fetch table ───────────────────────────────────────────────────
+            // Material / geometry tables have no load case or combo dependency.
+            // LoadCases and LoadCombos are null → EtabsTableQueryService does NOT
+            // call SetLoadCasesSelectedForDisplay / SetLoadCombinationsSelectedForDisplay.
             Console.Error.WriteLine($"ℹ Fetching table: '{tableKey}'");
 
             var queryService = _tableFactory.CreateQueryService(app);
-            var queryResult = await queryService.QueryAsync(new TableQueryRequest(tableKey));
+            var queryResult = await queryService.QueryAsync(
+                new TableQueryRequest(tableKey)
+                {
+                    FieldKeys = request.FieldKeys,
+                    // LoadCases / LoadCombos intentionally omitted (null)
+                });
 
             if (!queryResult.IsSuccess)
                 return Result.Fail<ExtractMaterialsData>(
@@ -80,48 +106,62 @@ public class ExtractMaterialsService : IExtractMaterialsService
 
             if (queryResult.FieldKeys.Count == 0)
                 return Result.Fail<ExtractMaterialsData>(
-                    $"Table '{tableKey}' returned no fields.");
+                    $"Table '{tableKey}' returned no fields — check that the table key is correct.");
 
             Console.Error.WriteLine(
-                $"ℹ Table: {queryResult.RowCount} rows x {queryResult.FieldKeys.Count} cols" +
+                $"ℹ Table: {queryResult.RowCount} rows × {queryResult.FieldKeys.Count} cols" +
                 $" [{string.Join(", ", queryResult.FieldKeys)}]");
 
-            // Preview first 3 rows to stderr
+            // Preview first 3 rows to help with debugging
             foreach (var (row, idx) in queryResult.Rows.Take(3).Select((r, i) => (r, i)))
+                Console.Error.WriteLine(
+                    $"  Row {idx + 1}: {string.Join(" | ", row.Select(kv => $"{kv.Key}={kv.Value}"))}");
+
+            // ── 0-row is valid — empty model or filter returned nothing ────────
+            if (queryResult.RowCount == 0)
             {
-                var preview = row.Select(kv => $"{kv.Key}={kv.Value}");
-                Console.Error.WriteLine($"  Row {idx + 1}: {string.Join(" | ", preview)}");
+                Console.Error.WriteLine("⚠ Table returned 0 rows — parquet file not written");
+                sw.Stop();
+                return Result.Ok(new ExtractMaterialsData
+                {
+                    FilePath = request.FilePath,
+                    OutputFile = null,
+                    TableKey = tableKey,
+                    RowCount = 0,
+                    DiscardedRowCount = queryResult.DiscardedRowCount,
+                    Units = unitSnapshot.Active,
+                    ExtractionTimeMs = sw.ElapsedMilliseconds
+                });
             }
 
-            // ── Rebuild flat data for the Parquet writer ──────────────────────
-            // Reconstructed from structured rows so empty-row filtering is reflected.
+            // ── Write parquet ─────────────────────────────────────────────────
             var flatData = queryResult.Rows
                 .SelectMany(row => queryResult.FieldKeys.Select(f =>
                     row.TryGetValue(f, out var v) ? v : string.Empty))
                 .ToList();
 
-            // ── Write parquet ─────────────────────────────────────────────────
-            var writeResult = await _parquet.WriteAsync(outputPath, queryResult.FieldKeys, flatData);
+            var writeResult = await _parquet.WriteAsync(outputFile, queryResult.FieldKeys, flatData);
             if (!writeResult.Success)
                 return Result.Fail<ExtractMaterialsData>($"Parquet write failed: {writeResult.Error}");
 
-            stopwatch.Stop();
+            sw.Stop();
             Console.Error.WriteLine(
-                $"✓ {writeResult.RowCount} rows → {outputPath} ({stopwatch.ElapsedMilliseconds} ms)");
+                $"✓ {writeResult.RowCount} rows → {outputFile} ({sw.ElapsedMilliseconds} ms)");
 
             return Result.Ok(new ExtractMaterialsData
             {
-                FilePath = filePath,
-                OutputFile = outputPath,
+                FilePath = request.FilePath,
+                OutputFile = outputFile,
                 TableKey = tableKey,
                 RowCount = writeResult.RowCount,
+                DiscardedRowCount = queryResult.DiscardedRowCount,
                 Units = unitSnapshot.Active,
-                ExtractionTimeMs = stopwatch.ElapsedMilliseconds
+                ExtractionTimeMs = sw.ElapsedMilliseconds
             });
         }
         catch (Exception ex)
         {
-            return Result.Fail<ExtractMaterialsData>($"Error: {ex.Message}");
+            return Result.Fail<ExtractMaterialsData>($"Fatal error: {ex.Message}");
         }
         finally
         {
@@ -130,28 +170,15 @@ public class ExtractMaterialsService : IExtractMaterialsService
         }
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Returns a concrete .parquet file path.
-    /// When <paramref name="outputPath"/> is a directory (already exists as one,
-    /// or has no file extension), a filename is derived from the .edb stem and
-    /// the table key: "{edbStem}.{snake_table_key}.parquet"
+    /// Converts a table key to a snake_case filename slug.
+    /// "Material List by Story" → "material_list_by_story"
     /// </summary>
-    private static string ResolveOutputPath(string outputPath, string edbPath, string tableKey)
-    {
-        var isDirectory = Directory.Exists(outputPath)
-                          || string.IsNullOrEmpty(Path.GetExtension(outputPath));
-
-        if (!isDirectory)
-            return outputPath;
-
-        var edbStem = Path.GetFileNameWithoutExtension(edbPath);
-        var tableSlug = tableKey
-            .ToLowerInvariant()
-            .Replace(' ', '_')
-            .Replace('/', '_');
-
-        return Path.Combine(outputPath, $"{edbStem}.{tableSlug}.parquet");
-    }
+    private static string ToSlug(string tableKey) =>
+        tableKey.ToLowerInvariant()
+                .Replace(' ', '_')
+                .Replace('/', '_')
+                .Replace('-', '_');
 }

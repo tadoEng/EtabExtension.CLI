@@ -5,7 +5,6 @@ using EtabExtension.CLI.Features.RunAnalysis.Models;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using EtabSharp.Core;
-using EtabSharp.System.Models;
 using System.Diagnostics;
 
 namespace EtabExtension.CLI.Features.RunAnalysis;
@@ -13,12 +12,19 @@ namespace EtabExtension.CLI.Features.RunAnalysis;
 public class RunAnalysisService : IRunAnalysisService
 {
     public async Task<Result<RunAnalysisData>> RunAnalysisAsync(
-        string filePath, List<string>? cases)
+        string filePath,
+        List<string>? cases,
+        string? units = null)
     {
         await Task.CompletedTask;
 
         if (!File.Exists(filePath))
             return Result.Fail<RunAnalysisData>($"File not found: {filePath}");
+
+        // Resolve units before starting ETABS — fail fast with a clear message
+        var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(units);
+        if (unitsError is not null)
+            return Result.Fail<RunAnalysisData>(unitsError);
 
         var hasSpecificCases = cases is { Count: > 0 };
 
@@ -41,7 +47,7 @@ public class RunAnalysisService : IRunAnalysisService
 
             // ── Unit normalisation ────────────────────────────────────────────
             var unitService = new EtabsUnitService(app);
-            var unitSnapshot = await unitService.ReadAndNormaliseAsync(EtabSharp.System.Models.Units.US_Kip_Ft);
+            var unitSnapshot = await unitService.ReadAndNormaliseAsync(targetUnits);
             Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
 
             if (app.Model.ModelInfo.IsLocked())
@@ -107,23 +113,10 @@ public class RunAnalysisService : IRunAnalysisService
             var finishedCount = caseStatuses.Count(cs => cs.IsFinished);
 
             // ── DO NOT call SaveFile() ────────────────────────────────────────
-            //
-            // ETABS stores analysis results in sidecar files alongside the .EDB:
-            //   .Y, .Y01, .Y03, .Y09, .Y0A   — displacement / force result sets
-            //   .K_I, .K_J, .K_M             — stiffness matrices
-            //   .msh                          — mesh data
-            //
-            // These files are written directly to disk by ETABS during the
-            // analysis run.  The .EDB itself is updated to record "analyzed"
-            // status when analysis completes.
-            //
-            // Calling SaveFile() on a hidden instance AFTER analysis causes ETABS
-            // to overwrite the .EDB from its in-memory model state — which does
-            // not include the sidecar files.  The save deletes all sidecar files,
-            // leaving a model that says "analyzed" but has no results on disk.
-            //
-            // The correct behavior: let ETABS exit normally via ApplicationExit().
-            // The sidecar files and the updated .EDB lock state persist naturally.
+            // ETABS writes analysis results to sidecar files (.Y*, .K_*, .msh)
+            // during the run. Calling SaveFile() overwrites the .EDB from
+            // in-memory state and deletes those sidecar files.
+            // Let ApplicationExit(false) handle clean shutdown instead.
             Console.Error.WriteLine(
                 "ℹ Results written to sidecar files — skipping SaveFile() to preserve them");
 
@@ -143,18 +136,11 @@ public class RunAnalysisService : IRunAnalysisService
         }
         finally
         {
-            // ApplicationExit(false) — ETABS handles its own cleanup.
-            // The sidecar result files written during analysis are already on disk
-            // and will NOT be touched by a normal exit.
             app?.Application.ApplicationExit(false);
             app?.Dispose();
         }
     }
 
-    /// <summary>
-    /// When specific cases were selected via SetRunCaseFlag, skip CreateAnalysisModel
-    /// inside RunCompleteAnalysis (which would reset flags) and call directly.
-    /// </summary>
     private static int RunSpecificCases(ETABSApplication app)
     {
         app.SapModel.Analyze.CreateAnalysisModel();
