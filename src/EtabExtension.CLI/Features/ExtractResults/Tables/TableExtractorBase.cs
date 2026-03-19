@@ -21,7 +21,7 @@ namespace EtabExtension.CLI.Features.ExtractResults.Tables;
 /// </summary>
 public abstract class TableExtractorBase : ITableExtractor
 {
-    protected readonly ILogger Logger;
+    protected ILogger Logger { get; }
 
     protected TableExtractorBase(ILogger logger)
     {

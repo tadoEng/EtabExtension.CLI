@@ -12,6 +12,11 @@ namespace EtabExtension.CLI.Features.ExtractResults;
 
 public static class ExtractResultsCommand
 {
+    private static readonly JsonSerializerOptions RequestJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
     public static Command Create(IServiceProvider services)
     {
         var command = new Command(
@@ -65,7 +70,7 @@ public static class ExtractResultsCommand
             {
                 partialRequest = JsonSerializer.Deserialize<ExtractResultsRequest>(
                     requestJson,
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    RequestJsonOptions);
             }
             catch (JsonException ex)
             {
