@@ -331,13 +331,13 @@ static class Tui
             string[]? groups = null;
 
             // Results tables: prompt for load cases
-            if (key is "baseReactions" or "storyForces" or "jointDrifts")
+            if (key is "baseReactions" or "storyForces" or "jointDrifts" or "pierForces")
             {
                 cases = AskLoadFilter("  Load cases (comma-sep, blank = all)");
             }
 
             // Results tables: prompt for load combos
-            if (key is "baseReactions" or "storyForces" or "pierForces")
+            if (key is "baseReactions" or "storyForces" or "jointDrifts" or "pierForces")
             {
                 combos = AskLoadFilter("  Load combos (comma-sep, blank = all)");
             }
