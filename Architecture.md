@@ -278,6 +278,8 @@ etab-cli extract-results -f <path.edb> -o <outputDir> -r '<requestJson>'
   "units": "US_Kip_Ft",
   "tables": {
     "materialListByStory":         {},
+    "materialPropertiesConcreteData": {},
+    "groupAssignments":            {},
     "storyDefinitions":            {},
     "pierSectionProperties":       { "groups": ["Piers"] },
     "baseReactions":               { "loadCases": ["*"], "loadCombos": ["*"] },
@@ -302,6 +304,8 @@ etab-cli extract-results -f <path.edb> -o <outputDir> -r '<requestJson>'
 | `tables` key | Slug / filename | `RequiresAnalysis` | ETABS table key |
 |---|---|---|---|
 | `materialListByStory` | `material_list_by_story.parquet` | false | `"Material List by Story"` |
+| `materialPropertiesConcreteData` | `material_properties_concrete_data.parquet` | false | `"Material Properties - Concrete Data"` |
+| `groupAssignments` | `group_assignments.parquet` | false | `"Group Assignments"` |
 | `storyDefinitions` | `story_definitions.parquet` | false | `"Story Definitions"` |
 | `pierSectionProperties` | `pier_section_properties.parquet` | false | `"Pier Section Properties"` |
 | `baseReactions` | `base_reactions.parquet` | **true** | `"Base Reactions"` |

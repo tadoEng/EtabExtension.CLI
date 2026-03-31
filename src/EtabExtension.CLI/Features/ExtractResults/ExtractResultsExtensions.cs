@@ -25,6 +25,8 @@ public static class ExtractResultsExtensions
     {
         // ── Individual table extractors (singleton — stateless, logger injected) ──
         services.AddSingleton<MaterialListByStoryExtractor>();
+        services.AddSingleton<MaterialPropertiesConcreteDataExtractor>();
+        services.AddSingleton<GroupAssignmentsExtractor>();
         services.AddSingleton<StoryDefinitionsExtractor>();
         services.AddSingleton<BaseReactionsExtractor>();
         services.AddSingleton<StoryForcesExtractor>();

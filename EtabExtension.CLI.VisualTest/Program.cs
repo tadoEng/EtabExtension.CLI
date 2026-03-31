@@ -272,6 +272,8 @@ static class Tui
         var rows = new[]
         {
             (Key: "materialListByStory",         Label: "Material List by Story",         On: true),
+            (Key: "materialPropertiesConcreteData", Label: "Material Properties - Concrete Data", On: true),
+            (Key: "groupAssignments",            Label: "Group Assignments",              On: true),
             (Key: "storyDefinitions",            Label: "Story Definitions",             On: true),
             (Key: "baseReactions",               Label: "Base Reactions",                On: true),
             (Key: "storyForces",                 Label: "Story Forces",                  On: true),
@@ -309,7 +311,8 @@ static class Tui
         // LOAD SELECTION RULES (matches TableFilter contract):
         //   blank input  → wildcard ["*"] → select ALL from model
         //   "X,Y"        → select exactly those names
-        //   geometry/material tables (materialListByStory, storyDefinitions, pierSectionProperties)
+        //   geometry/material tables (materialListByStory, materialPropertiesConcreteData,
+        //                            groupAssignments, storyDefinitions, pierSectionProperties)
         //                → no load prompt, LoadCases/LoadCombos stay null
         //
         // null  = nothing selected  (geometry/material tables — no load dependency)
@@ -361,6 +364,8 @@ static class Tui
             selections = key switch
             {
                 "materialListByStory" => selections with { MaterialListByStory = filter },
+                "materialPropertiesConcreteData" => selections with { MaterialPropertiesConcreteData = filter },
+                "groupAssignments" => selections with { GroupAssignments = filter },
                 "storyDefinitions" => selections with { StoryDefinitions = filter },
                 "baseReactions" => selections with { BaseReactions = filter },
                 "storyForces" => selections with { StoryForces = filter },

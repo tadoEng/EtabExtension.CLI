@@ -31,6 +31,8 @@ public class TableExtractorRegistry
 
     public TableExtractorRegistry(
         MaterialListByStoryExtractor materialListByStory,
+        MaterialPropertiesConcreteDataExtractor materialPropertiesConcreteData,
+        GroupAssignmentsExtractor groupAssignments,
         StoryDefinitionsExtractor storyDefinitions,
         BaseReactionsExtractor baseReactions,
         StoryForcesExtractor storyForces,
@@ -43,6 +45,8 @@ public class TableExtractorRegistry
         {
             // ── Geometry / definitions (no load dependency) ───────────────────
             new(s => s.MaterialListByStory, materialListByStory),
+            new(s => s.MaterialPropertiesConcreteData, materialPropertiesConcreteData),
+            new(s => s.GroupAssignments, groupAssignments),
             new(s => s.StoryDefinitions,     storyDefinitions),
             new(s => s.PierSectionProperties, pierSectionProperties),
 
