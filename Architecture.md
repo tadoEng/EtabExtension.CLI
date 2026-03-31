@@ -260,7 +260,7 @@ Returns `ExtractMaterialsData` — `outputFile` (null if 0 rows), `rowCount`, `d
 ---
 
 ### `extract-results`
-Extracts multiple ETABS results tables to `.parquet` files in a single hidden ETABS session (Mode B). Partial failures are tolerated — all requested tables are attempted.
+Extracts multiple ETABS results/material tables to `.parquet` files in a single hidden ETABS session (Mode B). Partial failures are tolerated — all requested tables are attempted.
 
 ```
 etab-cli extract-results -f <path.edb> -o <outputDir> -r '<requestJson>'
@@ -277,6 +277,7 @@ etab-cli extract-results -f <path.edb> -o <outputDir> -r '<requestJson>'
 {
   "units": "US_Kip_Ft",
   "tables": {
+    "materialListByStory":         {},
     "storyDefinitions":            {},
     "pierSectionProperties":       { "groups": ["Piers"] },
     "baseReactions":               { "loadCases": ["*"], "loadCombos": ["*"] },
@@ -300,6 +301,7 @@ etab-cli extract-results -f <path.edb> -o <outputDir> -r '<requestJson>'
 
 | `tables` key | Slug / filename | `RequiresAnalysis` | ETABS table key |
 |---|---|---|---|
+| `materialListByStory` | `material_list_by_story.parquet` | false | `"Material List by Story"` |
 | `storyDefinitions` | `story_definitions.parquet` | false | `"Story Definitions"` |
 | `pierSectionProperties` | `pier_section_properties.parquet` | false | `"Pier Section Properties"` |
 | `baseReactions` | `base_reactions.parquet` | **true** | `"Base Reactions"` |

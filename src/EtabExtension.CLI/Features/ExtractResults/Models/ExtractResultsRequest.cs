@@ -18,6 +18,7 @@ namespace EtabExtension.CLI.Features.ExtractResults.Models;
 ///   "outputDir": "C:\\output\\results",
 ///   "units":     "US_Kip_Ft",
 ///   "tables": {
+///     "materialListByStory":      {},
 ///     "baseReactions":           { "loadCases": ["*"], "loadCombos": ["*"] },
 ///     "storyForces":             { "loadCases": ["DEAD","LIVE","EQX","EQY"] },
 ///     "pierForces":              { "loadCombos": ["ENV-LRFD-MAX","ENV-LRFD-MIN"], "groups": ["Piers"] },
@@ -55,6 +56,12 @@ public record ExtractResultsRequest
 /// </summary>
 public record TableSelections
 {
+    /// <summary>
+    /// Material/geometry table. Only FieldKeys is honoured.
+    /// </summary>
+    [JsonPropertyName("materialListByStory")]
+    public TableFilter? MaterialListByStory { get; init; }
+
     [JsonPropertyName("storyDefinitions")]
     public TableFilter? StoryDefinitions { get; init; }
 

@@ -100,7 +100,7 @@ static class Tui
         ("generate-e2k",       "Export .edb → .e2k text format  [Mode B]"),
         ("extract-materials",  "Material takeoff → .parquet       [Mode B]"),
         ("run-analysis",       "Run analysis, save results         [Mode B]"),
-        ("extract-results",    "All results tables → .parquet      [Mode B]"),
+        ("extract-results",    "Batch tables/materials → .parquet  [Mode B]"),
     ];
 
     public static async Task RunAsync(IServiceProvider sp)
@@ -271,6 +271,7 @@ static class Tui
 
         var rows = new[]
         {
+            (Key: "materialListByStory",         Label: "Material List by Story",         On: true),
             (Key: "storyDefinitions",            Label: "Story Definitions",             On: true),
             (Key: "baseReactions",               Label: "Base Reactions",                On: true),
             (Key: "storyForces",                 Label: "Story Forces",                  On: true),
@@ -308,10 +309,10 @@ static class Tui
         // LOAD SELECTION RULES (matches TableFilter contract):
         //   blank input  → wildcard ["*"] → select ALL from model
         //   "X,Y"        → select exactly those names
-        //   geometry tables (storyDefinitions, pierSectionProperties)
+        //   geometry/material tables (materialListByStory, storyDefinitions, pierSectionProperties)
         //                → no load prompt, LoadCases/LoadCombos stay null
         //
-        // null  = nothing selected  (geometry tables — no load dependency)
+        // null  = nothing selected  (geometry/material tables — no load dependency)
         // ["*"] = select ALL        (user pressed Enter with blank input)
         // ["X"] = select exactly X  (user typed a name)
 
@@ -359,6 +360,7 @@ static class Tui
 
             selections = key switch
             {
+                "materialListByStory" => selections with { MaterialListByStory = filter },
                 "storyDefinitions" => selections with { StoryDefinitions = filter },
                 "baseReactions" => selections with { BaseReactions = filter },
                 "storyForces" => selections with { StoryForces = filter },

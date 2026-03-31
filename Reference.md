@@ -360,7 +360,7 @@ When `outputFile` is null, no `.parquet` file was written (the table returned 0 
 
 ## `extract-results`
 
-Extracts multiple ETABS results tables in a single hidden ETABS session (Mode B). All requested tables are attempted; individual table failures do not abort the session.
+Extracts multiple ETABS results/material tables in a single hidden ETABS session (Mode B). All requested tables are attempted; individual table failures do not abort the session.
 
 ```
 etab-cli extract-results \
@@ -411,6 +411,7 @@ etab-cli extract-results \
 
 | `tables` key | Output file | `RequiresAnalysis` | Supports load cases | Supports load combos | Supports groups |
 |---|---|---|---|---|---|
+| `materialListByStory` | `material_list_by_story.parquet` | No | — | — | No |
 | `storyDefinitions` | `story_definitions.parquet` | No | — | — | No |
 | `pierSectionProperties` | `pier_section_properties.parquet` | No | — | — | Yes |
 | `baseReactions` | `base_reactions.parquet` | **Yes** | Yes | Yes | No |
@@ -428,6 +429,7 @@ etab-cli extract-results \
 {
   "units": "US_Kip_Ft",
   "tables": {
+    "materialListByStory":         {},
     "storyDefinitions":            {},
     "pierSectionProperties":       {},
     "baseReactions":               { "loadCases": ["*"], "loadCombos": ["*"] },
@@ -444,6 +446,7 @@ etab-cli extract-results \
 {
   "units": "SI_kN_m",
   "tables": {
+    "materialListByStory": {},
     "storyDefinitions": {},
     "baseReactions": {
       "loadCases": ["DEAD", "LIVE", "EQX", "EQY"],

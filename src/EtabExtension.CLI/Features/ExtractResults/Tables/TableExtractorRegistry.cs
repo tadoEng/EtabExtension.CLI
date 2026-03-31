@@ -30,6 +30,7 @@ public class TableExtractorRegistry
     public IReadOnlyList<TableRegistration> Entries { get; }
 
     public TableExtractorRegistry(
+        MaterialListByStoryExtractor materialListByStory,
         StoryDefinitionsExtractor storyDefinitions,
         BaseReactionsExtractor baseReactions,
         StoryForcesExtractor storyForces,
@@ -41,6 +42,7 @@ public class TableExtractorRegistry
         Entries = new List<TableRegistration>
         {
             // ── Geometry / definitions (no load dependency) ───────────────────
+            new(s => s.MaterialListByStory, materialListByStory),
             new(s => s.StoryDefinitions,     storyDefinitions),
             new(s => s.PierSectionProperties, pierSectionProperties),
 

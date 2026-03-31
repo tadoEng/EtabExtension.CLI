@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 using EtabExtension.CLI.Features.ExtractMaterials.Models;
+using EtabExtension.CLI.Features.ExtractResults;
+using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
@@ -24,19 +26,81 @@ namespace EtabExtension.CLI.Features.ExtractMaterials;
 /// </summary>
 public class ExtractMaterialsService : IExtractMaterialsService
 {
+    private const string DefaultMaterialTableKey = "Material List by Story";
+    private const string DefaultMaterialTableSlug = "material_list_by_story";
+
     private readonly IParquetService _parquet;
     private readonly IEtabsTableServicesFactory _tableFactory;
+    private readonly IExtractResultsService _extractResultsService;
 
     public ExtractMaterialsService(
         IParquetService parquet,
-        IEtabsTableServicesFactory tableFactory)
+        IEtabsTableServicesFactory tableFactory,
+        IExtractResultsService extractResultsService)
     {
         _parquet = parquet;
         _tableFactory = tableFactory;
+        _extractResultsService = extractResultsService;
     }
 
     public async Task<Result<ExtractMaterialsData>> ExtractMaterialsAsync(
         ExtractMaterialsRequest request)
+    {
+        var tableKey = string.IsNullOrWhiteSpace(request.TableKey)
+            ? DefaultMaterialTableKey
+            : request.TableKey;
+
+        if (string.Equals(tableKey, DefaultMaterialTableKey, StringComparison.OrdinalIgnoreCase))
+            return await ExtractViaCombinedResultsPathAsync(request, tableKey);
+
+        return await ExtractViaLegacyPathAsync(request, tableKey);
+    }
+
+    private async Task<Result<ExtractMaterialsData>> ExtractViaCombinedResultsPathAsync(
+        ExtractMaterialsRequest request,
+        string tableKey)
+    {
+        var combinedRequest = new ExtractResultsRequest
+        {
+            FilePath = request.FilePath,
+            OutputDir = request.OutputDir,
+            Units = request.Units,
+            Tables = new TableSelections
+            {
+                MaterialListByStory = new TableFilter
+                {
+                    FieldKeys = request.FieldKeys,
+                }
+            }
+        };
+
+        var result = await _extractResultsService.ExtractAsync(combinedRequest);
+        if (!result.Success || result.Data is null)
+            return Result.Fail<ExtractMaterialsData>(result.Error ?? $"Failed to load table '{tableKey}'.");
+
+        if (!result.Data.Tables.TryGetValue(DefaultMaterialTableSlug, out var outcome))
+            return Result.Fail<ExtractMaterialsData>(
+                $"Combined extraction did not return '{DefaultMaterialTableSlug}'.");
+
+        if (!outcome.Success)
+            return Result.Fail<ExtractMaterialsData>(
+                $"Failed to load table '{tableKey}': {outcome.Error}");
+
+        return Result.Ok(new ExtractMaterialsData
+        {
+            FilePath = request.FilePath,
+            OutputFile = outcome.OutputFile,
+            TableKey = tableKey,
+            RowCount = outcome.RowCount,
+            DiscardedRowCount = outcome.DiscardedRowCount,
+            Units = result.Data.Units,
+            ExtractionTimeMs = outcome.ExtractionTimeMs
+        });
+    }
+
+    private async Task<Result<ExtractMaterialsData>> ExtractViaLegacyPathAsync(
+        ExtractMaterialsRequest request,
+        string tableKey)
     {
         // ── Pre-flight ────────────────────────────────────────────────────────
         if (!File.Exists(request.FilePath))
@@ -50,9 +114,6 @@ public class ExtractMaterialsService : IExtractMaterialsService
         if (unitsError is not null)
             return Result.Fail<ExtractMaterialsData>(unitsError);
 
-        var tableKey = string.IsNullOrWhiteSpace(request.TableKey)
-                             ? "Material List by Story"
-                             : request.TableKey;
         var tableSlug = ToSlug(tableKey);
         var outputFile = Path.Combine(request.OutputDir, $"{tableSlug}.parquet");
 

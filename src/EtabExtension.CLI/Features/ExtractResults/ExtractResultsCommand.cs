@@ -21,7 +21,7 @@ public static class ExtractResultsCommand
     {
         var command = new Command(
             "extract-results",
-            "Extract ETABS analysis results tables to .parquet files via a hidden ETABS instance");
+            "Extract ETABS results/material tables to .parquet files via a hidden ETABS instance");
 
         var fileOption = new Option<string>("--file")
         {
