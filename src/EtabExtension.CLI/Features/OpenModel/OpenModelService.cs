@@ -9,6 +9,27 @@ namespace EtabExtension.CLI.Features.OpenModel;
 
 public class OpenModelService : IOpenModelService
 {
+    private static async Task<int?> WaitForPidAsync(bool newestFirst)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+
+        while (true)
+        {
+            var instances = ETABSWrapper.GetAllRunningInstances();
+            var pid = newestFirst
+                ? instances.OrderByDescending(i => i.ProcessId).FirstOrDefault()?.ProcessId
+                : instances.FirstOrDefault()?.ProcessId;
+
+            if (pid is not null)
+                return pid;
+
+            if (DateTime.UtcNow >= deadline)
+                return null;
+
+            await Task.Delay(200);
+        }
+    }
+
     public async Task<Result<OpenModelData>> OpenModelAsync(
         string filePath, bool save, bool newInstance)
     {
@@ -108,9 +129,10 @@ public class OpenModelService : IOpenModelService
             if (openRet != 0)
                 return Result.Fail<OpenModelData>($"OpenFile failed (ret={openRet})");
 
-            var pid = ETABSWrapper.GetAllRunningInstances()
-                .OrderByDescending(i => i.ProcessId) // new instance has highest PID
-                .FirstOrDefault()?.ProcessId;
+            var pid = await WaitForPidAsync(newestFirst: true);
+            if (pid is null)
+                return Result.Fail<OpenModelData>(
+                    "ETABS opened the file, but the new process PID could not be confirmed within 3 seconds.");
 
             Console.Error.WriteLine($"✓ Opened in new instance (PID {pid}): {Path.GetFileName(filePath)}");
 
