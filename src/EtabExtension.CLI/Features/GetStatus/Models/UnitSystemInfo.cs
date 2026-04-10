@@ -23,8 +23,8 @@ public record UnitSystemInfo
     public string Temperature { get; init; } = string.Empty;
 
     /// <summary>True when units are a standard US preset (kip/ft/F, lb/in/F, kip/in/F …)</summary>
-    [JsonPropertyName("isUS")]
-    public bool IsUS { get; init; }
+    [JsonPropertyName("isUs")]
+    public bool IsUs { get; init; }
 
     /// <summary>True when units are a standard Metric preset (kN/m/C, N/mm/C, kgf/m/C …)</summary>
     [JsonPropertyName("isMetric")]

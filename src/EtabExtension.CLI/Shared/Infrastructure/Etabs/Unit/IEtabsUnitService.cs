@@ -60,7 +60,7 @@ public record UnitInfo
     /// <summary>"F" or "C"</summary>
     public required string Temperature { get; init; }
 
-    public bool IsUS { get; init; }
+    public bool IsUs { get; init; }
     public bool IsMetric { get; init; }
 
     /// <summary>

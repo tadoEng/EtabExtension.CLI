@@ -46,7 +46,7 @@ public class GetStatusService : IGetStatusService
                     Force = force,
                     Length = length,
                     Temperature = temp,
-                    IsUS = units.IsUS,
+                    IsUs = units.IsUS,
                     IsMetric = units.IsMetric
                 };
 

@@ -88,7 +88,7 @@ public class EtabsUnitService : IEtabsUnitService
             Force = ToForceSymbol(units.Force),
             Length = ToLengthSymbol(units.Length),
             Temperature = ToTemperatureSymbol(units.Temperature),
-            IsUS = units.IsUS,
+            IsUs = units.IsUS,
             IsMetric = units.IsMetric,
             // Store raw enum ints so RestoreAsync can round-trip back exactly
             RawForce = (int)units.Force,
@@ -104,7 +104,7 @@ public class EtabsUnitService : IEtabsUnitService
     public static string FormatSnapshot(UnitSnapshot snapshot)
     {
         var active = $"{snapshot.Active.Force}/{snapshot.Active.Length}/{snapshot.Active.Temperature}" +
-                     $" (isUS={snapshot.Active.IsUS}, isMetric={snapshot.Active.IsMetric})";
+                     $" (isUS={snapshot.Active.IsUs}, isMetric={snapshot.Active.IsMetric})";
 
         if (!snapshot.WasChanged)
             return $"ℹ Units: {active} (no change needed)";
