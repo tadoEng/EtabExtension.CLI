@@ -111,6 +111,21 @@ public class RunAnalysisService : IRunAnalysisService
 
             var caseStatuses = app.Model.Analyze.GetCaseStatus();
             var finishedCount = caseStatuses.Count(cs => cs.IsFinished);
+            if (finishedCount == 0)
+                return Result.Fail<RunAnalysisData>(
+                    "Analysis completed, but no cases were marked finished. Check ETABS run-case selections.")
+                    with
+                {
+                    Data = new RunAnalysisData
+                    {
+                        FilePath = filePath,
+                        CasesRequested = hasSpecificCases ? cases : null,
+                        CaseCount = caseStatuses.Count,
+                        FinishedCaseCount = finishedCount,
+                        AnalysisTimeMs = stopwatch.ElapsedMilliseconds,
+                        Units = unitSnapshot.Active
+                    }
+                };
 
             // ── DO NOT call SaveFile() ────────────────────────────────────────
             // ETABS writes analysis results to sidecar files (.Y*, .K_*, .msh)
