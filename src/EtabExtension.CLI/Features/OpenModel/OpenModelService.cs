@@ -84,7 +84,15 @@ public class OpenModelService : IOpenModelService
             if (openRet != 0)
                 return Result.Fail<OpenModelData>($"OpenFile failed (ret={openRet})");
 
-            var pid = ETABSWrapper.GetAllRunningInstances().FirstOrDefault()?.ProcessId;
+            // Use retry loop to get the PID (same pattern as Mode B)
+            // Handles race condition where COM registry might not immediately reflect the open
+            var pid = await WaitForPidAsync(newestFirst: false);
+            if (pid is null)
+            {
+                // Fallback: try direct query if retry loop fails (shouldn't happen)
+                pid = ETABSWrapper.GetAllRunningInstances().FirstOrDefault()?.ProcessId;
+            }
+
             Console.Error.WriteLine($"✓ Opened: {Path.GetFileName(filePath)}");
 
             return Result.Ok(new OpenModelData
@@ -150,9 +158,11 @@ public class OpenModelService : IOpenModelService
         }
         finally
         {
-            // New instance: release COM proxy only.
-            // User controls the visible ETABS window — we do NOT call ApplicationExit.
-            app?.Dispose();
+            // New instance (Mode B): Do NOT dispose the COM proxy.
+            // When the sidecar exits, the proxy is garbage-collected but ETABS (out-of-process
+            // COM server) stays running independently. The user controls the visible ETABS
+            // window going forward. Disposing would prematurely terminate ETABS.
+            // (Do not call app?.Dispose() or ApplicationExit())
         }
     }
 }
