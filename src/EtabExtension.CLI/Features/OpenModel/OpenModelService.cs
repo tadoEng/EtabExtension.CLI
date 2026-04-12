@@ -158,11 +158,28 @@ public class OpenModelService : IOpenModelService
         }
         finally
         {
-            // New instance (Mode B): Do NOT dispose the COM proxy.
-            // When the sidecar exits, the proxy is garbage-collected but ETABS (out-of-process
-            // COM server) stays running independently. The user controls the visible ETABS
-            // window going forward. Disposing would prematurely terminate ETABS.
-            // (Do not call app?.Dispose() or ApplicationExit())
+            // New instance (Mode B): Release the COM RCW immediately without Dispose.
+            // Dispose would prematurely terminate ETABS; we let it run independently.
+            // However, we must release the RCW (Runtime Callable Wrapper) to avoid a multi-second
+            // hang from COM finalization. Marshal.ReleaseComObject forces immediate cleanup of the
+            // proxy while leaving the out-of-process server untouched.
+            if (app is not null)
+            {
+                try
+                {
+                    // Marshal.ReleaseComObject is Windows-only; sidecar only runs on Windows
+                    if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                        System.Runtime.InteropServices.OSPlatform.Windows))
+                    {
+                        System.Runtime.InteropServices.Marshal.ReleaseComObject(app);
+                    }
+                }
+                catch
+                {
+                    // Best-effort: if release fails, continue anyway
+                }
+                app = null;
+            }
         }
     }
 }
