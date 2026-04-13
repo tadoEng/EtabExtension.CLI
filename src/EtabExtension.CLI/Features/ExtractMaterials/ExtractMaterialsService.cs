@@ -106,15 +106,16 @@ public class ExtractMaterialsService : IExtractMaterialsService
         if (!File.Exists(request.FilePath))
             return Result.Fail<ExtractMaterialsData>($"File not found: {request.FilePath}");
 
-        if (string.IsNullOrWhiteSpace(request.OutputDir))
-            return Result.Fail<ExtractMaterialsData>("OutputDir cannot be empty");
+        var pathError = PathSafe.GetErrorIfInvalidPath(request.OutputDir, "OutputDir");
+        if (pathError is not null)
+            return Result.Fail<ExtractMaterialsData>(pathError);
 
         // ── Resolve units (fail fast before starting ETABS) ───────────────────
         var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(request.Units);
         if (unitsError is not null)
             return Result.Fail<ExtractMaterialsData>(unitsError);
 
-        var tableSlug = ToSlug(tableKey);
+        var tableSlug = PathSafe.ToSafeSlug(tableKey);
         var outputFile = Path.Combine(request.OutputDir, $"{tableSlug}.parquet");
 
         Directory.CreateDirectory(request.OutputDir);
@@ -231,15 +232,4 @@ public class ExtractMaterialsService : IExtractMaterialsService
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Converts a table key to a snake_case filename slug.
-    /// "Material List by Story" → "material_list_by_story"
-    /// </summary>
-    private static string ToSlug(string tableKey) =>
-        tableKey.ToLowerInvariant()
-                .Replace(' ', '_')
-                .Replace('/', '_')
-                .Replace('-', '_');
 }
