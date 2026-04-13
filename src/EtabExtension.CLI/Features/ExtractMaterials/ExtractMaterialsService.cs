@@ -32,15 +32,18 @@ public class ExtractMaterialsService : IExtractMaterialsService
     private readonly IParquetService _parquet;
     private readonly IEtabsTableServicesFactory _tableFactory;
     private readonly IExtractResultsService _extractResultsService;
+    private readonly IEtabsBootstrapService _bootstrap;
 
     public ExtractMaterialsService(
         IParquetService parquet,
         IEtabsTableServicesFactory tableFactory,
-        IExtractResultsService extractResultsService)
+        IExtractResultsService extractResultsService,
+        IEtabsBootstrapService bootstrap)
     {
         _parquet = parquet;
         _tableFactory = tableFactory;
         _extractResultsService = extractResultsService;
+        _bootstrap = bootstrap;
     }
 
     public async Task<Result<ExtractMaterialsData>> ExtractMaterialsAsync(
@@ -102,17 +105,8 @@ public class ExtractMaterialsService : IExtractMaterialsService
         ExtractMaterialsRequest request,
         string tableKey)
     {
-        // ── Pre-flight ────────────────────────────────────────────────────────
-        if (!File.Exists(request.FilePath))
-            return Result.Fail<ExtractMaterialsData>($"File not found: {request.FilePath}");
-
         if (string.IsNullOrWhiteSpace(request.OutputDir))
             return Result.Fail<ExtractMaterialsData>("OutputDir cannot be empty");
-
-        // ── Resolve units (fail fast before starting ETABS) ───────────────────
-        var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(request.Units);
-        if (unitsError is not null)
-            return Result.Fail<ExtractMaterialsData>(unitsError);
 
         var tableSlug = ToSlug(tableKey);
         var outputFile = Path.Combine(request.OutputDir, $"{tableSlug}.parquet");
@@ -122,31 +116,17 @@ public class ExtractMaterialsService : IExtractMaterialsService
         Console.Error.WriteLine(
             $"ℹ extract-materials: '{tableKey}' → {outputFile}");
 
-        ETABSApplication? app = null;
         var sw = Stopwatch.StartNew();
+
+        var bootstrapResult = await _bootstrap.BootstrapAsync(request.FilePath, request.Units);
+        if (!bootstrapResult.Success || bootstrapResult.Data is null)
+            return Result.Fail<ExtractMaterialsData>(bootstrapResult.Error ?? "Bootstrap failed");
+
+        using var context = bootstrapResult.Data;
+        var app = context.App;
 
         try
         {
-            // ── Start ETABS ───────────────────────────────────────────────────
-            Console.Error.WriteLine("ℹ Starting ETABS (hidden)...");
-            app = ETABSWrapper.CreateNew();
-            if (app is null)
-                return Result.Fail<ExtractMaterialsData>("Failed to start ETABS hidden instance.");
-
-            app.Application.Hide();
-            Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
-
-            // ── Open file ─────────────────────────────────────────────────────
-            Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(request.FilePath)}");
-            int openRet = app.Model.Files.OpenFile(request.FilePath);
-            if (openRet != 0)
-                return Result.Fail<ExtractMaterialsData>($"OpenFile failed (ret={openRet})");
-
-            // ── Normalise units ───────────────────────────────────────────────
-            var unitService = new EtabsUnitService(app);
-            var unitSnapshot = await unitService.ReadAndNormaliseAsync(targetUnits);
-            Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
-
             // ── Fetch table ───────────────────────────────────────────────────
             // Material / geometry tables have no load case or combo dependency.
             // LoadCases and LoadCombos are null → EtabsTableQueryService does NOT
@@ -190,7 +170,7 @@ public class ExtractMaterialsService : IExtractMaterialsService
                     TableKey = tableKey,
                     RowCount = 0,
                     DiscardedRowCount = queryResult.DiscardedRowCount,
-                    Units = unitSnapshot.Active,
+                    Units = context.Units?.Active,
                     ExtractionTimeMs = sw.ElapsedMilliseconds
                 });
             }
@@ -216,18 +196,13 @@ public class ExtractMaterialsService : IExtractMaterialsService
                 TableKey = tableKey,
                 RowCount = writeResult.RowCount,
                 DiscardedRowCount = queryResult.DiscardedRowCount,
-                Units = unitSnapshot.Active,
+                Units = context.Units?.Active,
                 ExtractionTimeMs = sw.ElapsedMilliseconds
             });
         }
         catch (Exception ex)
         {
             return Result.Fail<ExtractMaterialsData>($"Fatal error: {ex.Message}");
-        }
-        finally
-        {
-            app?.Application.ApplicationExit(false);
-            app?.Dispose();
         }
     }
 
