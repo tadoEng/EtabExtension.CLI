@@ -23,6 +23,8 @@ public static class EtabsExtensions
         // factory.Create*(app) after they have opened the model.
         services.AddEtabsTableServices();
 
+        services.AddSingleton<IEtabsBootstrapService, EtabsBootstrapService>();
+
         return services;
     }
 }
