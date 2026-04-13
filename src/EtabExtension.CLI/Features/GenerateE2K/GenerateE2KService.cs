@@ -8,17 +8,19 @@ namespace EtabExtension.CLI.Features.GenerateE2K;
 
 public class GenerateE2KService : IGenerateE2KService
 {
+    private readonly IEtabsBootstrapService _bootstrap;
+
+    public GenerateE2KService(IEtabsBootstrapService bootstrap)
+    {
+        _bootstrap = bootstrap;
+    }
+
     public async Task<Result<GenerateE2KData>> GenerateE2KAsync(
         string inputFilePath,
         string outputFilePath,
         bool overwrite)
     {
-        await Task.CompletedTask;
-
         // Input validation — before touching COM
-        if (!File.Exists(inputFilePath))
-            return Result.Fail<GenerateE2KData>($"Input file not found: {inputFilePath}");
-
         if (!inputFilePath.EndsWith(".edb", StringComparison.OrdinalIgnoreCase))
             return Result.Fail<GenerateE2KData>("Input must be an .edb file");
 
@@ -30,23 +32,15 @@ public class GenerateE2KService : IGenerateE2KService
         if (!string.IsNullOrEmpty(outputDir))
             Directory.CreateDirectory(outputDir);
 
-        ETABSApplication? app = null;
+        var bootstrapResult = await _bootstrap.BootstrapAsync(inputFilePath);
+        if (!bootstrapResult.Success || bootstrapResult.Data is null)
+            return Result.Fail<GenerateE2KData>(bootstrapResult.Error ?? "Bootstrap failed");
+
+        using var context = bootstrapResult.Data;
+        var app = context.App;
         var stopwatch = Stopwatch.StartNew();
         try
         {
-            Console.Error.WriteLine("ℹ Starting ETABS (hidden)...");
-            app = ETABSWrapper.CreateNew();
-            if (app is null)
-                return Result.Fail<GenerateE2KData>("Failed to start ETABS hidden instance.");
-
-            app.Application.Hide();
-            Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
-
-            Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(inputFilePath)}");
-            int openRet = app.Model.Files.OpenFile(inputFilePath);
-            if (openRet != 0)
-                return Result.Fail<GenerateE2KData>($"OpenFile failed (ret={openRet})");
-
             Console.Error.WriteLine("ℹ Exporting to .e2k...");
             int exportRet = app.Model.Files.ExportFile(outputFilePath, eFileTypeIO.TextFile);
             stopwatch.Stop();
@@ -69,12 +63,6 @@ public class GenerateE2KService : IGenerateE2KService
         catch (Exception ex)
         {
             return Result.Fail<GenerateE2KData>($"ETABS COM error: {ex.Message}");
-        }
-        finally
-        {
-            // Mode B: always exit hidden instance
-            app?.Application.ApplicationExit(false);
-            app?.Dispose();
         }
     }
 }

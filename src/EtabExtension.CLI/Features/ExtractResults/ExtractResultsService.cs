@@ -40,33 +40,27 @@ public class ExtractResultsService : IExtractResultsService
     private readonly IEtabsTableServicesFactory _tableFactory;
     private readonly IParquetService _parquet;
     private readonly TableExtractorRegistry _registry;
+    private readonly IEtabsBootstrapService _bootstrap;
     private readonly ILogger<ExtractResultsService> _logger;
 
     public ExtractResultsService(
         IEtabsTableServicesFactory tableFactory,
         IParquetService parquet,
         TableExtractorRegistry registry,
+        IEtabsBootstrapService bootstrap,
         ILogger<ExtractResultsService> logger)
     {
         _tableFactory = tableFactory;
         _parquet = parquet;
         _registry = registry;
+        _bootstrap = bootstrap;
         _logger = logger;
     }
 
     public async Task<Result<ExtractResultsData>> ExtractAsync(ExtractResultsRequest request)
     {
-        // ── Pre-flight ────────────────────────────────────────────────────────
-        if (!File.Exists(request.FilePath))
-            return Result.Fail<ExtractResultsData>($"File not found: {request.FilePath}");
-
         if (string.IsNullOrWhiteSpace(request.OutputDir))
             return Result.Fail<ExtractResultsData>("OutputDir cannot be empty");
-
-        // ── Resolve units (fail fast before starting ETABS) ───────────────────
-        var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(request.Units);
-        if (unitsError is not null)
-            return Result.Fail<ExtractResultsData>(unitsError);
 
         Directory.CreateDirectory(request.OutputDir);
 
@@ -82,31 +76,17 @@ public class ExtractResultsService : IExtractResultsService
         Console.Error.WriteLine(
             $"ℹ extract-results: {planned.Count} table(s) requested → {request.OutputDir}");
 
-        ETABSApplication? app = null;
         var totalSw = Stopwatch.StartNew();
+
+        var bootstrapResult = await _bootstrap.BootstrapAsync(request.FilePath, request.Units);
+        if (!bootstrapResult.Success || bootstrapResult.Data is null)
+            return Result.Fail<ExtractResultsData>(bootstrapResult.Error ?? "Bootstrap failed");
+
+        using var context = bootstrapResult.Data;
+        var app = context.App;
 
         try
         {
-            // ── Start ETABS ───────────────────────────────────────────────────
-            Console.Error.WriteLine("ℹ Starting ETABS (hidden)...");
-            app = ETABSWrapper.CreateNew();
-            if (app is null)
-                return Result.Fail<ExtractResultsData>("Failed to start ETABS hidden instance.");
-
-            app.Application.Hide();
-            Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
-
-            // ── Open file ─────────────────────────────────────────────────────
-            Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(request.FilePath)}");
-            int openRet = app.Model.Files.OpenFile(request.FilePath);
-            if (openRet != 0)
-                return Result.Fail<ExtractResultsData>($"OpenFile failed (ret={openRet})");
-
-            // ── Normalise units ───────────────────────────────────────────────
-            var unitService = new EtabsUnitService(app);
-            var unitSnapshot = await unitService.ReadAndNormaliseAsync(targetUnits);
-            Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
-
             // ── Check analysis state ──────────────────────────────────────────
             bool isAnalyzed = app.Model.Analyze.AreAllCasesFinished();
             bool isLocked = app.Model.ModelInfo.IsLocked();
@@ -177,7 +157,7 @@ public class ExtractResultsService : IExtractResultsService
                 TotalRowCount = totalRows,
                 SucceededCount = succeeded,
                 FailedCount = failed,
-                Units = unitSnapshot.Active,
+                Units = context.Units?.Active,
                 ExtractionTimeMs = totalSw.ElapsedMilliseconds
             });
         }
@@ -185,11 +165,6 @@ public class ExtractResultsService : IExtractResultsService
         {
             _logger.LogError(ex, "ExtractResults fatal error");
             return Result.Fail<ExtractResultsData>($"Fatal error: {ex.Message}");
-        }
-        finally
-        {
-            app?.Application.ApplicationExit(false);
-            app?.Dispose();
         }
     }
 }
