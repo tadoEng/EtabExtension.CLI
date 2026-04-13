@@ -167,13 +167,18 @@ public class EtabsTableEditingService : IEtabsTableEditingService
                 AssertTableLoaded(table, tableKey);
                 var rows = table.GetStructuredData();
 
+                var rowLookup = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var r in rows)
+                {
+                    if (r.TryGetValue(keyField, out var v) && v != null && !rowLookup.ContainsKey(v))
+                    {
+                        rowLookup[v] = r;
+                    }
+                }
+
                 foreach (var (keyValue, newValue) in updates)
                 {
-                    var row = rows.FirstOrDefault(r =>
-                        r.TryGetValue(keyField, out var v) &&
-                        string.Equals(v, keyValue, StringComparison.OrdinalIgnoreCase));
-
-                    if (row is null)
+                    if (!rowLookup.TryGetValue(keyValue, out var row))
                     {
                         _logger.LogWarning(
                             "Row with {KeyField}='{KeyValue}' not found in '{TableKey}' — skipped",
@@ -220,13 +225,18 @@ public class EtabsTableEditingService : IEtabsTableEditingService
                 AssertTableLoaded(table, tableKey);
                 var rows = table.GetStructuredData();
 
+                var rowLookup = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var r in rows)
+                {
+                    if (r.TryGetValue(keyField, out var v) && v != null && !rowLookup.ContainsKey(v))
+                    {
+                        rowLookup[v] = r;
+                    }
+                }
+
                 foreach (var (keyValue, factor) in scaleFactors)
                 {
-                    var row = rows.FirstOrDefault(r =>
-                        r.TryGetValue(keyField, out var v) &&
-                        string.Equals(v, keyValue, StringComparison.OrdinalIgnoreCase));
-
-                    if (row is null)
+                    if (!rowLookup.TryGetValue(keyValue, out var row))
                     {
                         _logger.LogWarning(
                             "Row with {KeyField}='{KeyValue}' not found in '{TableKey}' — skipped",
