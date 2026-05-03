@@ -42,6 +42,11 @@ public record StoryInfo(string Name, double Elevation);
 
 internal static class ModelMetadataUnits
 {
-    public static string Format(UnitInfo units) =>
+    /// <summary>
+    /// Returns a human-readable units string (e.g. "kip/ft/F").
+    /// This is for display only — it is NOT a canonical preset string and
+    /// cannot be round-tripped back through <see cref="EtabsUnitPreset.Resolve"/>.
+    /// </summary>
+    public static string FormatDisplay(UnitInfo units) =>
         $"{units.Force}/{units.Length}/{units.Temperature}";
 }

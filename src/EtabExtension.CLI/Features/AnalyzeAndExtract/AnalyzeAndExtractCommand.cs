@@ -73,6 +73,15 @@ public static class AnalyzeAndExtractCommand
             var outputDir = parseResult.GetValue(outputDirOption);
             var requestJson = parseResult.GetValue(requestJsonOption);
 
+            // --file and --output-dir are always required regardless of --request mode.
+            if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(outputDir))
+            {
+                var fail = Result.Fail<AnalyzeAndExtractData>(
+                    "--file and --output-dir are required");
+                Environment.Exit(fail.ExitWithResult());
+                return;
+            }
+
             AnalyzeAndExtractRequest request;
             if (!string.IsNullOrWhiteSpace(requestJson))
             {
@@ -101,31 +110,13 @@ public static class AnalyzeAndExtractCommand
             }
             else
             {
-                if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(outputDir))
-                {
-                    var fail = Result.Fail<AnalyzeAndExtractData>(
-                        "--file and --output-dir are required when --request is not provided");
-                    Environment.Exit(fail.ExitWithResult());
-                    return;
-                }
-
                 request = BuildFlatRequest(
-                    filePath!,
-                    outputDir!,
                     parseResult.GetValue(unitsOption),
                     parseResult.GetValue(casesOption));
             }
 
-            var (_, unitsError) = EtabsUnitPreset.Resolve(request.Units);
-            if (unitsError is not null)
-            {
-                var fail = Result.Fail<AnalyzeAndExtractData>(unitsError);
-                Environment.Exit(fail.ExitWithResult());
-                return;
-            }
-
             var service = services.GetRequiredService<IAnalyzeAndExtractService>();
-            var result = await service.AnalyzeAndExtractAsync(request);
+            var result = await service.AnalyzeAndExtractAsync(filePath!, outputDir!, request);
             Environment.Exit(result.ExitWithResult());
         });
 
@@ -133,15 +124,11 @@ public static class AnalyzeAndExtractCommand
     }
 
     internal static AnalyzeAndExtractRequest BuildFlatRequest(
-        string filePath,
-        string outputDir,
         string? units,
         string[]? rawCases)
     {
         return new AnalyzeAndExtractRequest
         {
-            FilePath = filePath,
-            OutputDir = outputDir,
             Units = units,
             Cases = SplitCases(rawCases),
             Tables = BuildDefaultTableSelections()

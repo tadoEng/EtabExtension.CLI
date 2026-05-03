@@ -133,8 +133,7 @@ public class EtabsTableQueryService : IEtabsTableQueryService
         catch (Exception ex)
         {
             _logger.LogWarning("GetAllLoadCaseNames failed: {Error}", ex.Message);
-            _cachedCaseNames = Array.Empty<string>();
-            return _cachedCaseNames;
+            return Array.Empty<string>(); // do not cache — allow retry on next call
         }
     }
 
@@ -151,8 +150,7 @@ public class EtabsTableQueryService : IEtabsTableQueryService
         catch (Exception ex)
         {
             _logger.LogWarning("GetAllLoadComboNames failed: {Error}", ex.Message);
-            _cachedComboNames = Array.Empty<string>();
-            return _cachedComboNames;
+            return Array.Empty<string>(); // do not cache — allow retry on next call
         }
     }
 

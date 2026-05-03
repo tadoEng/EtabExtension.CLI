@@ -7,6 +7,7 @@ using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using EtabSharp.Core;
+using EtabSharp.System.Models;
 using System.Diagnostics;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs;
@@ -28,16 +29,14 @@ internal static class EtabsSessionHelpers
         return Result.Ok();
     }
 
+    /// <summary>
+    /// Applies an already-resolved <see cref="Units"/> preset to the open ETABS model.
+    /// The caller is responsible for resolving and validating the preset before ETABS starts.
+    /// </summary>
     internal static async Task<UnitSnapshot> NormaliseUnitsAsync(
         ETABSApplication app,
-        string? units)
+        Units targetUnits)
     {
-        var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(units);
-        if (unitsError is not null)
-        {
-            throw new ArgumentException(unitsError, nameof(units));
-        }
-
         var unitService = new EtabsUnitService(app);
         var unitSnapshot = await unitService.ReadAndNormaliseAsync(targetUnits);
         Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
@@ -225,7 +224,7 @@ internal static class EtabsSessionHelpers
             EtabsVersion = app.FullVersion,
             IsAnalyzed = ReadOrDefault("analysis state", () => app.Model.Analyze.AreAllCasesFinished(), false),
             IsLocked = ReadOrDefault("lock state", () => app.Model.ModelInfo.IsLocked(), false),
-            Units = ModelMetadataUnits.Format(unitSnapshot.Active),
+            Units = ModelMetadataUnits.FormatDisplay(unitSnapshot.Active),
             LoadCases = ReadLoadCases(app),
             LoadCombinations = ReadLoadCombinations(app),
             Stories = ReadStories(app),

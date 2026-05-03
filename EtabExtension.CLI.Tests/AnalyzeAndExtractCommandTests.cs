@@ -12,8 +12,6 @@ public class AnalyzeAndExtractCommandTests
     public void BuildFlatRequestSelectsAllDefaultTables()
     {
         var request = AnalyzeAndExtractCommand.BuildFlatRequest(
-            filePath: "tower.edb",
-            outputDir: "results",
             units: null,
             rawCases: null);
 
@@ -36,8 +34,6 @@ public class AnalyzeAndExtractCommandTests
     public void BuildFlatRequestSplitsCommaAndSpaceSeparatedCases()
     {
         var request = AnalyzeAndExtractCommand.BuildFlatRequest(
-            filePath: "tower.edb",
-            outputDir: "results",
             units: "SI_kN_m",
             rawCases: ["DEAD,LIVE", "EQX", "EQY, WINDX"]);
 

@@ -5,12 +5,6 @@ namespace EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
 
 public record AnalyzeAndExtractRequest
 {
-    [JsonPropertyName("filePath")]
-    public string FilePath { get; init; } = string.Empty;
-
-    [JsonPropertyName("outputDir")]
-    public string OutputDir { get; init; } = string.Empty;
-
     [JsonPropertyName("units")]
     public string? Units { get; init; }
 
