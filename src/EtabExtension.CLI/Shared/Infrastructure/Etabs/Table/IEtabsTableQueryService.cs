@@ -136,12 +136,13 @@ public record TableQueryResult
 ///   2. Fetch the table once per group, or once with no group.
 ///   3. Merge and de-duplicate rows across groups.
 ///   4. Discard rows where every field value is empty (configurable).
-///   5. Reset ETABS display selection back to all-selected.
+///   5. Caller resets ETABS display selection once after the extraction run.
 /// </summary>
 public interface IEtabsTableQueryService
 {
     Task<TableQueryResult> QueryAsync(TableQueryRequest request);
     Task ClearLoadSelectionAsync();
+    Task ResetSelectionAsync();
     Task<TableDataArrayResult> GetTableArrayAsync(
         string tableKey,
         string? groupName = null,

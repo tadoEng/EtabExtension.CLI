@@ -4,6 +4,7 @@
 using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Features.ExtractResults.Tables;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using EtabExtension.CLI.Shared.Infrastructure.Parquet;
@@ -120,40 +121,15 @@ public class ExtractResultsService : IExtractResultsService
                 Console.Error.WriteLine("ℹ Model is analyzed and locked — all tables available");
 
             // ── Extract ───────────────────────────────────────────────────────
-            var queryService = _tableFactory.CreateQueryService(app);
-            var outcomes = new Dictionary<string, TableExtractionOutcome>();
-
-            foreach (var entry in _registry.Entries)
-            {
-                var filter = entry.FilterSelector(request.Tables);
-                if (filter is null)
-                {
-                    _logger.LogDebug("Skipping '{Label}' (not in request)", entry.Extractor.Label);
-                    continue;
-                }
-
-                Console.Error.WriteLine(
-                    $"ℹ [{outcomes.Count + 1}/{planned.Count}] Extracting: {entry.Extractor.Label}");
-
-                TableExtractionOutcome outcome;
-                if (entry.Extractor.RequiresAnalysis && (!isAnalyzed || !isLocked))
-                {
-                    outcome = TableExtractionOutcome.Fail(
-                        "Model has no analysis results. Run analysis first (run-analysis command).");
-                    Console.Error.WriteLine("  ⚠ Skipped — model not analyzed");
-                }
-                else
-                {
-                    outcome = await entry.Extractor.ExtractAsync(
-                        filter, request.OutputDir, queryService, _parquet);
-                }
-
-                outcomes[entry.Extractor.Slug] = outcome;
-                var status = outcome.Success
-                    ? $"✓ {outcome.RowCount} rows → {Path.GetFileName(outcome.OutputFile ?? "(empty)")} ({outcome.ExtractionTimeMs} ms)"
-                    : $"✗ FAILED: {outcome.Error}";
-                Console.Error.WriteLine($"  {status}");
-            }
+            var outcomes = await EtabsSessionHelpers.ExtractTablesOnOpenModelAsync(
+                app,
+                request.Tables,
+                request.OutputDir,
+                isAnalyzed,
+                isLocked,
+                _tableFactory,
+                _registry,
+                _parquet);
 
             totalSw.Stop();
 

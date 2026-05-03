@@ -12,6 +12,8 @@ public class EtabsTableQueryService : IEtabsTableQueryService
 {
     private readonly ETABSApplication _app;
     private readonly ILogger<EtabsTableQueryService> _logger;
+    private string[]? _cachedCaseNames;
+    private string[]? _cachedComboNames;
 
     public EtabsTableQueryService(ETABSApplication app, ILogger<EtabsTableQueryService> logger)
     {
@@ -112,11 +114,6 @@ public class EtabsTableQueryService : IEtabsTableQueryService
             _logger.LogError(ex, "QueryAsync failed for table '{TableKey}'", request.TableKey);
             return TableQueryResult.Fail(request.TableKey, ex.Message);
         }
-        finally
-        {
-            // ── Step 5: reset selection — leave ETABS in a clean state ────────
-            await ResetSelectionAsync();
-        }
     }
 
     public async Task ClearLoadSelectionAsync() => await ResetSelectionAsync();
@@ -125,21 +122,37 @@ public class EtabsTableQueryService : IEtabsTableQueryService
 
     private string[] GetAllLoadCaseNames()
     {
-        try { return _app.Model.LoadCases.GetNameList() ?? Array.Empty<string>(); }
+        if (_cachedCaseNames is not null)
+            return _cachedCaseNames;
+
+        try
+        {
+            _cachedCaseNames = _app.Model.LoadCases.GetNameList() ?? Array.Empty<string>();
+            return _cachedCaseNames;
+        }
         catch (Exception ex)
         {
             _logger.LogWarning("GetAllLoadCaseNames failed: {Error}", ex.Message);
-            return Array.Empty<string>();
+            _cachedCaseNames = Array.Empty<string>();
+            return _cachedCaseNames;
         }
     }
 
     private string[] GetAllLoadComboNames()
     {
-        try { return _app.Model.LoadCombinations.GetNameList() ?? Array.Empty<string>(); }
+        if (_cachedComboNames is not null)
+            return _cachedComboNames;
+
+        try
+        {
+            _cachedComboNames = _app.Model.LoadCombinations.GetNameList() ?? Array.Empty<string>();
+            return _cachedComboNames;
+        }
         catch (Exception ex)
         {
             _logger.LogWarning("GetAllLoadComboNames failed: {Error}", ex.Message);
-            return Array.Empty<string>();
+            _cachedComboNames = Array.Empty<string>();
+            return _cachedComboNames;
         }
     }
 
@@ -200,9 +213,9 @@ public class EtabsTableQueryService : IEtabsTableQueryService
 
     /// <summary>
     /// Resets ETABS display selection back to all cases and all combos after
-    /// every query so the next table in the session starts from a known clean state.
+    /// an extraction run so the ETABS session returns to a known clean state.
     /// </summary>
-    private async Task ResetSelectionAsync()
+    public async Task ResetSelectionAsync()
     {
         await Task.CompletedTask;
 

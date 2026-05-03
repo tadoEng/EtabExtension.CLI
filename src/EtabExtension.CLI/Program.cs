@@ -1,4 +1,5 @@
 using System.CommandLine;
+using EtabExtension.CLI.Features.AnalyzeAndExtract;
 using EtabExtension.CLI.Features.CloseModel;
 using EtabExtension.CLI.Features.ExtractMaterials;
 using EtabExtension.CLI.Features.ExtractResults;
@@ -25,7 +26,8 @@ builder.Services
     .AddGenerateE2KFeature()
     .AddExtractMaterialsFeature()
     .AddRunAnalysisFeature()
-    .AddExtractResultsFeature();
+    .AddExtractResultsFeature()
+    .AddAnalyzeAndExtractFeature();
 
 var app = builder.Build();
 
@@ -42,5 +44,6 @@ rootCommand.Subcommands.Add(GenerateE2KCommand.Create(app.Services));
 rootCommand.Subcommands.Add(ExtractMaterialsCommand.Create(app.Services));
 rootCommand.Subcommands.Add(RunAnalysisCommand.Create(app.Services));
 rootCommand.Subcommands.Add(ExtractResultsCommand.Create(app.Services));
+rootCommand.Subcommands.Add(AnalyzeAndExtractCommand.Create(app.Services));
 
 return await rootCommand.Parse(args).InvokeAsync();
