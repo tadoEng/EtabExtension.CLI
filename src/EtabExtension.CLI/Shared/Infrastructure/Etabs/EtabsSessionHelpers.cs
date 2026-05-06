@@ -3,11 +3,13 @@ using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Features.ExtractResults.Tables;
 using EtabExtension.CLI.Features.RunAnalysis.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Metadata;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using EtabSharp.Core;
 using EtabSharp.System.Models;
+using ETABSv1;
 using System.Diagnostics;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs;
@@ -217,18 +219,27 @@ internal static class EtabsSessionHelpers
         await Task.CompletedTask;
 
         Console.Error.WriteLine("ℹ Collecting model metadata...");
+        _warnings = [];
+        var groups = ReadGroups(app);
 
         var metadata = new ModelMetadata
         {
+            SchemaVersion = 2,
             FilePath = filePath,
             EtabsVersion = app.FullVersion,
             IsAnalyzed = ReadOrDefault("analysis state", () => app.Model.Analyze.AreAllCasesFinished(), false),
             IsLocked = ReadOrDefault("lock state", () => app.Model.ModelInfo.IsLocked(), false),
             Units = ModelMetadataUnits.FormatDisplay(unitSnapshot.Active),
+            LoadPatterns = ReadLoadPatterns(app),
             LoadCases = ReadLoadCases(app),
             LoadCombinations = ReadLoadCombinations(app),
             Stories = ReadStories(app),
-            Groups = ReadOrDefault("groups", () => app.Model.Groups.GetNameList().ToList(), []),
+            Groups = groups.Names,
+            GroupDetails = groups.Details,
+            Materials = ReadMaterials(app),
+            FrameSections = ReadFrameSections(app),
+            AreaSections = ReadAreaSections(app),
+            Warnings = _metadataWarnings,
             CollectedAt = DateTimeOffset.UtcNow
         };
 
@@ -238,10 +249,52 @@ internal static class EtabsSessionHelpers
         return metadata;
     }
 
+    [ThreadStatic]
+    private static List<MetadataWarning>? _warnings;
+
+    private static List<MetadataWarning> _metadataWarnings
+    {
+        get
+        {
+            _warnings ??= [];
+            return _warnings;
+        }
+    }
+
     private static int RunSpecificCases(ETABSApplication app)
     {
         app.SapModel.Analyze.CreateAnalysisModel();
         return app.SapModel.Analyze.RunAnalysis();
+    }
+
+    private static List<LoadPatternInfo> ReadLoadPatterns(ETABSApplication app)
+    {
+        try
+        {
+            var result = new List<LoadPatternInfo>();
+            foreach (var name in app.Model.LoadPatterns.GetNameList())
+            {
+                var loadType = ReadItemOrDefault(
+                    "loadPatterns",
+                    $"load pattern '{name}' type",
+                    () => app.Model.LoadPatterns.GetLoadType(name).ToString(),
+                    "Unknown");
+                var selfWeight = ReadItemOrDefault(
+                    "loadPatterns",
+                    $"load pattern '{name}' self-weight multiplier",
+                    () => app.Model.LoadPatterns.GetSelfWeightMultiplier(name),
+                    0.0);
+
+                result.Add(new LoadPatternInfo(name, loadType, selfWeight));
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Warn("loadPatterns", $"Could not read load patterns: {ex.Message}");
+            return [];
+        }
     }
 
     private static List<LoadCaseInfo> ReadLoadCases(ETABSApplication app)
@@ -258,7 +311,7 @@ internal static class EtabsSessionHelpers
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"⚠ Could not read load case '{name}' type: {ex.Message}");
+                    Warn("loadCases", $"Could not read load case '{name}' type: {ex.Message}");
                     result.Add(new LoadCaseInfo(name, "Unknown"));
                 }
             }
@@ -267,7 +320,7 @@ internal static class EtabsSessionHelpers
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"⚠ Could not read load cases: {ex.Message}");
+            Warn("loadCases", $"Could not read load cases: {ex.Message}");
             return [];
         }
     }
@@ -281,6 +334,7 @@ internal static class EtabsSessionHelpers
             {
                 var comboType = "Unknown";
                 var cases = new List<string>();
+                var items = new List<LoadComboItemInfo>();
 
                 try
                 {
@@ -288,36 +342,68 @@ internal static class EtabsSessionHelpers
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"⚠ Could not read combo '{name}' type: {ex.Message}");
+                    Warn("loadCombinations", $"Could not read combo '{name}' type: {ex.Message}");
                 }
 
                 try
                 {
-                    cases = app.Model.LoadCombinations
-                        .GetCaseList(name)
-                        .Select(c => c.CaseName)
-                        .Where(c => !string.IsNullOrWhiteSpace(c))
+                    var comboItems = app.Model.LoadCombinations.GetCaseList(name);
+                    items = comboItems
+                        .Where(c => !string.IsNullOrWhiteSpace(c.CaseName))
+                        .Select(c => new LoadComboItemInfo(
+                            c.CaseName,
+                            c.CaseType.ToString(),
+                            c.ScaleFactor,
+                            c.ModeNumber))
+                        .ToList();
+                    cases = items
+                        .Select(i => i.Name)
                         .Distinct(StringComparer.OrdinalIgnoreCase)
                         .ToList();
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"⚠ Could not read combo '{name}' cases: {ex.Message}");
+                    Warn("loadCombinations", $"Could not read combo '{name}' cases: {ex.Message}");
                 }
 
-                result.Add(new LoadComboInfo(name, comboType, cases));
+                result.Add(new LoadComboInfo(name, comboType, cases, items));
             }
 
             return result;
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"⚠ Could not read load combinations: {ex.Message}");
+            Warn("loadCombinations", $"Could not read load combinations: {ex.Message}");
             return [];
         }
     }
 
     private static List<StoryInfo> ReadStories(ETABSApplication app)
+    {
+        try
+        {
+            var result = new List<StoryInfo>();
+            var stories = app.Model.Story.GetStories();
+            for (var i = 0; i < stories.NumberStories; i++)
+            {
+                result.Add(new StoryInfo(
+                    stories.StoryNames[i],
+                    stories.StoryElevations[i],
+                    SafeArrayValue(stories.StoryHeights, i),
+                    SafeArrayValue(stories.IsMasterStory, i),
+                    SafeArrayValue(stories.SimilarToStory, i)));
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Warn("stories", $"Could not read rich stories: {ex.Message}");
+            return ReadStoryNamesAndElevations(app);
+        }
+    }
+
+    private static List<StoryInfo> ReadStoryNamesAndElevations(ETABSApplication app)
     {
         try
         {
@@ -330,7 +416,7 @@ internal static class EtabsSessionHelpers
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"⚠ Could not read story '{name}' elevation: {ex.Message}");
+                    Warn("stories", $"Could not read story '{name}' elevation: {ex.Message}");
                 }
             }
 
@@ -338,7 +424,208 @@ internal static class EtabsSessionHelpers
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"⚠ Could not read stories: {ex.Message}");
+            Warn("stories", $"Could not read stories: {ex.Message}");
+            return [];
+        }
+    }
+
+    private static (List<string> Names, List<GroupInfo> Details) ReadGroups(ETABSApplication app)
+    {
+        try
+        {
+            var names = app.Model.Groups.GetNameList().ToList();
+            var details = names
+                .Select(name =>
+                {
+                    var count = ReadItemOrDefault(
+                        "groups",
+                        $"group '{name}' assignment count",
+                        () => app.Model.Groups.GetAssignmentCount(name),
+                        0);
+                    return new GroupInfo(name, count);
+                })
+                .ToList();
+
+            return (names, details);
+        }
+        catch (Exception ex)
+        {
+            Warn("groups", $"Could not read groups: {ex.Message}");
+            return ([], []);
+        }
+    }
+
+    private static List<MaterialInfo> ReadMaterials(ETABSApplication app)
+    {
+        try
+        {
+            var result = new List<MaterialInfo>();
+            foreach (var name in app.Model.Materials.GetNameList())
+            {
+                result.Add(ReadMaterial(app, name));
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Warn("materials", $"Could not read materials: {ex.Message}");
+            return [];
+        }
+    }
+
+    private static MaterialInfo ReadMaterial(ETABSApplication app, string name)
+    {
+        var materialType = "Unknown";
+        string? symType = null;
+        string? guid = null;
+        double? e = null;
+        double? u = null;
+        double? a = null;
+        double? g = null;
+        double? weight = null;
+        double? mass = null;
+        double? concreteFc = null;
+        double? steelFy = null;
+        double? steelFu = null;
+        double? rebarFy = null;
+        double? rebarFu = null;
+        eMatType? etabsMaterialType = null;
+
+        try
+        {
+            var basic = app.Model.Materials.GetMaterial(name);
+            materialType = basic.MatType.ToString();
+            guid = string.IsNullOrWhiteSpace(basic.GUID) ? null : basic.GUID;
+            etabsMaterialType = basic.MatType;
+        }
+        catch (Exception ex)
+        {
+            Warn("materials", $"Could not read material '{name}' basic info: {ex.Message}");
+        }
+
+        try
+        {
+            var type = app.Model.Materials.GetTypeOAPI(name);
+            etabsMaterialType = type.MatType;
+            materialType = type.MatType.ToString();
+            symType = type.SymType.ToString();
+        }
+        catch (Exception ex)
+        {
+            Warn("materials", $"Could not read material '{name}' OAPI type: {ex.Message}");
+        }
+
+        try
+        {
+            var iso = app.Model.Materials.GetMPIsotropic(name);
+            e = iso.E;
+            u = iso.U;
+            a = iso.A;
+            g = iso.G;
+        }
+        catch (Exception ex)
+        {
+            Warn("materials", $"Could not read material '{name}' isotropic properties: {ex.Message}");
+        }
+
+        try
+        {
+            var wm = app.Model.Materials.GetWeightAndMass(name);
+            weight = wm.W;
+            mass = wm.M;
+        }
+        catch (Exception ex)
+        {
+            Warn("materials", $"Could not read material '{name}' weight/mass: {ex.Message}");
+        }
+
+        try
+        {
+            switch (etabsMaterialType)
+            {
+                case eMatType.Concrete:
+                    concreteFc = app.Model.Materials.GetConcreteMaterial(name).Fc;
+                    break;
+                case eMatType.Steel:
+                    var steel = app.Model.Materials.GetSteelMaterial(name);
+                    steelFy = steel.Fy;
+                    steelFu = steel.Fu;
+                    break;
+                case eMatType.Rebar:
+                    var rebar = app.Model.Materials.GetRebarMaterial(name);
+                    rebarFy = rebar.Fy;
+                    rebarFu = rebar.Fu;
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Warn("materials", $"Could not read material '{name}' design properties: {ex.Message}");
+        }
+
+        return new MaterialInfo
+        {
+            Name = name,
+            MaterialType = materialType,
+            SymType = symType,
+            MaterialGuid = guid,
+            ElasticModulus = e,
+            PoissonRatio = u,
+            ThermalExpansion = a,
+            ShearModulus = g,
+            WeightPerVolume = weight,
+            MassPerVolume = mass,
+            ConcreteFc = concreteFc,
+            SteelFy = steelFy,
+            SteelFu = steelFu,
+            RebarFy = rebarFy,
+            RebarFu = rebarFu
+        };
+    }
+
+    private static List<FrameSectionInfo> ReadFrameSections(ETABSApplication app)
+    {
+        try
+        {
+            return app.Model.PropFrame.GetNameList()
+                .Select(name =>
+                {
+                    var sectionType = ReadItemOrDefault(
+                        "frameSections",
+                        $"frame section '{name}' type",
+                        () => app.Model.PropFrame.GetSectionType(name).ToString(),
+                        "Unknown");
+                    return new FrameSectionInfo(name, sectionType);
+                })
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            Warn("frameSections", $"Could not read frame sections: {ex.Message}");
+            return [];
+        }
+    }
+
+    private static List<AreaSectionInfo> ReadAreaSections(ETABSApplication app)
+    {
+        try
+        {
+            return app.Model.PropArea.GetNameList()
+                .Select(name =>
+                {
+                    var propertyType = ReadItemOrDefault(
+                        "areaSections",
+                        $"area section '{name}' type",
+                        () => app.Model.PropArea.GetPropertyType(name).ToString(),
+                        "Unknown");
+                    return new AreaSectionInfo(name, propertyType);
+                })
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            Warn("areaSections", $"Could not read area sections: {ex.Message}");
             return [];
         }
     }
@@ -351,10 +638,34 @@ internal static class EtabsSessionHelpers
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"⚠ Could not read {label}: {ex.Message}");
+            Warn(label, $"Could not read {label}: {ex.Message}");
             return fallback;
         }
     }
+
+    private static T ReadItemOrDefault<T>(string category, string label, Func<T> read, T fallback)
+    {
+        try
+        {
+            return read();
+        }
+        catch (Exception ex)
+        {
+            Warn(category, $"Could not read {label}: {ex.Message}");
+            return fallback;
+        }
+    }
+
+    private static void Warn(string category, string message)
+    {
+        Console.Error.WriteLine($"⚠ {message}");
+        _metadataWarnings.Add(new MetadataWarning(category, message));
+    }
+
+    private static T? SafeArrayValue<T>(T[]? values, int index) =>
+        values is not null && index >= 0 && index < values.Length
+            ? values[index]
+            : default;
 
     private static string ComboTypeLabel(int comboType) => comboType switch
     {

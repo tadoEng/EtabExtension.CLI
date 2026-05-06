@@ -7,6 +7,7 @@ using EtabExtension.CLI.Features.GenerateE2K;
 using EtabExtension.CLI.Features.GetStatus;
 using EtabExtension.CLI.Features.OpenModel;
 using EtabExtension.CLI.Features.RunAnalysis;
+using EtabExtension.CLI.Features.SnapshotExport;
 using EtabExtension.CLI.Features.UnlockModel;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using Microsoft.Extensions.Hosting;
@@ -27,7 +28,8 @@ builder.Services
     .AddExtractMaterialsFeature()
     .AddRunAnalysisFeature()
     .AddExtractResultsFeature()
-    .AddAnalyzeAndExtractFeature();
+    .AddAnalyzeAndExtractFeature()
+    .AddSnapshotExportFeature();
 
 var app = builder.Build();
 
@@ -45,5 +47,6 @@ rootCommand.Subcommands.Add(ExtractMaterialsCommand.Create(app.Services));
 rootCommand.Subcommands.Add(RunAnalysisCommand.Create(app.Services));
 rootCommand.Subcommands.Add(ExtractResultsCommand.Create(app.Services));
 rootCommand.Subcommands.Add(AnalyzeAndExtractCommand.Create(app.Services));
+rootCommand.Subcommands.Add(SnapshotExportCommand.Create(app.Services));
 
 return await rootCommand.Parse(args).InvokeAsync();

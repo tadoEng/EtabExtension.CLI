@@ -4,9 +4,9 @@ using EtabExtension.CLI.Shared.Infrastructure.Etabs.Metrics;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using System.Text.Json.Serialization;
 
-namespace EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
+namespace EtabExtension.CLI.Features.SnapshotExport.Models;
 
-public record AnalyzeAndExtractData
+public record SnapshotExportData
 {
     [JsonPropertyName("filePath")]
     public string FilePath { get; init; } = string.Empty;
@@ -14,17 +14,14 @@ public record AnalyzeAndExtractData
     [JsonPropertyName("outputDir")]
     public string OutputDir { get; init; } = string.Empty;
 
-    [JsonPropertyName("casesRequested")]
-    public List<string>? CasesRequested { get; init; }
+    [JsonPropertyName("e2kFile")]
+    public string E2KFile { get; init; } = string.Empty;
 
-    [JsonPropertyName("caseCount")]
-    public long CaseCount { get; init; }
+    [JsonPropertyName("e2kSizeBytes")]
+    public long E2KSizeBytes { get; init; }
 
-    [JsonPropertyName("finishedCaseCount")]
-    public long FinishedCaseCount { get; init; }
-
-    [JsonPropertyName("analysisTimeMs")]
-    public long AnalysisTimeMs { get; init; }
+    [JsonPropertyName("materialsDir")]
+    public string MaterialsDir { get; init; } = string.Empty;
 
     [JsonPropertyName("tables")]
     public Dictionary<string, TableExtractionOutcome> Tables { get; init; } = [];
@@ -37,9 +34,6 @@ public record AnalyzeAndExtractData
 
     [JsonPropertyName("failedCount")]
     public long FailedCount { get; init; }
-
-    [JsonPropertyName("extractionTimeMs")]
-    public long ExtractionTimeMs { get; init; }
 
     [JsonPropertyName("metadata")]
     public ModelMetadata? Metadata { get; init; }

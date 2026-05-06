@@ -13,4 +13,13 @@ public record AnalyzeAndExtractRequest
 
     [JsonPropertyName("tables")]
     public TableSelections Tables { get; init; } = new();
+
+    [JsonPropertyName("metadataOutputPath")]
+    public string? MetadataOutputPath { get; init; }
+
+    [JsonPropertyName("metricsOutputPath")]
+    public string? MetricsOutputPath { get; init; }
+
+    [JsonPropertyName("extractionProfile")]
+    public string? ExtractionProfile { get; init; }
 }

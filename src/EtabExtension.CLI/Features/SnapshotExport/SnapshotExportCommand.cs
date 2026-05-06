@@ -1,14 +1,14 @@
 using System.CommandLine;
 using System.Text.Json;
-using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
 using EtabExtension.CLI.Features.ExtractResults.Models;
+using EtabExtension.CLI.Features.SnapshotExport.Models;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using Microsoft.Extensions.DependencyInjection;
 
-namespace EtabExtension.CLI.Features.AnalyzeAndExtract;
+namespace EtabExtension.CLI.Features.SnapshotExport;
 
-public static class AnalyzeAndExtractCommand
+public static class SnapshotExportCommand
 {
     private static readonly JsonSerializerOptions RequestJsonOptions = new()
     {
@@ -18,8 +18,8 @@ public static class AnalyzeAndExtractCommand
     public static Command Create(IServiceProvider services)
     {
         var command = new Command(
-            "analyze-and-extract",
-            "Run ETABS analysis and extract result tables in one hidden ETABS session");
+            "snapshot-export",
+            "Export E2K, snapshot tables, and model metadata in one hidden ETABS session");
 
         var fileOption = new Option<string?>("--file")
         {
@@ -30,7 +30,7 @@ public static class AnalyzeAndExtractCommand
 
         var outputDirOption = new Option<string?>("--output-dir")
         {
-            Description = "Directory for parquet output and model-metadata.json",
+            Description = "Directory for model.e2k, materials, and model-metadata.json",
             Required = false
         };
         outputDirOption.Aliases.Add("-o");
@@ -38,39 +38,29 @@ public static class AnalyzeAndExtractCommand
         var unitsOption = new Option<string?>("--units")
         {
             Description =
-                $"Unit preset to normalise to before running analysis. " +
+                $"Unit preset to normalise to before export. " +
                 $"Default: {EtabsUnitPreset.Default}. " +
                 $"Valid: {string.Join(", ", EtabsUnitPreset.All)}",
             Required = false
         };
         unitsOption.Aliases.Add("-u");
 
-        var casesOption = new Option<string[]?>("--cases")
-        {
-            Description = "Load case names to run. Supports space-separated tokens and comma-separated values.",
-            Required = false,
-            AllowMultipleArgumentsPerToken = true
-        };
-        casesOption.Aliases.Add("-c");
-
         var requestJsonOption = new Option<string?>("--request")
         {
-            Description =
-                "Full AnalyzeAndExtractRequest JSON. When provided, flat flags are ignored.",
+            Description = "Full SnapshotExportRequest JSON. When provided, flat flags are ignored.",
             Required = false
         };
         requestJsonOption.Aliases.Add("-r");
 
         var profileOption = new Option<string?>("--profile")
         {
-            Description = "Extraction profile for flat mode: full, results, geometry, or snapshot. Default: full.",
+            Description = "Extraction profile for flat mode: snapshot, geometry, results, or full. Default: snapshot.",
             Required = false
         };
 
         command.Options.Add(fileOption);
         command.Options.Add(outputDirOption);
         command.Options.Add(unitsOption);
-        command.Options.Add(casesOption);
         command.Options.Add(requestJsonOption);
         command.Options.Add(profileOption);
 
@@ -80,81 +70,62 @@ public static class AnalyzeAndExtractCommand
             var outputDir = parseResult.GetValue(outputDirOption);
             var requestJson = parseResult.GetValue(requestJsonOption);
 
-            // --file and --output-dir are always required regardless of --request mode.
             if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(outputDir))
             {
-                var fail = Result.Fail<AnalyzeAndExtractData>(
-                    "--file and --output-dir are required");
+                var fail = Result.Fail<SnapshotExportData>("--file and --output-dir are required");
                 Environment.Exit(fail.ExitWithResult());
                 return;
             }
 
-            AnalyzeAndExtractRequest request;
+            SnapshotExportRequest request;
             if (!string.IsNullOrWhiteSpace(requestJson))
             {
-                AnalyzeAndExtractRequest? parsedRequest;
                 try
                 {
-                    parsedRequest = JsonSerializer.Deserialize<AnalyzeAndExtractRequest>(
+                    request = JsonSerializer.Deserialize<SnapshotExportRequest>(
                         requestJson,
-                        RequestJsonOptions);
+                        RequestJsonOptions)
+                        ?? throw new JsonException("--request JSON deserialised to null");
                 }
                 catch (JsonException ex)
                 {
-                    var fail = Result.Fail<AnalyzeAndExtractData>($"Invalid --request JSON: {ex.Message}");
+                    var fail = Result.Fail<SnapshotExportData>($"Invalid --request JSON: {ex.Message}");
                     Environment.Exit(fail.ExitWithResult());
                     return;
                 }
-
-                if (parsedRequest is null)
-                {
-                    var fail = Result.Fail<AnalyzeAndExtractData>("--request JSON deserialised to null");
-                    Environment.Exit(fail.ExitWithResult());
-                    return;
-                }
-
-                request = parsedRequest;
             }
             else
             {
                 request = BuildFlatRequest(
                     parseResult.GetValue(unitsOption),
-                    parseResult.GetValue(casesOption),
                     parseResult.GetValue(profileOption));
             }
 
-            var service = services.GetRequiredService<IAnalyzeAndExtractService>();
-            var result = await service.AnalyzeAndExtractAsync(filePath!, outputDir!, request);
+            var service = services.GetRequiredService<ISnapshotExportService>();
+            var result = await service.SnapshotExportAsync(filePath!, outputDir!, request);
             Environment.Exit(result.ExitWithResult());
         });
 
         return command;
     }
 
-    internal static AnalyzeAndExtractRequest BuildFlatRequest(
-        string? units,
-        string[]? rawCases,
-        string? profile)
+    internal static SnapshotExportRequest BuildFlatRequest(string? units, string? profile)
     {
-        var normalisedProfile = ExtractionProfiles.Normalise(profile);
-        return new AnalyzeAndExtractRequest
+        var normalisedProfile = string.IsNullOrWhiteSpace(profile)
+            ? ExtractionProfiles.Snapshot
+            : ExtractionProfiles.Normalise(profile);
+        return new SnapshotExportRequest
         {
             Units = units,
-            Cases = SplitCases(rawCases),
+            E2KFileName = "model.e2k",
+            MaterialsDirName = "materials",
+            MetadataFileName = "model-metadata.json",
+            MetricsFileName = "run-metrics.json",
             ExtractionProfile = normalisedProfile,
             Tables = ExtractionProfiles.Build(normalisedProfile)
         };
     }
 
-    private static List<string>? SplitCases(string[]? rawCases)
-    {
-        var cases = rawCases?
-            .SelectMany(value => value.Split(
-                [',', ' '],
-                StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
-            .ToList();
-
-        return cases is { Count: > 0 } ? cases : null;
-    }
-
+    internal static TableSelections BuildSnapshotTableSelections() =>
+        ExtractionProfiles.Build(ExtractionProfiles.Snapshot);
 }

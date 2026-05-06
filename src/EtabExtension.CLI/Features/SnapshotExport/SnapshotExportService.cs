@@ -1,6 +1,7 @@
-using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
+using EtabExtension.CLI.Features.AnalyzeAndExtract;
 using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Features.ExtractResults.Tables;
+using EtabExtension.CLI.Features.SnapshotExport.Models;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Metadata;
@@ -9,24 +10,19 @@ using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using EtabSharp.Core;
+using ETABSv1;
 using System.Diagnostics;
 using System.Text.Json;
 
-namespace EtabExtension.CLI.Features.AnalyzeAndExtract;
+namespace EtabExtension.CLI.Features.SnapshotExport;
 
-public class AnalyzeAndExtractService : IAnalyzeAndExtractService
+public class SnapshotExportService : ISnapshotExportService
 {
-    public static readonly JsonSerializerOptions MetadataJsonOptions = new()
-    {
-        WriteIndented = true,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-    };
-
     private readonly IEtabsTableServicesFactory _tableFactory;
     private readonly TableExtractorRegistry _registry;
     private readonly IParquetService _parquet;
 
-    public AnalyzeAndExtractService(
+    public SnapshotExportService(
         IEtabsTableServicesFactory tableFactory,
         TableExtractorRegistry registry,
         IParquetService parquet)
@@ -36,48 +32,44 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
         _parquet = parquet;
     }
 
-    public async Task<Result<AnalyzeAndExtractData>> AnalyzeAndExtractAsync(
+    public async Task<Result<SnapshotExportData>> SnapshotExportAsync(
         string filePath,
         string outputDir,
-        AnalyzeAndExtractRequest request)
+        SnapshotExportRequest request)
     {
         if (!File.Exists(filePath))
         {
-            return Result.Fail<AnalyzeAndExtractData>($"File not found: {filePath}");
+            return Result.Fail<SnapshotExportData>($"File not found: {filePath}");
         }
 
         if (string.IsNullOrWhiteSpace(outputDir))
         {
-            return Result.Fail<AnalyzeAndExtractData>("OutputDir cannot be empty");
+            return Result.Fail<SnapshotExportData>("OutputDir cannot be empty");
         }
 
         var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(request.Units);
         if (unitsError is not null)
         {
-            return Result.Fail<AnalyzeAndExtractData>(unitsError);
+            return Result.Fail<SnapshotExportData>(unitsError);
         }
 
         var tables = ExtractionProfiles.Resolve(
             request.Tables,
             request.ExtractionProfile,
-            ExtractionProfiles.Full);
-        var planned = _registry.Entries
-            .Where(e => e.FilterSelector(tables) is not null)
-            .ToList();
-
-        if (planned.Count == 0)
-        {
-            return Result.Fail<AnalyzeAndExtractData>(
-                "No tables selected — all TableSelections properties are null. " +
-                "Set at least one table filter in the request.");
-        }
+            ExtractionProfiles.Snapshot);
 
         Directory.CreateDirectory(outputDir);
-        Console.Error.WriteLine($"ℹ analyze-and-extract: {filePath}");
+        var e2kFile = Path.Combine(outputDir, SafeFileName(request.E2KFileName, "model.e2k"));
+        var materialsDir = Path.Combine(outputDir, SafeFileName(request.MaterialsDirName, "materials"));
+        var metadataPath = Path.Combine(outputDir, SafeFileName(request.MetadataFileName, "model-metadata.json"));
+        var metricsPath = Path.Combine(outputDir, SafeFileName(request.MetricsFileName, "run-metrics.json"));
+        Directory.CreateDirectory(materialsDir);
+
+        Console.Error.WriteLine($"ℹ snapshot-export: {filePath}");
 
         ETABSApplication? app = null;
         var totalSw = Stopwatch.StartNew();
-        var metricsBuilder = new RunMetricsBuilder("analyze-and-extract", filePath, outputDir);
+        var metricsBuilder = new RunMetricsBuilder("snapshot-export", filePath, outputDir);
 
         try
         {
@@ -85,7 +77,7 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
             app = metricsBuilder.Measure("startEtabs", () => ETABSWrapper.CreateNew());
             if (app is null)
             {
-                return Result.Fail<AnalyzeAndExtractData>("Failed to start ETABS hidden instance.");
+                return Result.Fail<SnapshotExportData>("Failed to start ETABS hidden instance.");
             }
 
             app.Application.Hide();
@@ -96,46 +88,41 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
                 () => EtabsSessionHelpers.OpenFileAsync(app, filePath));
             if (!openResult.Success)
             {
-                return Result.Fail<AnalyzeAndExtractData>(openResult.Error ?? "OpenFile failed");
+                return Result.Fail<SnapshotExportData>(openResult.Error ?? "OpenFile failed");
             }
 
             var unitSnapshot = await metricsBuilder.MeasureAsync(
                 "normaliseUnits",
                 () => EtabsSessionHelpers.NormaliseUnitsAsync(app, targetUnits));
 
-            var analysisResult = await metricsBuilder.MeasureAsync(
-                "runAnalysis",
-                () => EtabsSessionHelpers.RunAnalysisOnOpenModelAsync(
-                    app,
-                    filePath,
-                    request.Cases,
-                    unitSnapshot));
-
-            if (!analysisResult.Success || analysisResult.Data is null)
+            Console.Error.WriteLine("ℹ Exporting to .e2k...");
+            var exportRet = metricsBuilder.Measure(
+                "exportE2k",
+                () => app.Model.Files.ExportFile(e2kFile, eFileTypeIO.TextFile));
+            if (exportRet != 0 || !File.Exists(e2kFile))
             {
-                return Result.Fail<AnalyzeAndExtractData>(
-                    analysisResult.Error ?? "Analysis failed");
+                return Result.Fail<SnapshotExportData>($"ExportFile failed (ret={exportRet})");
             }
 
-            bool isAnalyzed = app.Model.Analyze.AreAllCasesFinished();
-            bool isLocked = app.Model.ModelInfo.IsLocked();
+            var e2kSize = new FileInfo(e2kFile).Length;
+            Console.Error.WriteLine($"✓ Exported ({e2kSize / 1024.0:F1} KB)");
 
-            var extractionSw = Stopwatch.StartNew();
+            var isAnalyzed = app.Model.Analyze.AreAllCasesFinished();
+            var isLocked = app.Model.ModelInfo.IsLocked();
             var outcomes = await metricsBuilder.MeasureAsync(
                 "extractTables",
                 () => EtabsSessionHelpers.ExtractTablesOnOpenModelAsync(
                     app,
                     tables,
-                    outputDir,
+                    materialsDir,
                     isAnalyzed,
                     isLocked,
                     _tableFactory,
                     _registry,
                     _parquet));
-            extractionSw.Stop();
 
             ModelMetadata? metadata = null;
-            string? metadataPath = null;
+            string? writtenMetadataPath = null;
             try
             {
                 metadata = await metricsBuilder.MeasureAsync(
@@ -145,39 +132,26 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
                         filePath,
                         unitSnapshot));
 
-                metadataPath = string.IsNullOrWhiteSpace(request.MetadataOutputPath)
-                    ? Path.Combine(outputDir, "model-metadata.json")
-                    : request.MetadataOutputPath;
-                var metadataDir = Path.GetDirectoryName(metadataPath);
-                if (!string.IsNullOrWhiteSpace(metadataDir))
-                {
-                    Directory.CreateDirectory(metadataDir);
-                }
                 Console.Error.WriteLine("ℹ Writing model-metadata.json");
-                var metadataJson = JsonSerializer.Serialize(metadata, MetadataJsonOptions);
+                var metadataJson = JsonSerializer.Serialize(
+                    metadata,
+                    AnalyzeAndExtractService.MetadataJsonOptions);
                 await metricsBuilder.MeasureAsync(
                     "writeMetadata",
                     () => File.WriteAllTextAsync(metadataPath, metadataJson));
+                writtenMetadataPath = metadataPath;
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"⚠ Metadata collection failed: {ex.Message}");
-                metadata = null;
-                metadataPath = null;
             }
 
             totalSw.Stop();
             var metrics = metricsBuilder.Build(totalSw.ElapsedMilliseconds);
-            var metricsPath = string.IsNullOrWhiteSpace(request.MetricsOutputPath)
-                ? Path.Combine(outputDir, "run-metrics.json")
-                : request.MetricsOutputPath;
-            var metricsDir = Path.GetDirectoryName(metricsPath);
-            if (!string.IsNullOrWhiteSpace(metricsDir))
-            {
-                Directory.CreateDirectory(metricsDir);
-            }
             Console.Error.WriteLine("ℹ Writing run-metrics.json");
-            var metricsJson = JsonSerializer.Serialize(metrics, MetadataJsonOptions);
+            var metricsJson = JsonSerializer.Serialize(
+                metrics,
+                AnalyzeAndExtractService.MetadataJsonOptions);
             await File.WriteAllTextAsync(metricsPath, metricsJson);
 
             var succeeded = outcomes.Values.Count(o => o.Success);
@@ -185,23 +159,21 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
             var totalRows = outcomes.Values.Sum(o => o.RowCount);
 
             Console.Error.WriteLine(
-                $"✓ Done: {succeeded}/{outcomes.Count} tables, {totalRows} rows ({totalSw.ElapsedMilliseconds} ms)");
+                $"✓ Done: E2K + {succeeded}/{outcomes.Count} tables, {totalRows} rows ({totalSw.ElapsedMilliseconds} ms)");
 
-            return Result.Ok(new AnalyzeAndExtractData
+            return Result.Ok(new SnapshotExportData
             {
                 FilePath = filePath,
                 OutputDir = outputDir,
-                CasesRequested = analysisResult.Data.CasesRequested,
-                CaseCount = analysisResult.Data.CaseCount,
-                FinishedCaseCount = analysisResult.Data.FinishedCaseCount,
-                AnalysisTimeMs = analysisResult.Data.AnalysisTimeMs,
+                E2KFile = e2kFile,
+                E2KSizeBytes = e2kSize,
+                MaterialsDir = materialsDir,
                 Tables = outcomes,
                 TotalRowCount = totalRows,
                 SucceededCount = succeeded,
                 FailedCount = failed,
-                ExtractionTimeMs = extractionSw.ElapsedMilliseconds,
                 Metadata = metadata,
-                MetadataPath = metadataPath,
+                MetadataPath = writtenMetadataPath,
                 Metrics = metrics,
                 MetricsPath = metricsPath,
                 Units = unitSnapshot.Active,
@@ -210,7 +182,7 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
         }
         catch (Exception ex)
         {
-            return Result.Fail<AnalyzeAndExtractData>($"ETABS COM error: {ex.Message}");
+            return Result.Fail<SnapshotExportData>($"ETABS COM error: {ex.Message}");
         }
         finally
         {
@@ -218,4 +190,7 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
             app?.Dispose();
         }
     }
+
+    private static string SafeFileName(string? value, string fallback) =>
+        string.IsNullOrWhiteSpace(value) ? fallback : value;
 }
