@@ -28,6 +28,7 @@ Mode A commands attach to a user-visible ETABS instance:
 Mode B commands create their own hidden ETABS session:
 
 - `generate-e2k`
+- `generate-e2k-corpus`
 - `extract-materials`
 - `run-analysis`
 - `extract-results`
@@ -39,6 +40,23 @@ commands on the same `.edb`. `analyze-and-extract` opens ETABS once, runs
 analysis, extracts tables, collects metadata, then exits once. `snapshot-export`
 opens ETABS once, exports E2K, extracts snapshot/material tables, collects
 metadata, then exits once.
+
+`generate-e2k-corpus` is the parser-oracle generator. It starts one hidden
+ETABS session, creates each requested model through EtabSharp/CSI API calls,
+saves `model.edb`, exports `model.e2k`, and writes a hash-pinned
+`model.meta.toml`. It must never create or modify a model by rewriting or
+re-importing E2K text.
+
+Use `generate-e2k-corpus --output-dir <dir> --plan-version 22|23` to generate
+the authoritative pairwise subset assigned to one installed ETABS major
+version. Use `--request <json>` for explicit custom cases; provide exactly one
+planning mode. When multiple ETABS versions are installed, pass
+`--etabs-path <path-to-ETABS.exe>`; the adapter validates the path and forwards
+it to Cardex's `ETABSWrapper.CreateNew(programPath)`.
+
+Before adding or changing a CSI ETABS API call, verify the contract in
+`D:\Work\Cardex`. Check every CSI return code through EtabSharp or explicitly at
+the call site.
 
 ## Current Performance Notes
 
