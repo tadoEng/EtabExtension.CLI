@@ -11,45 +11,30 @@ namespace EtabExtension.CLI.Features.RunAnalysis;
 
 public class RunAnalysisService : IRunAnalysisService
 {
+    private readonly IEtabsBootstrapService _bootstrap;
+
+    public RunAnalysisService(IEtabsBootstrapService bootstrap)
+    {
+        _bootstrap = bootstrap;
+    }
+
     public async Task<Result<RunAnalysisData>> RunAnalysisAsync(
         string filePath,
         List<string>? cases,
         string? units = null)
     {
-        await Task.CompletedTask;
-
-        if (!File.Exists(filePath))
-            return Result.Fail<RunAnalysisData>($"File not found: {filePath}");
-
-        // Resolve units before starting ETABS — fail fast with a clear message
-        var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(units);
-        if (unitsError is not null)
-            return Result.Fail<RunAnalysisData>(unitsError);
-
         var hasSpecificCases = cases is { Count: > 0 };
 
-        ETABSApplication? app = null;
+        var bootstrapResult = await _bootstrap.BootstrapAsync(filePath, units);
+        if (!bootstrapResult.Success || bootstrapResult.Data is null)
+            return Result.Fail<RunAnalysisData>(bootstrapResult.Error ?? "Bootstrap failed");
+
+        using var context = bootstrapResult.Data;
+        var app = context.App;
         var stopwatch = Stopwatch.StartNew();
+
         try
         {
-            Console.Error.WriteLine("ℹ Starting ETABS (hidden)...");
-            app = ETABSWrapper.CreateNew();
-            if (app is null)
-                return Result.Fail<RunAnalysisData>("Failed to start ETABS hidden instance.");
-
-            app.Application.Hide();
-            Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
-
-            Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");
-            int openRet = app.Model.Files.OpenFile(filePath);
-            if (openRet != 0)
-                return Result.Fail<RunAnalysisData>($"OpenFile failed (ret={openRet})");
-
-            // ── Unit normalisation ────────────────────────────────────────────
-            var unitService = new EtabsUnitService(app);
-            var unitSnapshot = await unitService.ReadAndNormaliseAsync(targetUnits);
-            Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
-
             if (app.Model.ModelInfo.IsLocked())
             {
                 Console.Error.WriteLine("ℹ Clearing analysis lock...");
@@ -123,7 +108,7 @@ public class RunAnalysisService : IRunAnalysisService
                         CaseCount = caseStatuses.Count,
                         FinishedCaseCount = finishedCount,
                         AnalysisTimeMs = stopwatch.ElapsedMilliseconds,
-                        Units = unitSnapshot.Active
+                        Units = context.Units?.Active
                     }
                 };
 
@@ -142,17 +127,12 @@ public class RunAnalysisService : IRunAnalysisService
                 CaseCount = caseStatuses.Count,
                 FinishedCaseCount = finishedCount,
                 AnalysisTimeMs = stopwatch.ElapsedMilliseconds,
-                Units = unitSnapshot.Active
+                Units = context.Units?.Active
             });
         }
         catch (Exception ex)
         {
             return Result.Fail<RunAnalysisData>($"ETABS COM error: {ex.Message}");
-        }
-        finally
-        {
-            app?.Application.ApplicationExit(false);
-            app?.Dispose();
         }
     }
 
