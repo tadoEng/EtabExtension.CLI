@@ -117,7 +117,11 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
                     analysisResult.Error ?? "Analysis failed");
             }
 
-            bool isAnalyzed = app.Model.Analyze.AreAllCasesFinished();
+            // A model has usable results when AT LEAST ONE case finished. The prior
+            // AreAllCasesFinished() returned false whenever any case was left un-run
+            // (an unselected modal/RS/TH case, a combo-only case, etc.), which silently
+            // skipped every result table even after a successful analysis.
+            bool isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
             bool isLocked = app.Model.ModelInfo.IsLocked();
 
             var extractionSw = Stopwatch.StartNew();

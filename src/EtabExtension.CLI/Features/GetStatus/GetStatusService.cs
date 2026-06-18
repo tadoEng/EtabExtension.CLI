@@ -30,7 +30,7 @@ public class GetStatusService : IGetStatusService
             var openFilePath = app.Model.ModelInfo.GetModelFilepath();
             var isModelOpen = !string.IsNullOrEmpty(openFilePath);
             var isLocked = app.Model.ModelInfo.IsLocked();
-            var isAnalyzed = app.Model.Analyze.AreAllCasesFinished();
+            var isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
 
             // Read unit system — mirrors demo script PrintUnitSummary
             UnitSystemInfo? unitSystem = null;

@@ -107,7 +107,7 @@ public class SnapshotExportService : ISnapshotExportService
             var e2kSize = new FileInfo(e2kFile).Length;
             Console.Error.WriteLine($"✓ Exported ({e2kSize / 1024.0:F1} KB)");
 
-            var isAnalyzed = app.Model.Analyze.AreAllCasesFinished();
+            var isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
             var isLocked = app.Model.ModelInfo.IsLocked();
             var outcomes = await metricsBuilder.MeasureAsync(
                 "extractTables",

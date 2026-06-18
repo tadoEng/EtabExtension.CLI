@@ -109,7 +109,7 @@ public class ExtractResultsService : IExtractResultsService
             Console.Error.WriteLine(EtabsUnitService.FormatSnapshot(unitSnapshot));
 
             // ── Check analysis state ──────────────────────────────────────────
-            bool isAnalyzed = app.Model.Analyze.AreAllCasesFinished();
+            bool isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
             bool isLocked = app.Model.ModelInfo.IsLocked();
 
             if (!isAnalyzed || !isLocked)
