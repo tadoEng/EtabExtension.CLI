@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
+using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using System.Text.Json.Serialization;
 
 namespace EtabExtension.CLI.Features.ExtractMaterials.Models;
@@ -27,6 +28,9 @@ public record ExtractMaterialsData
     /// <summary>Rows dropped because every value was empty.</summary>
     [JsonPropertyName("discardedRowCount")]
     public int DiscardedRowCount { get; init; }
+
+    [JsonPropertyName("columns")]
+    public IReadOnlyList<ParquetColumnMapping>? Columns { get; init; }
 
     /// <summary>
     /// Units active during extraction (after normalisation).

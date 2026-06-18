@@ -93,6 +93,7 @@ public class ExtractMaterialsService : IExtractMaterialsService
             TableKey = tableKey,
             RowCount = outcome.RowCount,
             DiscardedRowCount = outcome.DiscardedRowCount,
+            Columns = outcome.Columns,
             Units = result.Data.Units,
             ExtractionTimeMs = outcome.ExtractionTimeMs
         });
@@ -216,6 +217,7 @@ public class ExtractMaterialsService : IExtractMaterialsService
                 TableKey = tableKey,
                 RowCount = writeResult.RowCount,
                 DiscardedRowCount = queryResult.DiscardedRowCount,
+                Columns = writeResult.Columns,
                 Units = unitSnapshot.Active,
                 ExtractionTimeMs = sw.ElapsedMilliseconds
             });

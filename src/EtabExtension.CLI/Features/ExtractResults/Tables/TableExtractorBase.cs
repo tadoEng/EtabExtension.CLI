@@ -119,6 +119,7 @@ public abstract class TableExtractorBase : ITableExtractor
                 OutputFile = outputFile,
                 RowCount = writeResult.RowCount,
                 DiscardedRowCount = queryResult.DiscardedRowCount,
+                Columns = writeResult.Columns,
                 ExtractionTimeMs = sw.ElapsedMilliseconds
             };
         }

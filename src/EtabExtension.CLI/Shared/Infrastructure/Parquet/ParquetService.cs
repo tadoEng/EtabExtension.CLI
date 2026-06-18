@@ -4,6 +4,8 @@
 using Parquet;
 using Parquet.Data;
 using Parquet.Schema;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Parquet;
 
@@ -16,6 +18,10 @@ namespace EtabExtension.CLI.Shared.Infrastructure.Parquet;
 /// </summary>
 public class ParquetService : IParquetService
 {
+    internal const string ColumnMappingMetadataKey = "etabextension.cli.parquet.columnMapping.v1";
+
+    private static readonly JsonSerializerOptions ColumnMappingJsonOptions = new(JsonSerializerDefaults.Web);
+
     public async Task<ParquetWriteResult> WriteAsync(
         string outputPath,
         List<string> fieldNames,
@@ -34,6 +40,7 @@ public class ParquetService : IParquetService
 
         // Sanitize and deduplicate field names — same as demo script
         var uniqueNames = MakeUniqueFieldNames(fieldNames);
+        var columnMappings = BuildColumnMappings(fieldNames, uniqueNames);
         var schemaFields = uniqueNames
             .Select(name => new DataField(name, typeof(string)))
             .ToArray();
@@ -57,12 +64,16 @@ public class ParquetService : IParquetService
         // await using matches parquet-dotnet docs pattern
         await using var fs = File.Create(outputPath);
         await using var writer = await ParquetWriter.CreateAsync(schema, fs);
+        writer.CustomMetadata = new Dictionary<string, string>
+        {
+            [ColumnMappingMetadataKey] = SerializeColumnMapping(columnMappings)
+        };
         using var rowGroup = writer.CreateRowGroup();
 
         foreach (var col in columns)
             await rowGroup.WriteColumnAsync(col);
 
-        return new ParquetWriteResult(true, rowCount, outputPath);
+        return new ParquetWriteResult(true, rowCount, outputPath, Columns: columnMappings);
     }
 
     // ── Helpers — copied verbatim from demo script ────────────────────────────
@@ -99,4 +110,28 @@ public class ParquetService : IParquetService
 
         return string.IsNullOrWhiteSpace(cleaned) ? "Column" : cleaned;
     }
+
+    private static List<ParquetColumnMapping> BuildColumnMappings(
+        List<string> rawFields,
+        List<string> parquetNames)
+    {
+        var mappings = new List<ParquetColumnMapping>(rawFields.Count);
+
+        for (var i = 0; i < rawFields.Count; i++)
+        {
+            mappings.Add(new ParquetColumnMapping(i, parquetNames[i], rawFields[i]));
+        }
+
+        return mappings;
+    }
+
+    private static string SerializeColumnMapping(IReadOnlyList<ParquetColumnMapping> columns)
+    {
+        var metadata = new ParquetColumnMappingMetadata(1, columns);
+        return JsonSerializer.Serialize(metadata, ColumnMappingJsonOptions);
+    }
+
+    private sealed record ParquetColumnMappingMetadata(
+        [property: JsonPropertyName("schemaVersion")] int SchemaVersion,
+        [property: JsonPropertyName("columns")] IReadOnlyList<ParquetColumnMapping> Columns);
 }

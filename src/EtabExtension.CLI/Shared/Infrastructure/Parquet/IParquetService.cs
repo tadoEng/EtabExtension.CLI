@@ -1,6 +1,8 @@
 // Copyright (c) Thanh Tu. All rights reserved.
 // Licensed under the MIT License.
 
+using System.Text.Json.Serialization;
+
 namespace EtabExtension.CLI.Shared.Infrastructure.Parquet;
 
 /// <summary>
@@ -29,4 +31,10 @@ public record ParquetWriteResult(
     bool Success,
     int RowCount,
     string OutputPath,
-    string? Error = null);
+    string? Error = null,
+    IReadOnlyList<ParquetColumnMapping>? Columns = null);
+
+public record ParquetColumnMapping(
+    [property: JsonPropertyName("index")] int Index,
+    [property: JsonPropertyName("parquetColumnName")] string ParquetColumnName,
+    [property: JsonPropertyName("originalFieldName")] string OriginalFieldName);
