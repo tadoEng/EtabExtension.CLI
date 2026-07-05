@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
+using EtabExtension.CLI.Features.SnapshotExport.Models;
 
 namespace EtabExtension.CLI.Features.Serve;
 
@@ -21,4 +22,12 @@ public sealed class ServeAnalyzeRequest
     [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
     [JsonPropertyName("outputDir")] public string OutputDir { get; init; } = string.Empty;
     [JsonPropertyName("request")] public AnalyzeAndExtractRequest Request { get; init; } = new();
+}
+
+/// <summary>Payload for the <c>snapshot-export</c> serve command.</summary>
+public sealed class ServeSnapshotRequest
+{
+    [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
+    [JsonPropertyName("outputDir")] public string OutputDir { get; init; } = string.Empty;
+    [JsonPropertyName("request")] public SnapshotExportRequest Request { get; init; } = new();
 }

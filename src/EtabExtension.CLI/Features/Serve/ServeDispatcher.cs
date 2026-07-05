@@ -3,6 +3,7 @@ using EtabExtension.CLI.Features.AnalyzeAndExtract;
 using EtabExtension.CLI.Features.GetStatus;
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Features.OpenModel;
+using EtabExtension.CLI.Features.SnapshotExport;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
@@ -20,17 +21,20 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly IGetStatusService _status;
     private readonly IOpenModelService _open;
     private readonly IAnalyzeAndExtractService _analyze;
+    private readonly ISnapshotExportService _snapshot;
 
     public ServeDispatcher(
         IEtabsSession session,
         IGetStatusService status,
         IOpenModelService open,
-        IAnalyzeAndExtractService analyze)
+        IAnalyzeAndExtractService analyze,
+        ISnapshotExportService snapshot)
     {
         _session = session;
         _status = status;
         _open = open;
         _analyze = analyze;
+        _snapshot = snapshot;
     }
 
     public async Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct)
@@ -57,8 +61,15 @@ public sealed class ServeDispatcher : IServeDispatcher
                     _session.GetOrStart(), req.FilePath, req.OutputDir, req.Request);
             }
 
-            // TODO(#188 follow-up): snapshot-export, unlock-model, close-model,
-            // extract-results, read-model-metadata against the shared session.
+            case "snapshot-export":
+            {
+                var req = Deserialize<ServeSnapshotRequest>(request);
+                return await _snapshot.SnapshotExportOnAppAsync(
+                    _session.GetOrStart(), req.FilePath, req.OutputDir, req.Request);
+            }
+
+            // TODO(#188 follow-up): unlock-model, close-model, extract-results,
+            // read-model-metadata against the shared session.
             default:
                 return Result.Fail($"Command not supported in serve mode yet: '{command}'");
         }
