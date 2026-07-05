@@ -3,6 +3,7 @@
 
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.GetStatus;
 
@@ -13,4 +14,10 @@ public interface IGetStatusService
     /// Returns Result.Ok with IsRunning=false when ETABS is not running — not an error.
     /// </summary>
     Task<Result<GetStatusData>> GetStatusAsync();
+
+    /// <summary>
+    /// Daemon: report status on the shared serve-session instance (no COM attach,
+    /// no dispose).
+    /// </summary>
+    Result<GetStatusData> GetStatusOnApp(ETABSApplication app, int? pid = null);
 }
