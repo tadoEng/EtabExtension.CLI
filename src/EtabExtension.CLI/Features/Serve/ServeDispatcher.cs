@@ -1,9 +1,11 @@
 using System.Text.Json;
 using EtabExtension.CLI.Features.AnalyzeAndExtract;
+using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
 using EtabExtension.CLI.Features.GetStatus;
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Features.OpenModel;
 using EtabExtension.CLI.Features.SnapshotExport;
+using EtabExtension.CLI.Features.SnapshotExport.Models;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
@@ -51,21 +53,25 @@ public sealed class ServeDispatcher : IServeDispatcher
             case "open-model":
             {
                 var req = Deserialize<ServeOpenModelRequest>(request);
-                return await _open.OpenModelOnAppAsync(_session.GetOrStart(), req.FilePath, req.Save);
+                return await _open.OpenModelOnAppAsync(
+                    _session.GetOrStart(), req.FilePath, req.SaveOnClose);
             }
 
             case "analyze-and-extract":
             {
-                var req = Deserialize<ServeAnalyzeRequest>(request);
+                // Flattened payload: {filePath, outputDir, <AnalyzeAndExtractRequest fields>}.
+                var loc = Deserialize<ServeFileLocator>(request);
+                var aeReq = Deserialize<AnalyzeAndExtractRequest>(request);
                 return await _analyze.AnalyzeAndExtractOnAppAsync(
-                    _session.GetOrStart(), req.FilePath, req.OutputDir, req.Request);
+                    _session.GetOrStart(), loc.FilePath, loc.OutputDir, aeReq);
             }
 
             case "snapshot-export":
             {
-                var req = Deserialize<ServeSnapshotRequest>(request);
+                var loc = Deserialize<ServeFileLocator>(request);
+                var snapReq = Deserialize<SnapshotExportRequest>(request);
                 return await _snapshot.SnapshotExportOnAppAsync(
-                    _session.GetOrStart(), req.FilePath, req.OutputDir, req.Request);
+                    _session.GetOrStart(), loc.FilePath, loc.OutputDir, snapReq);
             }
 
             // TODO(#188 follow-up): unlock-model, close-model, extract-results,

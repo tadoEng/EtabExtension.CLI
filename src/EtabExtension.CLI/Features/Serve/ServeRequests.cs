@@ -1,33 +1,32 @@
 using System.Text.Json.Serialization;
-using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
-using EtabExtension.CLI.Features.SnapshotExport.Models;
 
 namespace EtabExtension.CLI.Features.Serve;
 
-// Serve request payloads. For commands whose one-shot form takes CLI flags
-// (--file, --output-dir, --save), those arguments move INTO the request JSON
-// here so the whole call is a single line. The Rust client (Phase 2, #189)
-// sends these shapes.
+// Serve request payloads. These MUST match what the Rust ext-sidecar client's
+// `request_from_args` produces (crates/ext-sidecar/src/client.rs): for commands
+// whose one-shot form used CLI flags, the flags move into the request JSON, and
+// the `--request` JSON is *flattened* into the top level (not nested). So an
+// analyze request arrives as {filePath, outputDir, units, cases, tables, ...}.
 
-/// <summary>Payload for the <c>open-model</c> serve command.</summary>
+/// <summary>
+/// filePath/outputDir locator for the flattened <c>analyze-and-extract</c> and
+/// <c>snapshot-export</c> requests. The per-command request fields (units,
+/// tables, …) are deserialised separately from the SAME element (unknown fields
+/// are ignored on each pass).
+/// </summary>
+public sealed class ServeFileLocator
+{
+    [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
+    [JsonPropertyName("outputDir")] public string OutputDir { get; init; } = string.Empty;
+}
+
+/// <summary>
+/// Payload for the <c>open-model</c> serve command. The Rust client sends
+/// <c>saveOnClose</c> (and <c>newInstance</c>, which is irrelevant in daemon
+/// mode — there is exactly one shared instance).
+/// </summary>
 public sealed class ServeOpenModelRequest
 {
     [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
-    [JsonPropertyName("save")] public bool Save { get; init; }
-}
-
-/// <summary>Payload for the <c>analyze-and-extract</c> serve command.</summary>
-public sealed class ServeAnalyzeRequest
-{
-    [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
-    [JsonPropertyName("outputDir")] public string OutputDir { get; init; } = string.Empty;
-    [JsonPropertyName("request")] public AnalyzeAndExtractRequest Request { get; init; } = new();
-}
-
-/// <summary>Payload for the <c>snapshot-export</c> serve command.</summary>
-public sealed class ServeSnapshotRequest
-{
-    [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
-    [JsonPropertyName("outputDir")] public string OutputDir { get; init; } = string.Empty;
-    [JsonPropertyName("request")] public SnapshotExportRequest Request { get; init; } = new();
+    [JsonPropertyName("saveOnClose")] public bool SaveOnClose { get; init; }
 }
