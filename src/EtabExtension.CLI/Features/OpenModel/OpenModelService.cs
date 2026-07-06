@@ -46,6 +46,53 @@ public class OpenModelService : IOpenModelService
             : await OpenInRunningInstanceAsync(filePath, save);
     }
 
+    // ── Daemon — open into the shared serve-session instance ─────────────────
+    // Like Mode A but against a caller-owned app: no Connect, no Dispose.
+
+    public async Task<Result<OpenModelData>> OpenModelOnAppAsync(
+        ETABSApplication app, string filePath, bool save)
+    {
+        await Task.CompletedTask;
+
+        if (!File.Exists(filePath))
+            return Result.Fail<OpenModelData>($"File not found: {filePath}");
+
+        if (!filePath.EndsWith(".edb", StringComparison.OrdinalIgnoreCase))
+            return Result.Fail<OpenModelData>("Only .edb files can be opened");
+
+        try
+        {
+            var currentPath = app.Model.ModelInfo.GetModelFilepath();
+            var hasCurrentFile = !string.IsNullOrEmpty(currentPath);
+
+            if (hasCurrentFile && save)
+            {
+                Console.Error.WriteLine("ℹ Saving current file...");
+                int saveRet = app.Model.Files.SaveFile(currentPath!);
+                if (saveRet != 0)
+                    Console.Error.WriteLine($"⚠ SaveFile returned {saveRet} — continuing");
+            }
+
+            Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");
+            int openRet = app.Model.Files.OpenFile(filePath);
+            if (openRet != 0)
+                return Result.Fail<OpenModelData>($"OpenFile failed (ret={openRet})");
+
+            Console.Error.WriteLine($"✓ Opened: {Path.GetFileName(filePath)}");
+            return Result.Ok(new OpenModelData
+            {
+                FilePath = filePath,
+                PreviousFilePath = hasCurrentFile ? currentPath : null,
+                Pid = null,
+                OpenedInNewInstance = false
+            });
+        }
+        catch (Exception ex)
+        {
+            return Result.Fail<OpenModelData>($"ETABS COM error: {ex.Message}");
+        }
+    }
+
     // ── Mode A — open in the user's running ETABS ────────────────────────────
 
     private static async Task<Result<OpenModelData>> OpenInRunningInstanceAsync(

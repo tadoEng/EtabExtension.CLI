@@ -3,11 +3,18 @@
 
 using EtabExtension.CLI.Features.OpenModel.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.OpenModel;
 
 public interface IOpenModelService
 {
+    /// <summary>
+    /// Daemon: open an .edb file into the shared serve-session instance (no
+    /// COM attach, no dispose).
+    /// </summary>
+    Task<Result<OpenModelData>> OpenModelOnAppAsync(ETABSApplication app, string filePath, bool save);
+
     /// <summary>
     /// Opens an .edb file in ETABS.
     /// </summary>

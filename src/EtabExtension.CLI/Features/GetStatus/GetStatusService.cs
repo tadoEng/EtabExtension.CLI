@@ -7,6 +7,7 @@ namespace EtabExtension.CLI.Features.GetStatus;
 
 public class GetStatusService : IGetStatusService
 {
+    // One-shot: probe whatever ETABS is running and COM-attach to report on it.
     public async Task<Result<GetStatusData>> GetStatusAsync()
     {
         await Task.CompletedTask;
@@ -26,50 +27,7 @@ public class GetStatusService : IGetStatusService
                     "ETABS is running but COM attach failed. Try restarting ETABS.");
 
             Console.Error.WriteLine($"✓ Connected to ETABS v{app.FullVersion} (PID {pid})");
-
-            var openFilePath = app.Model.ModelInfo.GetModelFilepath();
-            var isModelOpen = !string.IsNullOrEmpty(openFilePath);
-            var isLocked = app.Model.ModelInfo.IsLocked();
-            var isAnalyzed = app.Model.Analyze.AreAllCasesFinished();
-
-            // Read unit system — mirrors demo script PrintUnitSummary
-            UnitSystemInfo? unitSystem = null;
-            try
-            {
-                var units = app.Model.Units.GetPresentUnits();
-                var force = ToForceSymbol(units.Force);
-                var length = ToLengthSymbol(units.Length);
-                var temp = ToTemperatureSymbol(units.Temperature);
-
-                unitSystem = new UnitSystemInfo
-                {
-                    Force = force,
-                    Length = length,
-                    Temperature = temp,
-                    IsUs = units.IsUS,
-                    IsMetric = units.IsMetric
-                };
-
-                Console.Error.WriteLine(
-                    $"ℹ Units: {force}/{length}/{temp}  isUS={units.IsUS}  isMetric={units.IsMetric}");
-            }
-            catch (Exception ex)
-            {
-                // Not fatal — unit read failing should not block status
-                Console.Error.WriteLine($"⚠ Could not read units: {ex.Message}");
-            }
-
-            return Result.Ok(new GetStatusData
-            {
-                IsRunning = true,
-                Pid = pid,
-                EtabsVersion = app.FullVersion,
-                OpenFilePath = isModelOpen ? openFilePath : null,
-                IsModelOpen = isModelOpen,
-                IsLocked = isLocked,
-                IsAnalyzed = isAnalyzed,
-                UnitSystem = unitSystem
-            });
+            return Result.Ok(BuildStatusData(app, pid));
         }
         catch (Exception ex)
         {
@@ -79,6 +37,60 @@ public class GetStatusService : IGetStatusService
         {
             app?.Dispose(); // Mode A: release COM only — ETABS keeps running
         }
+    }
+
+    // Daemon: report on the shared serve-session instance (no attach, no dispose).
+    public Result<GetStatusData> GetStatusOnApp(ETABSApplication app, int? pid = null)
+    {
+        try
+        {
+            return Result.Ok(BuildStatusData(app, pid));
+        }
+        catch (Exception ex)
+        {
+            return Result.Fail<GetStatusData>($"ETABS COM error: {ex.Message}");
+        }
+    }
+
+    private static GetStatusData BuildStatusData(ETABSApplication app, int? pid)
+    {
+        var openFilePath = app.Model.ModelInfo.GetModelFilepath();
+        var isModelOpen = !string.IsNullOrEmpty(openFilePath);
+        var isLocked = app.Model.ModelInfo.IsLocked();
+        var isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
+
+        UnitSystemInfo? unitSystem = null;
+        try
+        {
+            var units = app.Model.Units.GetPresentUnits();
+            unitSystem = new UnitSystemInfo
+            {
+                Force = ToForceSymbol(units.Force),
+                Length = ToLengthSymbol(units.Length),
+                Temperature = ToTemperatureSymbol(units.Temperature),
+                IsUs = units.IsUS,
+                IsMetric = units.IsMetric
+            };
+            Console.Error.WriteLine(
+                $"ℹ Units: {unitSystem.Force}/{unitSystem.Length}/{unitSystem.Temperature}  isUS={units.IsUS}  isMetric={units.IsMetric}");
+        }
+        catch (Exception ex)
+        {
+            // Not fatal — unit read failing should not block status
+            Console.Error.WriteLine($"⚠ Could not read units: {ex.Message}");
+        }
+
+        return new GetStatusData
+        {
+            IsRunning = true,
+            Pid = pid,
+            EtabsVersion = app.FullVersion,
+            OpenFilePath = isModelOpen ? openFilePath : null,
+            IsModelOpen = isModelOpen,
+            IsLocked = isLocked,
+            IsAnalyzed = isAnalyzed,
+            UnitSystem = unitSystem
+        };
     }
 
     // ── Unit helpers — copied verbatim from demo script ───────────────────────

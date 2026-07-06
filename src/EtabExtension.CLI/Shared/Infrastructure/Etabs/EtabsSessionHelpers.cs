@@ -184,7 +184,10 @@ internal static class EtabsSessionHelpers
                     $"ℹ [{outcomes.Count + 1}/{planned.Count}] Extracting: {entry.Extractor.Label}");
 
                 TableExtractionOutcome outcome;
-                if (entry.Extractor.RequiresAnalysis && (!isAnalyzed || !isLocked))
+                // Result tables require analysis RESULTS (≥1 finished case), not a
+                // locked UI state. The lock half of this gate previously skipped
+                // extraction when ETABS did not leave the model locked post-run.
+                if (entry.Extractor.RequiresAnalysis && !isAnalyzed)
                 {
                     outcome = TableExtractionOutcome.Fail(
                         "Model has no analysis results. Run analysis first (run-analysis command).");
@@ -227,7 +230,7 @@ internal static class EtabsSessionHelpers
             SchemaVersion = 2,
             FilePath = filePath,
             EtabsVersion = app.FullVersion,
-            IsAnalyzed = ReadOrDefault("analysis state", () => app.Model.Analyze.AreAllCasesFinished(), false),
+            IsAnalyzed = ReadOrDefault("analysis state", () => app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished), false),
             IsLocked = ReadOrDefault("lock state", () => app.Model.ModelInfo.IsLocked(), false),
             Units = ModelMetadataUnits.FormatDisplay(unitSnapshot.Active),
             LoadPatterns = ReadLoadPatterns(app),
