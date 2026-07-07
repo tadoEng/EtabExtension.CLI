@@ -44,4 +44,19 @@ public class ServeContractTests
         Assert.Equal(@"C:\v1\model.edb", request.FilePath);
         Assert.True(request.SaveOnClose);
     }
+
+    // request_from_args emits {"save": <bool>} for "close-model"; an absent flag
+    // (has("--save") == false) must deserialise to save=false, never a crash.
+    [Theory]
+    [InlineData("""{"save":true}""", true)]
+    [InlineData("""{"save":false}""", false)]
+    [InlineData("{}", false)]
+    public void Close_model_reads_the_save_flag(string json, bool expected)
+    {
+        var element = JsonSerializer.Deserialize<JsonElement>(json);
+
+        var request = element.Deserialize<ServeCloseModelRequest>(Opts)!;
+
+        Assert.Equal(expected, request.Save);
+    }
 }

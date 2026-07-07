@@ -1,6 +1,7 @@
 using System.Text.Json;
 using EtabExtension.CLI.Features.AnalyzeAndExtract;
 using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
+using EtabExtension.CLI.Features.CloseModel;
 using EtabExtension.CLI.Features.GetStatus;
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Features.OpenModel;
@@ -24,19 +25,22 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly IOpenModelService _open;
     private readonly IAnalyzeAndExtractService _analyze;
     private readonly ISnapshotExportService _snapshot;
+    private readonly ICloseModelService _close;
 
     public ServeDispatcher(
         IEtabsSession session,
         IGetStatusService status,
         IOpenModelService open,
         IAnalyzeAndExtractService analyze,
-        ISnapshotExportService snapshot)
+        ISnapshotExportService snapshot,
+        ICloseModelService close)
     {
         _session = session;
         _status = status;
         _open = open;
         _analyze = analyze;
         _snapshot = snapshot;
+        _close = close;
     }
 
     public async Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct)
@@ -74,7 +78,15 @@ public sealed class ServeDispatcher : IServeDispatcher
                     _session.GetOrStart(), loc.FilePath, loc.OutputDir, snapReq);
             }
 
-            // TODO(#188 follow-up): unlock-model, close-model, extract-results,
+            case "close-model":
+            {
+                // Flattened payload: { "save": bool }. Clears the shared session's
+                // workspace (InitializeNewModel) — ETABS stays running.
+                var req = Deserialize<ServeCloseModelRequest>(request);
+                return await _close.CloseModelOnAppAsync(_session.GetOrStart(), req.Save);
+            }
+
+            // TODO(#188 follow-up): unlock-model, extract-results,
             // read-model-metadata against the shared session.
             default:
                 return Result.Fail($"Command not supported in serve mode yet: '{command}'");

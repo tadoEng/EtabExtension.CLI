@@ -30,3 +30,13 @@ public sealed class ServeOpenModelRequest
     [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
     [JsonPropertyName("saveOnClose")] public bool SaveOnClose { get; init; }
 }
+
+/// <summary>
+/// Payload for the <c>close-model</c> serve command. The Rust client sends a
+/// flattened <c>{ "save": bool }</c> (crates/ext-sidecar/src/client.rs
+/// <c>request_from_args</c>: <c>"close-model" =&gt; insert_bool("save", has("--save"))</c>).
+/// </summary>
+public sealed class ServeCloseModelRequest
+{
+    [JsonPropertyName("save")] public bool Save { get; init; }
+}
