@@ -54,8 +54,17 @@ public class GetStatusService : IGetStatusService
 
     private static GetStatusData BuildStatusData(ETABSApplication app, int? pid)
     {
-        var openFilePath = app.Model.ModelInfo.GetModelFilepath();
-        var isModelOpen = !string.IsNullOrEmpty(openFilePath);
+        // GetModelFilepath() returns only the DIRECTORY, and ETABS reports a blank/
+        // unsaved model (e.g. right after InitializeNewModel — how close-model clears
+        // the workspace) as the literal "(Untitled)". Both are non-empty, so the old
+        // !IsNullOrEmpty check reported isModelOpen=true even for a cleared session,
+        // which made "wait for no model open" never resolve. Use the full filename and
+        // treat an unsaved/blank model as "no model open".
+        var modelFile = app.Model.ModelInfo.GetModelFilename(includePath: true);
+        var hasRealModel = !string.IsNullOrWhiteSpace(modelFile)
+            && !modelFile.Trim().Equals("(Untitled)", StringComparison.OrdinalIgnoreCase);
+        var openFilePath = hasRealModel ? modelFile : null;
+        var isModelOpen = hasRealModel;
         var isLocked = app.Model.ModelInfo.IsLocked();
         var isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
 
