@@ -40,7 +40,18 @@ public sealed class EtabsSession : IEtabsSession
         {
             if (_app is not null)
             {
-                return _app;
+                if (IsAlive(_app))
+                {
+                    return _app;
+                }
+
+                // The previous instance died — e.g. ETABS crashed mid-command (a native
+                // AccessViolation while building a results table can take the whole
+                // process down). Drop the dead COM reference and start fresh so the
+                // daemon keeps serving instead of returning RPC errors on every call.
+                Console.Error.WriteLine("⚠ Shared ETABS instance stopped responding — restarting it.");
+                try { _app.Dispose(); } catch (Exception) { /* already gone */ }
+                _app = null;
             }
 
             Console.Error.WriteLine("ℹ Starting ETABS (hidden, shared serve session)...");
@@ -50,6 +61,22 @@ public sealed class EtabsSession : IEtabsSession
             Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
             _app = app;
             return _app;
+        }
+    }
+
+    // Cheap live COM round-trip. If the ETABS process behind this reference has died,
+    // any property access throws (RPC unavailable), so this returns false and lets
+    // GetOrStart replace the crashed instance.
+    private static bool IsAlive(ETABSApplication app)
+    {
+        try
+        {
+            _ = app.Model.ModelInfo.GetModelFilename(includePath: false);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
         }
     }
 
