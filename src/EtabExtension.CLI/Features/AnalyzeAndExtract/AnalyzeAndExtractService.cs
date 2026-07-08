@@ -189,20 +189,11 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
         bool isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
         bool isLocked = app.Model.ModelInfo.IsLocked();
 
-        var extractionSw = Stopwatch.StartNew();
-        var outcomes = await metricsBuilder.MeasureAsync(
-            "extractTables",
-            () => EtabsSessionHelpers.ExtractTablesOnOpenModelAsync(
-                app,
-                tables,
-                outputDir,
-                isAnalyzed,
-                isLocked,
-                _tableFactory,
-                _registry,
-                _parquet));
-        extractionSw.Stop();
-
+        // Collect + write model-metadata.json BEFORE extraction, while ETABS is
+        // guaranteed alive. Extraction can crash ETABS (a native table-builder
+        // AccessViolation on some models), and metadata collection needs a live COM
+        // connection — gathering it first means the snapshot's metadata (incl.
+        // isAnalyzed) survives even if a later table brings the instance down.
         ModelMetadata? metadata = null;
         string? metadataPath = null;
         try
@@ -234,6 +225,20 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
             metadata = null;
             metadataPath = null;
         }
+
+        var extractionSw = Stopwatch.StartNew();
+        var outcomes = await metricsBuilder.MeasureAsync(
+            "extractTables",
+            () => EtabsSessionHelpers.ExtractTablesOnOpenModelAsync(
+                app,
+                tables,
+                outputDir,
+                isAnalyzed,
+                isLocked,
+                _tableFactory,
+                _registry,
+                _parquet));
+        extractionSw.Stop();
 
         totalSw.Stop();
         var metrics = metricsBuilder.Build(totalSw.ElapsedMilliseconds);
