@@ -177,18 +177,10 @@ public class SnapshotExportService : ISnapshotExportService
 
         var isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
         var isLocked = app.Model.ModelInfo.IsLocked();
-        var outcomes = await metricsBuilder.MeasureAsync(
-            "extractTables",
-            () => EtabsSessionHelpers.ExtractTablesOnOpenModelAsync(
-                app,
-                prep.Tables!,
-                prep.MaterialsDir,
-                isAnalyzed,
-                isLocked,
-                _tableFactory,
-                _registry,
-                _parquet));
 
+        // Collect + write metadata BEFORE extraction, while ETABS is guaranteed alive —
+        // same crash-safety ordering as analyze-and-extract (a table can crash ETABS, and
+        // metadata needs a live COM connection).
         ModelMetadata? metadata = null;
         string? writtenMetadataPath = null;
         try
@@ -210,6 +202,18 @@ public class SnapshotExportService : ISnapshotExportService
         {
             Console.Error.WriteLine($"⚠ Metadata collection failed: {ex.Message}");
         }
+
+        var outcomes = await metricsBuilder.MeasureAsync(
+            "extractTables",
+            () => EtabsSessionHelpers.ExtractTablesOnOpenModelAsync(
+                app,
+                prep.Tables!,
+                prep.MaterialsDir,
+                isAnalyzed,
+                isLocked,
+                _tableFactory,
+                _registry,
+                _parquet));
 
         totalSw.Stop();
         var metrics = metricsBuilder.Build(totalSw.ElapsedMilliseconds);

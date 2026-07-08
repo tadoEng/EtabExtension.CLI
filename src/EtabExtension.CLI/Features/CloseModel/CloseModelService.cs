@@ -21,34 +21,7 @@ public class CloseModelService : ICloseModelService
             if (app is null)
                 return Result.Fail<CloseModelData>("ETABS is not running.");
 
-            var currentPath = app.Model.ModelInfo.GetModelFilepath();
-            var hasFile = !string.IsNullOrEmpty(currentPath);
-
-            Console.Error.WriteLine($"ℹ Currently open: {(hasFile ? Path.GetFileName(currentPath) : "(none)")}");
-
-            if (save && hasFile)
-            {
-                Console.Error.WriteLine("ℹ Saving...");
-                int saveRet = app.Model.Files.SaveFile(currentPath!);
-                if (saveRet != 0)
-                    Console.Error.WriteLine($"⚠ Save returned {saveRet} — continuing");
-                else
-                    Console.Error.WriteLine("✓ Saved");
-            }
-
-            // InitializeNewModel() confirmed: clears workspace without triggering
-            // Save dialog even on modified models. Rust decides save/no-save.
-            int initRet = app.Model.ModelInfo.InitializeNewModel(eUnits.kip_ft_F);
-            if (initRet != 0)
-                return Result.Fail<CloseModelData>($"InitializeNewModel failed (ret={initRet})");
-
-            Console.Error.WriteLine("✓ Workspace cleared");
-
-            return Result.Ok(new CloseModelData
-            {
-                ClosedFilePath = hasFile ? currentPath : null,
-                WasSaved = save && hasFile
-            });
+            return ClearWorkspace(app, save);
         }
         catch (Exception ex)
         {
@@ -58,5 +31,56 @@ public class CloseModelService : ICloseModelService
         {
             app?.Dispose(); // Mode A: release COM only — ETABS keeps running
         }
+    }
+
+    // ── Daemon — clear the shared serve-session workspace ────────────────────
+    // Like Mode A but against a caller-owned app: no Connect, no Dispose. The
+    // serve session owns the ETABS lifecycle and disposes it once on shutdown.
+    public async Task<Result<CloseModelData>> CloseModelOnAppAsync(ETABSApplication app, bool save)
+    {
+        await Task.CompletedTask;
+
+        try
+        {
+            return ClearWorkspace(app, save);
+        }
+        catch (Exception ex)
+        {
+            return Result.Fail<CloseModelData>($"ETABS COM error: {ex.Message}");
+        }
+    }
+
+    // Shared clear logic for both the one-shot (Connect/Dispose) and daemon
+    // (caller-owned app) paths. Rust decides save/no-save.
+    private static Result<CloseModelData> ClearWorkspace(ETABSApplication app, bool save)
+    {
+        var currentPath = app.Model.ModelInfo.GetModelFilepath();
+        var hasFile = !string.IsNullOrEmpty(currentPath);
+
+        Console.Error.WriteLine($"ℹ Currently open: {(hasFile ? Path.GetFileName(currentPath) : "(none)")}");
+
+        if (save && hasFile)
+        {
+            Console.Error.WriteLine("ℹ Saving...");
+            int saveRet = app.Model.Files.SaveFile(currentPath!);
+            if (saveRet != 0)
+                Console.Error.WriteLine($"⚠ Save returned {saveRet} — continuing");
+            else
+                Console.Error.WriteLine("✓ Saved");
+        }
+
+        // InitializeNewModel() confirmed: clears workspace without triggering
+        // Save dialog even on modified models.
+        int initRet = app.Model.ModelInfo.InitializeNewModel(eUnits.kip_ft_F);
+        if (initRet != 0)
+            return Result.Fail<CloseModelData>($"InitializeNewModel failed (ret={initRet})");
+
+        Console.Error.WriteLine("✓ Workspace cleared");
+
+        return Result.Ok(new CloseModelData
+        {
+            ClosedFilePath = hasFile ? currentPath : null,
+            WasSaved = save && hasFile
+        });
     }
 }
