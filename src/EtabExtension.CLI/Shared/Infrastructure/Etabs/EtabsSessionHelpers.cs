@@ -195,8 +195,19 @@ internal static class EtabsSessionHelpers
                 }
                 else
                 {
-                    outcome = await entry.Extractor.ExtractAsync(
-                        filter, outputDir, queryService, parquet);
+                    // Guard each table: an extractor that THROWS (e.g. its
+                    // SetLoadCasesForDisplay setup, or a query that has just crashed
+                    // ETABS mid-run) must become a failed outcome for THIS table — never
+                    // abort the whole extraction and discard the tables that succeeded.
+                    try
+                    {
+                        outcome = await entry.Extractor.ExtractAsync(
+                            filter, outputDir, queryService, parquet);
+                    }
+                    catch (Exception ex)
+                    {
+                        outcome = TableExtractionOutcome.Fail(ex.Message);
+                    }
                 }
 
                 outcomes[entry.Extractor.Slug] = outcome;
@@ -210,7 +221,18 @@ internal static class EtabsSessionHelpers
         }
         finally
         {
-            await queryService.ResetSelectionAsync();
+            // Best-effort cleanup. A throwing finally OVERRIDES the return value, so an
+            // exception here (e.g. "setting load cases for display: RPC unavailable" when
+            // ETABS has died mid-extraction) would discard every table we just collected.
+            // Swallow it so the successful extractions survive.
+            try
+            {
+                await queryService.ResetSelectionAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"⚠ Reset selection failed (non-fatal): {ex.Message}");
+            }
         }
     }
 
