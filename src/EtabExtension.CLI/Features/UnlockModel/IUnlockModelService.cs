@@ -3,6 +3,7 @@
 
 using EtabExtension.CLI.Features.UnlockModel.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.UnlockModel;
 
@@ -13,4 +14,5 @@ public interface IUnlockModelService
     /// The file must already be open in ETABS.
     /// </summary>
     Task<Result<UnlockModelData>> UnlockModelAsync(string filePath);
+    Task<Result<UnlockModelData>> UnlockModelOnAppAsync(ETABSApplication app, string filePath);
 }

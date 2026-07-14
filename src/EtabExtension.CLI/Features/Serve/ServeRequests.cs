@@ -30,3 +30,20 @@ public sealed class ServeOpenModelRequest
     [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
     [JsonPropertyName("saveOnClose")] public bool SaveOnClose { get; init; }
 }
+
+public sealed class ServeCloseModelRequest
+{
+    [JsonPropertyName("save")] public bool Save { get; init; }
+}
+
+public sealed class ServeFileRequest
+{
+    [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
+}
+
+public sealed class ServeGenerateE2KRequest
+{
+    [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
+    [JsonPropertyName("outputFile")] public string OutputFile { get; init; } = string.Empty;
+    [JsonPropertyName("overwrite")] public bool Overwrite { get; init; }
+}

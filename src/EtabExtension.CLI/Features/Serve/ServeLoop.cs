@@ -28,6 +28,9 @@ public sealed class ServeLoop
     /// </summary>
     public async Task RunAsync(TextReader input, TextWriter output, CancellationToken ct = default)
     {
+        await output.WriteLineAsync(JsonSerializer.Serialize(
+            new ServeHandshake("etab-cli-serve", 1), ServeJson.Options));
+        await output.FlushAsync(ct);
         Console.Error.WriteLine("ℹ etab-cli serve: ready (line-delimited JSON on stdin/stdout)");
 
         while (!ct.IsCancellationRequested)

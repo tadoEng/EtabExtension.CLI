@@ -20,6 +20,26 @@ public class UnlockModelService : IUnlockModelService
             if (app is null)
                 return Result.Fail<UnlockModelData>("ETABS is not running.");
 
+            return UnlockOnApp(app, filePath);
+        }
+        catch (Exception ex)
+        {
+            return Result.Fail<UnlockModelData>($"ETABS COM error: {ex.Message}");
+        }
+        finally
+        {
+            app?.Dispose(); // Mode A: release COM only — ETABS keeps running
+        }
+    }
+
+    public Task<Result<UnlockModelData>> UnlockModelOnAppAsync(ETABSApplication app, string filePath)
+    {
+        try { return Task.FromResult(UnlockOnApp(app, filePath)); }
+        catch (Exception ex) { return Task.FromResult(Result.Fail<UnlockModelData>($"ETABS COM error: {ex.Message}")); }
+    }
+
+    private static Result<UnlockModelData> UnlockOnApp(ETABSApplication app, string filePath)
+    {
             var currentPath = app.Model.ModelInfo.GetModelFilepath();
 
             // Guard: file must already be open
@@ -50,15 +70,6 @@ public class UnlockModelService : IUnlockModelService
                 WasLocked = wasLocked
             });
         }
-        catch (Exception ex)
-        {
-            return Result.Fail<UnlockModelData>($"ETABS COM error: {ex.Message}");
-        }
-        finally
-        {
-            app?.Dispose(); // Mode A: release COM only — ETABS keeps running
-        }
-    }
 
     private static bool PathsAreEqual(string? a, string? b)
     {

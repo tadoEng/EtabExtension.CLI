@@ -94,7 +94,7 @@ public class ExtractResultsService : IExtractResultsService
             if (app is null)
                 return Result.Fail<ExtractResultsData>("Failed to start ETABS hidden instance.");
 
-            app.Application.Hide();
+            EtabsSessionHelpers.HideIfVisible(app);
             Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
 
             // ── Open file ─────────────────────────────────────────────────────
@@ -166,6 +166,47 @@ public class ExtractResultsService : IExtractResultsService
         {
             app?.Application.ApplicationExit(false);
             app?.Dispose();
+        }
+    }
+
+    public async Task<Result<ExtractResultsData>> ExtractOnAppAsync(
+        ETABSApplication app, ExtractResultsRequest request)
+    {
+        if (!File.Exists(request.FilePath)) return Result.Fail<ExtractResultsData>($"File not found: {request.FilePath}");
+        if (string.IsNullOrWhiteSpace(request.OutputDir)) return Result.Fail<ExtractResultsData>("OutputDir cannot be empty");
+        var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(request.Units);
+        if (unitsError is not null) return Result.Fail<ExtractResultsData>(unitsError);
+        var planned = _registry.Entries.Where(e => e.FilterSelector(request.Tables) is not null).ToList();
+        if (planned.Count == 0) return Result.Fail<ExtractResultsData>("No tables selected — all TableSelections properties are null. Set at least one table filter in the request.");
+        Directory.CreateDirectory(request.OutputDir);
+        var totalSw = Stopwatch.StartNew();
+        try
+        {
+            var openRet = app.Model.Files.OpenFile(request.FilePath);
+            if (openRet != 0) return Result.Fail<ExtractResultsData>($"OpenFile failed (ret={openRet})");
+            var unitSnapshot = await new EtabsUnitService(app).ReadAndNormaliseAsync(targetUnits!);
+            var isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
+            var isLocked = app.Model.ModelInfo.IsLocked();
+            var outcomes = await EtabsSessionHelpers.ExtractTablesOnOpenModelAsync(
+                app, request.Tables, request.OutputDir, isAnalyzed, isLocked,
+                _tableFactory, _registry, _parquet);
+            totalSw.Stop();
+            return Result.Ok(new ExtractResultsData
+            {
+                FilePath = request.FilePath,
+                OutputDir = request.OutputDir,
+                Tables = outcomes,
+                TotalRowCount = outcomes.Values.Sum(o => o.RowCount),
+                SucceededCount = outcomes.Values.Count(o => o.Success),
+                FailedCount = outcomes.Values.Count(o => !o.Success),
+                Units = unitSnapshot.Active,
+                ExtractionTimeMs = totalSw.ElapsedMilliseconds
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "ExtractResults shared-session fatal error");
+            return Result.Fail<ExtractResultsData>($"Fatal error: {ex.Message}");
         }
     }
 }

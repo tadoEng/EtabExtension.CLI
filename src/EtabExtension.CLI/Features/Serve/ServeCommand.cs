@@ -21,6 +21,7 @@ public static class ServeCommand
             var provider = scope.ServiceProvider;
             var session = provider.GetRequiredService<IEtabsSession>();
             var dispatcher = provider.GetRequiredService<IServeDispatcher>();
+            var orphanCleaner = provider.GetRequiredService<IOrphanSessionCleaner>();
 
             // Program.cs redirects Console.Out to stderr — write the protocol to the
             // REAL stdout. "\n" line endings keep framing clean for the Rust reader.
@@ -33,6 +34,7 @@ public static class ServeCommand
 
             try
             {
+                orphanCleaner.Clean();
                 await new ServeLoop(dispatcher).RunAsync(stdin, stdout);
             }
             finally

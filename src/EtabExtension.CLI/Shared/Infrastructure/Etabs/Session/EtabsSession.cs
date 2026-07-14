@@ -2,54 +2,77 @@ using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
-/// <summary>
-/// Owns the single, long-lived hidden ETABS instance for the <c>serve</c> daemon.
-///
-/// One instance per process lifetime: created lazily on first use, reused for
-/// every command, and disposed exactly once on shutdown. This is what makes the
-/// daemon a *single-ETABS-instance* sidecar — as opposed to the one-shot
-/// commands, which each <c>CreateNew()</c>/<c>Connect()</c> their own instance
-/// and so can leave multiple ETABS processes racing over COM.
-/// </summary>
 public interface IEtabsSession : IDisposable
 {
-    /// <summary>Returns the shared hidden ETABS app, starting it on first call.</summary>
     ETABSApplication GetOrStart();
-
-    /// <summary>True once the shared instance has been started.</summary>
+    IManagedEtabsApplication GetOrStartOwned();
     bool IsStarted { get; }
-
-    /// <summary>Exit + dispose the shared ETABS instance (idempotent).</summary>
+    int? ProcessId { get; }
     void Shutdown();
 }
 
-/// <inheritdoc />
-public sealed class EtabsSession : IEtabsSession
+public sealed class EtabsSession(
+    IManagedEtabsLauncher launcher,
+    IProcessInspector processes,
+    ISessionRecordStore records) : IEtabsSession
 {
     private readonly object _gate = new();
-    private ETABSApplication? _app;
+    private IManagedEtabsApplication? _owned;
 
-    public bool IsStarted
-    {
-        get { lock (_gate) { return _app is not null; } }
-    }
+    public bool IsStarted { get { lock (_gate) return _owned is not null; } }
+    public int? ProcessId { get { lock (_gate) return _owned?.Identity.Pid; } }
 
-    public ETABSApplication GetOrStart()
+    public ETABSApplication GetOrStart() => GetOrStartOwned().Application;
+
+    public IManagedEtabsApplication GetOrStartOwned()
     {
         lock (_gate)
         {
-            if (_app is not null)
+            if (_owned is null)
             {
-                return _app;
+                Console.Error.WriteLine("ℹ Starting ETABS (hidden, shared serve session)...");
+                var launched = launcher.Launch();
+                try
+                {
+                    records.Write(ToRecord(launched));
+                    _owned = launched;
+                }
+                catch
+                {
+                    try { launched.ExitWithoutSaving(); } catch { }
+                    try { launched.Dispose(); } catch { }
+                    throw;
+                }
+                Console.Error.WriteLine($"✓ ETABS started hidden (PID {_owned.Identity.Pid})");
             }
 
-            Console.Error.WriteLine("ℹ Starting ETABS (hidden, shared serve session)...");
-            var app = ETABSWrapper.CreateNew()
-                ?? throw new InvalidOperationException("Failed to start ETABS hidden instance.");
-            app.Application.Hide();
-            Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
-            _app = app;
-            return _app;
+            try
+            {
+                Verify(_owned);
+                return _owned;
+            }
+            catch
+            {
+                try { _owned.ExitWithoutSaving(); } catch { }
+                try { _owned.Dispose(); } catch { }
+                _owned = null;
+                records.Clear();
+                throw;
+            }
+        }
+    }
+
+    private void Verify(IManagedEtabsApplication owned)
+    {
+        var record = records.Read();
+        var live = processes.Find(owned.Identity.Pid);
+        if (record is null || live is null
+            || record.ManagedLaunchRecordId != owned.ManagedLaunchRecordId
+            || !OrphanSessionCleaner.IdentityMatches(record, live)
+            || live != owned.Identity)
+        {
+            throw new InvalidOperationException(
+                "Managed ETABS identity verification failed; a clean reopen is required.");
         }
     }
 
@@ -57,21 +80,24 @@ public sealed class EtabsSession : IEtabsSession
     {
         lock (_gate)
         {
-            if (_app is null)
-            {
-                return;
-            }
-
-            try { _app.Application.ApplicationExit(false); }
+            if (_owned is null) { records.Clear(); return; }
+            try { _owned.ExitWithoutSaving(); }
             catch (Exception ex) { Console.Error.WriteLine($"⚠ ApplicationExit failed: {ex.Message}"); }
-
-            try { _app.Dispose(); }
+            try { _owned.Dispose(); }
             catch (Exception ex) { Console.Error.WriteLine($"⚠ Dispose failed: {ex.Message}"); }
-
-            _app = null;
+            _owned = null;
+            records.Clear();
             Console.Error.WriteLine("ℹ Shared ETABS session shut down.");
         }
     }
 
     public void Dispose() => Shutdown();
+
+    private static ManagedEtabsSessionRecord ToRecord(IManagedEtabsApplication owned) => new(
+        1,
+        owned.Identity.Pid,
+        owned.Identity.ProcessStartTimeUtc,
+        Path.GetFullPath(owned.Identity.ExecutablePath),
+        owned.ManagedLaunchRecordId,
+        DateTimeOffset.UtcNow);
 }

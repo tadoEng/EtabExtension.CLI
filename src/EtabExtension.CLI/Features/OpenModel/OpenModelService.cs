@@ -9,19 +9,16 @@ namespace EtabExtension.CLI.Features.OpenModel;
 
 public class OpenModelService : IOpenModelService
 {
-    private static async Task<int?> WaitForPidAsync(bool newestFirst)
+    private static async Task<int?> WaitForNewPidAsync(HashSet<int> existingPids)
     {
         var deadline = DateTime.UtcNow.AddSeconds(3);
 
         while (true)
         {
             var instances = ETABSWrapper.GetAllRunningInstances();
-            var pid = newestFirst
-                ? instances.OrderByDescending(i => i.ProcessId).FirstOrDefault()?.ProcessId
-                : instances.FirstOrDefault()?.ProcessId;
-
-            if (pid is not null)
-                return pid;
+            var candidates = instances.Where(i => !existingPids.Contains(i.ProcessId)).ToList();
+            if (candidates.Count == 1) return candidates[0].ProcessId;
+            if (candidates.Count > 1) return null;
 
             if (DateTime.UtcNow >= deadline)
                 return null;
@@ -103,10 +100,14 @@ public class OpenModelService : IOpenModelService
         ETABSApplication? app = null;
         try
         {
-            app = ETABSWrapper.Connect();
-            if (app is null)
+            var instances = ETABSWrapper.GetAllRunningInstances();
+            if (instances.Count != 1)
                 return Result.Fail<OpenModelData>(
-                    "ETABS is not running. Start ETABS first, or use --new-instance to launch one.");
+                    $"Expected exactly one ETABS instance, found {instances.Count}. Start one instance or use etab-cli serve.");
+            var pid = instances[0].ProcessId;
+            app = ETABSWrapper.ConnectToProcess(pid);
+            if (app is null)
+                return Result.Fail<OpenModelData>("ETABS process identity was selected but COM attach failed.");
 
             var currentPath = app.Model.ModelInfo.GetModelFilepath();
             var hasCurrentFile = !string.IsNullOrEmpty(currentPath);
@@ -130,15 +131,6 @@ public class OpenModelService : IOpenModelService
             int openRet = app.Model.Files.OpenFile(filePath);
             if (openRet != 0)
                 return Result.Fail<OpenModelData>($"OpenFile failed (ret={openRet})");
-
-            // Use retry loop to get the PID (same pattern as Mode B)
-            // Handles race condition where COM registry might not immediately reflect the open
-            var pid = await WaitForPidAsync(newestFirst: false);
-            if (pid is null)
-            {
-                // Fallback: try direct query if retry loop fails (shouldn't happen)
-                pid = ETABSWrapper.GetAllRunningInstances().FirstOrDefault()?.ProcessId;
-            }
 
             Console.Error.WriteLine($"✓ Opened: {Path.GetFileName(filePath)}");
 
@@ -171,6 +163,9 @@ public class OpenModelService : IOpenModelService
         ETABSApplication? app = null;
         try
         {
+            var existingPids = ETABSWrapper.GetAllRunningInstances()
+                .Select(instance => instance.ProcessId)
+                .ToHashSet();
             Console.Error.WriteLine("ℹ Starting new ETABS instance...");
             app = ETABSWrapper.CreateNew(startApplication: true);
             if (app is null)
@@ -184,7 +179,7 @@ public class OpenModelService : IOpenModelService
             if (openRet != 0)
                 return Result.Fail<OpenModelData>($"OpenFile failed (ret={openRet})");
 
-            var pid = await WaitForPidAsync(newestFirst: true);
+            var pid = await WaitForNewPidAsync(existingPids);
             if (pid is null)
                 return Result.Fail<OpenModelData>(
                     "ETABS opened the file, but the new process PID could not be confirmed within 3 seconds.");

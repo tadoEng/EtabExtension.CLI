@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using EtabExtension.CLI.Features.GenerateE2KCorpus.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabSharp.Core;
 using EtabSharp.Elements.AreaObj.Models;
 using EtabSharp.Properties.Areas.Models;
@@ -60,7 +61,7 @@ public sealed class GenerateE2KCorpusService : IGenerateE2KCorpusService
                     "Failed to start ETABS hidden instance.");
             }
 
-            app.Application.Hide();
+            EtabsSessionHelpers.HideIfVisible(app);
             Console.Error.WriteLine(
                 $"ETABS corpus session started (v{app.FullVersion}).");
 
