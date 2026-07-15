@@ -17,6 +17,7 @@ using EtabExtension.CLI.Features.UnlockModel;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabExtension.CLI.Features.Serve.Operations;
+using EtabExtension.CLI.Features.Serve.Inspection;
 
 namespace EtabExtension.CLI.Features.Serve;
 
@@ -38,6 +39,9 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly IExtractMaterialsService _extractMaterials;
     private readonly IGenerateE2KService _generateE2K;
     private readonly IReadModelMetadataService _metadata;
+    private readonly IServeInspectionService _inspection;
+    private readonly IEtabsInspectionApiFactory _inspectionApiFactory;
+    private readonly ISessionRecordStore _sessionRecords;
     private readonly IOperationManager _operations;
     private readonly ICachedSessionStatus _cachedStatus;
 
@@ -52,6 +56,9 @@ public sealed class ServeDispatcher : IServeDispatcher
         IExtractMaterialsService extractMaterials,
         IGenerateE2KService generateE2K,
         IReadModelMetadataService metadata,
+        IServeInspectionService inspection,
+        IEtabsInspectionApiFactory inspectionApiFactory,
+        ISessionRecordStore sessionRecords,
         IOperationManager operations,
         ICachedSessionStatus cachedStatus)
     {
@@ -65,6 +72,9 @@ public sealed class ServeDispatcher : IServeDispatcher
         _extractMaterials = extractMaterials;
         _generateE2K = generateE2K;
         _metadata = metadata;
+        _inspection = inspection;
+        _inspectionApiFactory = inspectionApiFactory;
+        _sessionRecords = sessionRecords;
         _operations = operations;
         _cachedStatus = cachedStatus;
     }
@@ -176,6 +186,42 @@ public sealed class ServeDispatcher : IServeDispatcher
                 var req = Deserialize<ServeFileRequest>(request);
                 return await ExecuteComAsync(async () => await _metadata.ReadOnAppAsync(
                     _session.GetOrStart(), req.FilePath));
+            }
+
+            case "get-model-state":
+                return await ExecuteComAsync(() =>
+                {
+                    var api = _inspectionApiFactory.Create(_session.GetOrStart());
+                    return Task.FromResult<object>(
+                        _inspection.GetModelState(api, _sessionRecords.Read()));
+                });
+
+            case "list-wall-properties":
+                return await ExecuteComAsync(() =>
+                {
+                    var api = _inspectionApiFactory.Create(_session.GetOrStart());
+                    return Task.FromResult<object>(_inspection.ListWallProperties(api));
+                });
+
+            case "inspect-wall-property":
+            {
+                var req = Deserialize<InspectWallPropertyRequest>(request);
+                return await ExecuteComAsync(() =>
+                {
+                    var api = _inspectionApiFactory.Create(_session.GetOrStart());
+                    return Task.FromResult<object>(_inspection.InspectWallProperty(api, req.Name));
+                });
+            }
+
+            case "resolve-area-targets":
+            {
+                var req = Deserialize<ResolveAreaTargetsRequest>(request);
+                return await ExecuteComAsync(() =>
+                {
+                    var api = _inspectionApiFactory.Create(_session.GetOrStart());
+                    return Task.FromResult<object>(
+                        _inspection.ResolveAreaTargets(api, req.SourceProperty));
+                });
             }
 
             default:

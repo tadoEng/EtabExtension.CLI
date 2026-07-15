@@ -1,6 +1,7 @@
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabExtension.CLI.Features.ReadModelMetadata;
 using EtabExtension.CLI.Features.Serve.Operations;
+using EtabExtension.CLI.Features.Serve.Inspection;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EtabExtension.CLI.Features.Serve;
@@ -23,6 +24,8 @@ public static class ServeExtensions
         services.AddScoped<ICachedSessionStatus, CachedSessionStatus>();
         services.AddScoped<IOperationDefinition, AnalyzeAndExtractOperation>();
         services.AddScoped<IOperationManager, OperationManager>();
+        services.AddScoped<IServeInspectionService, ServeInspectionService>();
+        services.AddScoped<IEtabsInspectionApiFactory, EtabsInspectionApiFactory>();
         services.AddScoped<IServeDispatcher, ServeDispatcher>();
         services.AddScoped<IReadModelMetadataService, ReadModelMetadataService>();
         return services;
