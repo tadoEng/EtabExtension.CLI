@@ -112,7 +112,13 @@ public sealed class WindowsProcessInspector : IProcessInspector
         { return null; }
     }
 
-    public void Terminate(int pid) => Process.GetProcessById(pid).Kill(entireProcessTree: true);
+    public void Terminate(int pid)
+    {
+        // The target may exit between identity verification and this call;
+        // an already-gone process is a successful termination, not a crash.
+        try { Process.GetProcessById(pid).Kill(entireProcessTree: true); }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception) { }
+    }
 
     public bool WaitForExit(int pid, TimeSpan timeout)
     {
