@@ -1,5 +1,6 @@
 using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.AnalyzeAndExtract;
@@ -20,5 +21,6 @@ public interface IAnalyzeAndExtractService
         ETABSApplication app,
         string filePath,
         string outputDir,
-        AnalyzeAndExtractRequest request);
+        AnalyzeAndExtractRequest request,
+        IEtabsOperationProgress? progress = null);
 }

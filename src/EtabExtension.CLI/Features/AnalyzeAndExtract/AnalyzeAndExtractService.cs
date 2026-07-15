@@ -66,7 +66,7 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
             Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
 
             return await ExecuteAsync(
-                app, filePath, outputDir, request, prep.Tables!, prep.TargetUnits!, metricsBuilder, totalSw);
+                app, filePath, outputDir, request, prep.Tables!, prep.TargetUnits!, metricsBuilder, totalSw, null);
         }
         catch (Exception ex)
         {
@@ -85,7 +85,8 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
         ETABSApplication app,
         string filePath,
         string outputDir,
-        AnalyzeAndExtractRequest request)
+        AnalyzeAndExtractRequest request,
+        IEtabsOperationProgress? progress = null)
     {
         var prep = Prepare(filePath, outputDir, request);
         if (prep.Error is not null)
@@ -99,7 +100,11 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
         try
         {
             return await ExecuteAsync(
-                app, filePath, outputDir, request, prep.Tables!, prep.TargetUnits!, metricsBuilder, totalSw);
+                app, filePath, outputDir, request, prep.Tables!, prep.TargetUnits!, metricsBuilder, totalSw, progress);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -157,27 +162,44 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
         TableSelections tables,
         Units targetUnits,
         RunMetricsBuilder metricsBuilder,
-        Stopwatch totalSw)
+        Stopwatch totalSw,
+        IEtabsOperationProgress? progress)
     {
-        var openResult = await metricsBuilder.MeasureAsync(
-            "openModel",
-            () => EtabsSessionHelpers.OpenFileAsync(app, filePath));
+        const int totalSteps = 7;
+        var openResult = await RunStepAsync(
+            progress,
+            1,
+            totalSteps,
+            "cSapModel.File.OpenFile",
+            () => metricsBuilder.MeasureAsync(
+                "openModel",
+                () => EtabsSessionHelpers.OpenFileAsync(app, filePath)));
         if (!openResult.Success)
         {
             return Result.Fail<AnalyzeAndExtractData>(openResult.Error ?? "OpenFile failed");
         }
 
-        var unitSnapshot = await metricsBuilder.MeasureAsync(
-            "normaliseUnits",
-            () => EtabsSessionHelpers.NormaliseUnitsAsync(app, targetUnits));
+        var unitSnapshot = await RunStepAsync(
+            progress,
+            2,
+            totalSteps,
+            "cSapModel.SetPresentUnits_2",
+            () => metricsBuilder.MeasureAsync(
+                "normaliseUnits",
+                () => EtabsSessionHelpers.NormaliseUnitsAsync(app, targetUnits)));
 
-        var analysisResult = await metricsBuilder.MeasureAsync(
-            "runAnalysis",
-            () => EtabsSessionHelpers.RunAnalysisOnOpenModelAsync(
-                app,
-                filePath,
-                request.Cases,
-                unitSnapshot));
+        var analysisResult = await RunStepAsync(
+            progress,
+            3,
+            totalSteps,
+            "cSapModel.Analyze.RunAnalysis",
+            () => metricsBuilder.MeasureAsync(
+                "runAnalysis",
+                () => EtabsSessionHelpers.RunAnalysisOnOpenModelAsync(
+                    app,
+                    filePath,
+                    request.Cases,
+                    unitSnapshot)));
 
         if (!analysisResult.Success || analysisResult.Data is null)
         {
@@ -186,33 +208,49 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
         }
 
         // Usable results = AT LEAST ONE finished case (the fixed gate).
-        bool isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
-        bool isLocked = app.Model.ModelInfo.IsLocked();
+        var modelState = await RunStepAsync(
+            progress,
+            4,
+            totalSteps,
+            "cSapModel.Analyze.GetCaseStatus",
+            () => Task.FromResult((
+                IsAnalyzed: app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished),
+                IsLocked: app.Model.ModelInfo.IsLocked())));
 
         var extractionSw = Stopwatch.StartNew();
-        var outcomes = await metricsBuilder.MeasureAsync(
-            "extractTables",
-            () => EtabsSessionHelpers.ExtractTablesOnOpenModelAsync(
-                app,
-                tables,
-                outputDir,
-                isAnalyzed,
-                isLocked,
-                _tableFactory,
-                _registry,
-                _parquet));
+        var outcomes = await RunStepAsync(
+            progress,
+            5,
+            totalSteps,
+            "cDatabaseTables.GetTableForDisplayArray",
+            () => metricsBuilder.MeasureAsync(
+                "extractTables",
+                () => EtabsSessionHelpers.ExtractTablesOnOpenModelAsync(
+                    app,
+                    tables,
+                    outputDir,
+                    modelState.IsAnalyzed,
+                    modelState.IsLocked,
+                    _tableFactory,
+                    _registry,
+                    _parquet)));
         extractionSw.Stop();
 
         ModelMetadata? metadata = null;
         string? metadataPath = null;
         try
         {
-            metadata = await metricsBuilder.MeasureAsync(
-                "collectMetadata",
-                () => EtabsSessionHelpers.CollectModelMetadataAsync(
-                    app,
-                    filePath,
-                    unitSnapshot));
+            metadata = await RunStepAsync(
+                progress,
+                6,
+                totalSteps,
+                "cDatabaseTables.GetAllTables",
+                () => metricsBuilder.MeasureAsync(
+                    "collectMetadata",
+                    () => EtabsSessionHelpers.CollectModelMetadataAsync(
+                        app,
+                        filePath,
+                        unitSnapshot)));
 
             metadataPath = string.IsNullOrWhiteSpace(request.MetadataOutputPath)
                 ? Path.Combine(outputDir, "model-metadata.json")
@@ -224,9 +262,22 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
             }
             Console.Error.WriteLine("ℹ Writing model-metadata.json");
             var metadataJson = JsonSerializer.Serialize(metadata, MetadataJsonOptions);
-            await metricsBuilder.MeasureAsync(
-                "writeMetadata",
-                () => File.WriteAllTextAsync(metadataPath, metadataJson));
+            await RunStepAsync(
+                progress,
+                7,
+                totalSteps,
+                "write-operation-artifacts",
+                async () =>
+                {
+                    await metricsBuilder.MeasureAsync(
+                        "writeMetadata",
+                        () => File.WriteAllTextAsync(metadataPath, metadataJson));
+                    return true;
+                });
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -277,4 +328,13 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
             TotalElapsedMs = totalSw.ElapsedMilliseconds
         });
     }
+
+    private static Task<T> RunStepAsync<T>(
+        IEtabsOperationProgress? progress,
+        int index,
+        int total,
+        string csiOperation,
+        Func<Task<T>> action) => progress is null
+            ? action()
+            : progress.RunStepAsync(index, total, csiOperation, action);
 }

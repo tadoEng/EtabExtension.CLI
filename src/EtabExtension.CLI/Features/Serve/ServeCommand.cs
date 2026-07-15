@@ -1,5 +1,6 @@
 using System.CommandLine;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
+using EtabExtension.CLI.Features.Serve.Operations;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EtabExtension.CLI.Features.Serve;
@@ -21,6 +22,7 @@ public static class ServeCommand
             var provider = scope.ServiceProvider;
             var session = provider.GetRequiredService<IEtabsSession>();
             var dispatcher = provider.GetRequiredService<IServeDispatcher>();
+            var operations = provider.GetRequiredService<IOperationManager>();
             var orphanCleaner = provider.GetRequiredService<IOrphanSessionCleaner>();
 
             // Program.cs redirects Console.Out to stderr — write the protocol to the
@@ -39,6 +41,7 @@ public static class ServeCommand
             }
             finally
             {
+                operations.Dispose();
                 session.Shutdown();
             }
         });
