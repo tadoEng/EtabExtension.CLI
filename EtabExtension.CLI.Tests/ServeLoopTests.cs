@@ -31,8 +31,47 @@ public class ServeLoopTests
         return writer.ToString()
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(line => JsonSerializer.Deserialize<JsonElement>(line))
+            .Where(element => element.TryGetProperty("id", out _))
             .ToList();
     }
+
+    private sealed class SerialProbeDispatcher : IServeDispatcher
+    {
+        private int _inFlight;
+        public int MaxInFlight { get; private set; }
+        public async Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct)
+        {
+            var current = Interlocked.Increment(ref _inFlight);
+            MaxInFlight = Math.Max(MaxInFlight, current);
+            await Task.Delay(10, ct);
+            Interlocked.Decrement(ref _inFlight);
+            return Result.Ok(new Echo(command));
+        }
+    }
+
+    [Fact]
+    public async Task Emits_versioned_handshake_before_responses()
+    {
+        using var reader = new StringReader("{\"id\":1,\"command\":\"get-status\"}\n");
+        await using var writer = new StringWriter();
+        await new ServeLoop(new FakeDispatcher()).RunAsync(
+            reader, writer, TestContext.Current.CancellationToken);
+        var first = writer.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)[0].TrimEnd('\r');
+        Assert.Equal("{\"protocol\":\"etab-cli-serve\",\"version\":1}", first);
+    }
+
+    [Fact]
+    public async Task Never_overlaps_dispatches()
+    {
+        var dispatcher = new SerialProbeDispatcher();
+        using var reader = new StringReader(
+            "{\"id\":1,\"command\":\"a\",\"request\":{}}\n{\"id\":2,\"command\":\"b\",\"request\":{}}\n");
+        await using var writer = new StringWriter();
+        await new ServeLoop(dispatcher).RunAsync(reader, writer, TestContext.Current.CancellationToken);
+        Assert.Equal(1, dispatcher.MaxInFlight);
+    }
+
+    private static readonly string[] TwoExpectedCommands = ["get-status", "open-model"];
 
     [Fact]
     public async Task Dispatches_each_request_serially_and_correlates_the_id()
@@ -42,7 +81,7 @@ public class ServeLoopTests
             "{\"id\":1,\"command\":\"get-status\"}\n{\"id\":2,\"command\":\"open-model\",\"request\":{}}\n",
             dispatcher);
 
-        Assert.Equal(new[] { "get-status", "open-model" }, dispatcher.Commands);
+        Assert.Equal(TwoExpectedCommands, dispatcher.Commands);
         Assert.Equal(2, responses.Count);
         Assert.Equal(1, responses[0].GetProperty("id").GetInt64());
         Assert.True(responses[0].GetProperty("success").GetBoolean());
@@ -62,6 +101,8 @@ public class ServeLoopTests
         Assert.False(responses[0].TryGetProperty("data", out _));
     }
 
+    private static readonly string[] OneExpectedCommand = ["get-status"];
+
     [Fact]
     public async Task Malformed_line_gets_an_error_but_the_loop_keeps_serving()
     {
@@ -71,7 +112,7 @@ public class ServeLoopTests
         Assert.Equal(2, responses.Count);
         Assert.False(responses[0].GetProperty("success").GetBoolean());
         Assert.True(responses[1].GetProperty("success").GetBoolean());
-        Assert.Equal(new[] { "get-status" }, dispatcher.Commands);
+        Assert.Equal(OneExpectedCommand, dispatcher.Commands);
     }
 
     [Fact]

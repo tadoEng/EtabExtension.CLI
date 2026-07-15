@@ -3,6 +3,7 @@
 
 using EtabExtension.CLI.Features.ExtractMaterials.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.ExtractMaterials;
 
@@ -21,4 +22,5 @@ public interface IExtractMaterialsService
     /// an unrecognised unit preset.
     /// </summary>
     Task<Result<ExtractMaterialsData>> ExtractMaterialsAsync(ExtractMaterialsRequest request);
+    Task<Result<ExtractMaterialsData>> ExtractMaterialsOnAppAsync(ETABSApplication app, ExtractMaterialsRequest request);
 }

@@ -3,6 +3,7 @@
 
 using EtabExtension.CLI.Features.RunAnalysis.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using EtabSharp.Core;
 using System.Diagnostics;
@@ -37,7 +38,7 @@ public class RunAnalysisService : IRunAnalysisService
             if (app is null)
                 return Result.Fail<RunAnalysisData>("Failed to start ETABS hidden instance.");
 
-            app.Application.Hide();
+            EtabsSessionHelpers.HideIfVisible(app);
             Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
 
             Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");

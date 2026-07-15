@@ -16,12 +16,15 @@ public class GetStatusService : IGetStatusService
             return Result.Ok(new GetStatusData { IsRunning = false });
 
         var instances = ETABSWrapper.GetAllRunningInstances();
-        var pid = instances.FirstOrDefault()?.ProcessId;
+        if (instances.Count != 1)
+            return Result.Fail<GetStatusData>(
+                $"Expected exactly one ETABS instance, found {instances.Count}. Use etab-cli serve for managed ownership.");
+        var pid = instances[0].ProcessId;
 
         ETABSApplication? app = null;
         try
         {
-            app = ETABSWrapper.Connect();
+            app = ETABSWrapper.ConnectToProcess(pid);
             if (app is null)
                 return Result.Fail<GetStatusData>(
                     "ETABS is running but COM attach failed. Try restarting ETABS.");

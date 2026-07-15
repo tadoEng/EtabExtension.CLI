@@ -16,6 +16,11 @@ namespace EtabExtension.CLI.Shared.Infrastructure.Etabs;
 
 internal static class EtabsSessionHelpers
 {
+    internal static void HideIfVisible(ETABSApplication app)
+    {
+        if (app.Application.Visible()) app.Application.Hide();
+    }
+
     internal static async Task<Result> OpenFileAsync(ETABSApplication app, string filePath)
     {
         await Task.CompletedTask;

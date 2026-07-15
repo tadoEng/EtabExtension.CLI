@@ -5,6 +5,7 @@ using EtabExtension.CLI.Features.ExtractMaterials.Models;
 using EtabExtension.CLI.Features.ExtractResults;
 using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
 using EtabExtension.CLI.Shared.Infrastructure.Parquet;
@@ -54,6 +55,57 @@ public class ExtractMaterialsService : IExtractMaterialsService
             return await ExtractViaCombinedResultsPathAsync(request, tableKey);
 
         return await ExtractViaLegacyPathAsync(request, tableKey);
+    }
+
+    public async Task<Result<ExtractMaterialsData>> ExtractMaterialsOnAppAsync(
+        ETABSApplication app, ExtractMaterialsRequest request)
+    {
+        var tableKey = string.IsNullOrWhiteSpace(request.TableKey) ? DefaultMaterialTableKey : request.TableKey;
+        if (string.Equals(tableKey, DefaultMaterialTableKey, StringComparison.OrdinalIgnoreCase))
+        {
+            var combined = new ExtractResultsRequest
+            {
+                FilePath = request.FilePath,
+                OutputDir = request.OutputDir,
+                Units = request.Units,
+                Tables = new TableSelections { MaterialListByStory = new TableFilter { FieldKeys = request.FieldKeys } }
+            };
+            var result = await _extractResultsService.ExtractOnAppAsync(app, combined);
+            if (!result.Success || result.Data is null) return Result.Fail<ExtractMaterialsData>(result.Error ?? $"Failed to load table '{tableKey}'.");
+            if (!result.Data.Tables.TryGetValue(DefaultMaterialTableSlug, out var outcome) || !outcome.Success)
+                return Result.Fail<ExtractMaterialsData>(outcome?.Error ?? $"Combined extraction did not return '{DefaultMaterialTableSlug}'.");
+            return Result.Ok(new ExtractMaterialsData
+            {
+                FilePath = request.FilePath, OutputFile = outcome.OutputFile, TableKey = tableKey,
+                RowCount = outcome.RowCount, DiscardedRowCount = outcome.DiscardedRowCount,
+                Columns = outcome.Columns, Units = result.Data.Units, ExtractionTimeMs = outcome.ExtractionTimeMs
+            });
+        }
+
+        if (!File.Exists(request.FilePath)) return Result.Fail<ExtractMaterialsData>($"File not found: {request.FilePath}");
+        if (string.IsNullOrWhiteSpace(request.OutputDir)) return Result.Fail<ExtractMaterialsData>("OutputDir cannot be empty");
+        var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(request.Units);
+        if (unitsError is not null) return Result.Fail<ExtractMaterialsData>(unitsError);
+        Directory.CreateDirectory(request.OutputDir);
+        var outputFile = Path.Combine(request.OutputDir, $"{ToSlug(tableKey)}.parquet");
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var openRet = app.Model.Files.OpenFile(request.FilePath);
+            if (openRet != 0) return Result.Fail<ExtractMaterialsData>($"OpenFile failed (ret={openRet})");
+            var units = await new EtabsUnitService(app).ReadAndNormaliseAsync(targetUnits!);
+            var query = await _tableFactory.CreateQueryService(app).QueryAsync(
+                new TableQueryRequest(tableKey) { FieldKeys = request.FieldKeys });
+            if (!query.IsSuccess) return Result.Fail<ExtractMaterialsData>($"Failed to load table '{tableKey}': {query.ErrorMessage}");
+            if (query.FieldKeys.Count == 0) return Result.Fail<ExtractMaterialsData>($"Table '{tableKey}' returned no fields — check that the table key is correct.");
+            if (query.RowCount == 0) return Result.Ok(new ExtractMaterialsData { FilePath = request.FilePath, TableKey = tableKey, Units = units.Active, DiscardedRowCount = query.DiscardedRowCount, ExtractionTimeMs = sw.ElapsedMilliseconds });
+            var flat = query.Rows.SelectMany(row => query.FieldKeys.Select(f => row.TryGetValue(f, out var value) ? value : string.Empty)).ToList();
+            var write = await _parquet.WriteAsync(outputFile, query.FieldKeys, flat);
+            if (!write.Success) return Result.Fail<ExtractMaterialsData>($"Parquet write failed: {write.Error}");
+            sw.Stop();
+            return Result.Ok(new ExtractMaterialsData { FilePath = request.FilePath, OutputFile = outputFile, TableKey = tableKey, RowCount = write.RowCount, DiscardedRowCount = query.DiscardedRowCount, Columns = write.Columns, Units = units.Active, ExtractionTimeMs = sw.ElapsedMilliseconds });
+        }
+        catch (Exception ex) { return Result.Fail<ExtractMaterialsData>($"Fatal error: {ex.Message}"); }
     }
 
     private async Task<Result<ExtractMaterialsData>> ExtractViaCombinedResultsPathAsync(
@@ -134,7 +186,7 @@ public class ExtractMaterialsService : IExtractMaterialsService
             if (app is null)
                 return Result.Fail<ExtractMaterialsData>("Failed to start ETABS hidden instance.");
 
-            app.Application.Hide();
+            EtabsSessionHelpers.HideIfVisible(app);
             Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
 
             // ── Open file ─────────────────────────────────────────────────────

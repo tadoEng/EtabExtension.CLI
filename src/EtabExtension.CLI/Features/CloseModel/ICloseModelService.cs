@@ -3,6 +3,7 @@
 
 using EtabExtension.CLI.Features.CloseModel.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.CloseModel;
 
@@ -13,4 +14,5 @@ public interface ICloseModelService
     /// Rust decides save/no-save — the flag is passed in, never inferred here.
     /// </summary>
     Task<Result<CloseModelData>> CloseModelAsync(bool save);
+    Task<Result<CloseModelData>> CloseModelOnAppAsync(ETABSApplication app, bool save);
 }

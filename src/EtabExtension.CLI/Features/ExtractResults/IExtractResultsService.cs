@@ -3,6 +3,7 @@
 
 using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.ExtractResults;
 
@@ -20,4 +21,5 @@ public interface IExtractResultsService
     /// A top-level Result.Fail is only returned for ETABS startup / file-open failures.
     /// </summary>
     Task<Result<ExtractResultsData>> ExtractAsync(ExtractResultsRequest request);
+    Task<Result<ExtractResultsData>> ExtractOnAppAsync(ETABSApplication app, ExtractResultsRequest request);
 }

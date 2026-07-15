@@ -58,7 +58,7 @@ public class SnapshotExportService : ISnapshotExportService
                 return Result.Fail<SnapshotExportData>("Failed to start ETABS hidden instance.");
             }
 
-            app.Application.Hide();
+            EtabsSessionHelpers.HideIfVisible(app);
             Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
 
             return await ExecuteAsync(app, filePath, outputDir, request, prep, metricsBuilder, totalSw);

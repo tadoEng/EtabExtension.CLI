@@ -15,6 +15,10 @@ public sealed class ServeRequest
     [JsonPropertyName("request")] public JsonElement? Request { get; init; }
 }
 
+public sealed record ServeHandshake(
+    [property: JsonPropertyName("protocol")] string Protocol,
+    [property: JsonPropertyName("version")] int Version);
+
 /// <summary>
 /// JSON options for the line-delimited serve protocol. Mirrors
 /// <c>JsonExtensions.DefaultOptions</c> (camelCase, null-ignored, enum-as-string)

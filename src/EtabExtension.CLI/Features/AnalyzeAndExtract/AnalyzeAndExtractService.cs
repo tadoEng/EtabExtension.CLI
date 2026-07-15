@@ -62,7 +62,7 @@ public class AnalyzeAndExtractService : IAnalyzeAndExtractService
                 return Result.Fail<AnalyzeAndExtractData>("Failed to start ETABS hidden instance.");
             }
 
-            app.Application.Hide();
+            EtabsSessionHelpers.HideIfVisible(app);
             Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
 
             return await ExecuteAsync(

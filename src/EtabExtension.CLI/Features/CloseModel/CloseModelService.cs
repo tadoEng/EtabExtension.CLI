@@ -21,6 +21,26 @@ public class CloseModelService : ICloseModelService
             if (app is null)
                 return Result.Fail<CloseModelData>("ETABS is not running.");
 
+            return CloseOnApp(app, save);
+        }
+        catch (Exception ex)
+        {
+            return Result.Fail<CloseModelData>($"ETABS COM error: {ex.Message}");
+        }
+        finally
+        {
+            app?.Dispose(); // Mode A: release COM only — ETABS keeps running
+        }
+    }
+
+    public Task<Result<CloseModelData>> CloseModelOnAppAsync(ETABSApplication app, bool save)
+    {
+        try { return Task.FromResult(CloseOnApp(app, save)); }
+        catch (Exception ex) { return Task.FromResult(Result.Fail<CloseModelData>($"ETABS COM error: {ex.Message}")); }
+    }
+
+    private static Result<CloseModelData> CloseOnApp(ETABSApplication app, bool save)
+    {
             var currentPath = app.Model.ModelInfo.GetModelFilepath();
             var hasFile = !string.IsNullOrEmpty(currentPath);
 
@@ -49,14 +69,5 @@ public class CloseModelService : ICloseModelService
                 ClosedFilePath = hasFile ? currentPath : null,
                 WasSaved = save && hasFile
             });
-        }
-        catch (Exception ex)
-        {
-            return Result.Fail<CloseModelData>($"ETABS COM error: {ex.Message}");
-        }
-        finally
-        {
-            app?.Dispose(); // Mode A: release COM only — ETABS keeps running
-        }
     }
 }
