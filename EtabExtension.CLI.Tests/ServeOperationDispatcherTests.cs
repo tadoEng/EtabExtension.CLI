@@ -119,6 +119,42 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.Equal(@"C:\results", response.Data.OutputDir);
     }
 
+    [Theory]
+    [InlineData("get-model-state", null)]
+    [InlineData("list-wall-properties", null)]
+    [InlineData("inspect-wall-property", "{\"name\":\"W1500\"}")]
+    [InlineData("resolve-area-targets", "{\"sourceProperty\":\"W1500\"}")]
+    public async Task InspectionCommandsAreRejectedWhileAnAsyncOperationIsActive(
+        string command,
+        string? requestJson)
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager = CreateManager(new DelegateOperation(async (_, context) =>
+        {
+            await context.RunStepAsync(1, 1, "Fake.CsiCall", async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return true;
+            });
+            return Result.Ok();
+        }));
+        var dispatcher = CreateDispatcher(_manager);
+        var started = _manager.Start("analyze-and-extract", Json("{}"));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        var response = Assert.IsType<Result>(await dispatcher.DispatchAsync(
+            command,
+            requestJson is null ? null : Json(requestJson),
+            TestContext.Current.CancellationToken));
+
+        Assert.False(response.Success);
+        Assert.Contains("operation is active", response.Error, StringComparison.Ordinal);
+        release.SetResult();
+        await _manager.WaitAsync(started.Data!.OperationId, TestContext.Current.CancellationToken);
+    }
+
     private OperationManager CreateManager(IOperationDefinition definition) => new(
         new StaExecutionWorker(),
         new OperationEventJournalFactory(_directory, memoryCapacity: 4),
@@ -129,6 +165,9 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         IOperationManager operations,
         IEtabsSession? session = null) => new(
             session ?? null!,
+            null!,
+            null!,
+            null!,
             null!,
             null!,
             null!,
