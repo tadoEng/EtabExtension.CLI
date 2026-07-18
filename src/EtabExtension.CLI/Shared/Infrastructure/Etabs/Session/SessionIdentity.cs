@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using EtabSharp.Core;
+using Microsoft.Extensions.Configuration;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
@@ -196,13 +197,24 @@ public interface IManagedEtabsApplication : IDisposable
 public sealed class ManagedEtabsApplication(
     ETABSApplication application,
     ManagedProcessIdentity identity,
-    Guid launchRecordId) : IManagedEtabsApplication
+    Guid launchRecordId,
+    IOwnedEtabsProcess ownedProcess) : IManagedEtabsApplication
 {
     public ETABSApplication Application { get; } = application;
     public ManagedProcessIdentity Identity { get; } = identity;
     public Guid ManagedLaunchRecordId { get; } = launchRecordId;
     public void ExitWithoutSaving() => Application.Application.ApplicationExit(false);
-    public void Dispose() => Application.Dispose();
+    public void Dispose()
+    {
+        try
+        {
+            Application.Dispose();
+        }
+        finally
+        {
+            ownedProcess.Dispose();
+        }
+    }
 }
 
 public interface IManagedEtabsLauncher
@@ -210,35 +222,160 @@ public interface IManagedEtabsLauncher
     IManagedEtabsApplication Launch();
 }
 
-public sealed class ManagedEtabsLauncher(IProcessInspector processes) : IManagedEtabsLauncher
+public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
 {
+    public static readonly TimeSpan AttachTimeout = TimeSpan.FromSeconds(60);
+    public static readonly TimeSpan AttachRetryInterval = TimeSpan.FromMilliseconds(100);
+
+    private readonly IProcessInspector _processes;
+    private readonly IEtabsExecutableResolver _executableResolver;
+    private readonly IEtabsProcessStarter _processStarter;
+    private readonly IManagedEtabsConnector _connector;
+    private readonly IEtabsLaunchClock _clock;
+    private readonly TextWriter _diagnostics;
+
+    public ManagedEtabsLauncher(
+        IProcessInspector processes,
+        IConfiguration configuration) : this(
+            processes,
+            new EtabsExecutableResolver(configuration, new WindowsEtabsInstallDiscovery()),
+            new WindowsEtabsProcessStarter(),
+            new EtabSharpManagedEtabsConnector(),
+            new SystemEtabsLaunchClock(),
+            Console.Error)
+    {
+    }
+
+    public ManagedEtabsLauncher(
+        IProcessInspector processes,
+        IEtabsExecutableResolver executableResolver,
+        IEtabsProcessStarter processStarter,
+        IManagedEtabsConnector connector,
+        IEtabsLaunchClock clock,
+        TextWriter diagnostics)
+    {
+        _processes = processes;
+        _executableResolver = executableResolver;
+        _processStarter = processStarter;
+        _connector = connector;
+        _clock = clock;
+        _diagnostics = diagnostics;
+    }
+
     public IManagedEtabsApplication Launch()
     {
-        var before = processes.SnapshotEtabs().Select(x => x.Pid).ToHashSet();
-        var app = ETABSWrapper.CreateNew()
-            ?? throw new InvalidOperationException("Failed to start ETABS hidden instance.");
+        var before = CaptureCrossCheckBaseline();
+        var executablePath = _executableResolver.Resolve();
+        IOwnedEtabsProcess? ownedProcess = null;
         try
         {
-            if (app.Application.Visible()) app.Application.Hide();
+            ownedProcess = _processStarter.Start(executablePath);
+            var launchRecordId = Guid.NewGuid();
+            var deadline = _clock.UtcNow + AttachTimeout;
+            string? lastError = null;
 
-            var deadline = DateTime.UtcNow.AddSeconds(5);
-            List<ManagedProcessIdentity> candidates;
-            do
+            // TODO(issue #238 live certification): Verify that a plainly started ETABS.exe
+            // accepts ConnectToProcess before any model is open and measure readiness latency.
+            while (_clock.UtcNow < deadline)
             {
-                candidates = processes.SnapshotEtabs().Where(x => !before.Contains(x.Pid)).ToList();
-                if (candidates.Count == 1)
-                    return new ManagedEtabsApplication(app, candidates[0], Guid.NewGuid());
-                Thread.Sleep(100);
-            } while (DateTime.UtcNow < deadline && candidates.Count == 0);
+                var managed = _connector.TryConnect(ownedProcess, launchRecordId, out lastError);
+                if (managed is not null)
+                {
+                    LogCrossCheckDisagreement(before, ownedProcess.Identity.Pid);
+                    ownedProcess = null; // ownership transferred to the managed application
+                    return managed;
+                }
 
-            throw new InvalidOperationException(
-                $"Could not uniquely identify the managed ETABS process after launch (candidates={candidates.Count}).");
+                if (ownedProcess.HasExited)
+                {
+                    lastError = "The owned ETABS process exited before COM attach succeeded.";
+                    break;
+                }
+
+                _clock.Sleep(AttachRetryInterval);
+            }
+
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.AttachTimeout,
+                $"ETABS process PID {ownedProcess.Identity.Pid} did not accept ConnectToProcess within {AttachTimeout.TotalSeconds:0} seconds. Last error: {lastError ?? "none"}");
         }
         catch
         {
-            try { app.Application.ApplicationExit(false); } catch { }
-            app.Dispose();
+            if (ownedProcess is not null)
+            {
+                CleanUpOwnedProcess(ownedProcess);
+            }
+
             throw;
+        }
+    }
+
+    private HashSet<int>? CaptureCrossCheckBaseline()
+    {
+        try
+        {
+            return _processes.SnapshotEtabs().Select(identity => identity.Pid).ToHashSet();
+        }
+        catch (Exception ex)
+        {
+            _diagnostics.WriteLine($"⚠ Managed ETABS launch cross-check baseline unavailable: {ex.Message}");
+            return null;
+        }
+    }
+
+    private void LogCrossCheckDisagreement(HashSet<int>? before, int ownedPid)
+    {
+        if (before is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var candidates = _processes.SnapshotEtabs()
+                .Where(identity => !before.Contains(identity.Pid))
+                .Select(identity => identity.Pid)
+                .Distinct()
+                .Order()
+                .ToList();
+            if (candidates.Count == 1 && candidates[0] == ownedPid)
+            {
+                return;
+            }
+
+            _diagnostics.WriteLine(
+                $"⚠ Managed ETABS launch cross-check disagreed with authoritative owned PID {ownedPid}: " +
+                $"snapshot candidates=[{string.Join(", ", candidates)}]. Authoritative owned-process identity retained.");
+        }
+        catch (Exception ex)
+        {
+            _diagnostics.WriteLine(
+                $"⚠ Managed ETABS launch cross-check unavailable for authoritative owned PID {ownedPid}: {ex.Message}");
+        }
+    }
+
+    private void CleanUpOwnedProcess(IOwnedEtabsProcess ownedProcess)
+    {
+        try
+        {
+            if (!ownedProcess.HasExited)
+            {
+                ownedProcess.Kill();
+                if (!ownedProcess.WaitForExit(TimeSpan.FromSeconds(10)))
+                {
+                    _diagnostics.WriteLine(
+                        $"⚠ Timed out waiting for owned ETABS PID {ownedProcess.Identity.Pid} to exit after launch failure.");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _diagnostics.WriteLine(
+                $"⚠ Could not clean up owned ETABS PID {ownedProcess.Identity.Pid} after launch failure: {ex.Message}");
+        }
+        finally
+        {
+            ownedProcess.Dispose();
         }
     }
 }
