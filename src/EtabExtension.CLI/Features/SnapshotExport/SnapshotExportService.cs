@@ -109,7 +109,7 @@ public class SnapshotExportService : ISnapshotExportService
         string MetadataPath,
         string MetricsPath);
 
-    private Preparation Prepare(string filePath, string outputDir, SnapshotExportRequest request)
+    private static Preparation Prepare(string filePath, string outputDir, SnapshotExportRequest request)
     {
         if (!File.Exists(filePath))
         {
