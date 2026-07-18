@@ -189,7 +189,10 @@ public sealed class WindowsEtabsInstallDiscovery : IEtabsInstallDiscovery
         if (product.GetValue("DisplayIcon") is string displayIcon)
         {
             var iconPath = displayIcon.Split(',')[0].Trim().Trim('"');
-            if (iconPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(
+                    Path.GetFileName(iconPath),
+                    "ETABS.exe",
+                    StringComparison.OrdinalIgnoreCase))
             {
                 return iconPath;
             }
