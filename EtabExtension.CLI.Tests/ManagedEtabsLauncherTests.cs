@@ -1,0 +1,288 @@
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
+using EtabSharp.Core;
+using Microsoft.Extensions.Configuration;
+using Xunit;
+
+namespace EtabExtension.CLI.Tests;
+
+public sealed class ManagedEtabsLauncherTests : IDisposable
+{
+    private readonly string _directory = Path.Combine(
+        Path.GetTempPath(), "etab-cli-launcher-tests", Guid.NewGuid().ToString("N"));
+
+    [Fact]
+    public void ExplicitConfiguredExecutableWinsOverDiscovery()
+    {
+        var configured = CreateExecutable("configured", "ETABS.exe");
+        var discovered = CreateExecutable("registry", "ETABS.exe");
+        var configuration = new ConfigurationManager
+        {
+            [EtabsExecutableResolver.ConfigurationKey] = configured
+        };
+
+        var resolved = new EtabsExecutableResolver(
+            configuration,
+            new FakeDiscovery([discovered], [])).Resolve();
+
+        Assert.Equal(Path.GetFullPath(configured), resolved);
+    }
+
+    [Fact]
+    public void RegistryCandidatePrecedesDefaultInstallCandidate()
+    {
+        var registry = CreateExecutable("registry", "ETABS.exe");
+        var fallback = CreateExecutable("default", "ETABS.exe");
+
+        var resolved = new EtabsExecutableResolver(
+            new ConfigurationManager(),
+            new FakeDiscovery([registry], [fallback])).Resolve();
+
+        Assert.Equal(Path.GetFullPath(registry), resolved);
+    }
+
+    [Fact]
+    public void ExplicitMissingExecutableReturnsStableNotFoundError()
+    {
+        var missing = Path.Combine(_directory, "missing", "ETABS.exe");
+        var configuration = new ConfigurationManager
+        {
+            [EtabsExecutableResolver.ConfigurationKey] = missing
+        };
+
+        var error = Assert.Throws<EtabsLaunchException>(() =>
+            new EtabsExecutableResolver(configuration, new FakeDiscovery([], [])).Resolve());
+
+        Assert.Equal(EtabsLaunchErrorCodes.ExecutableNotFound, error.Code);
+        Assert.Contains(missing, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void MissingConfigAndDiscoveryReturnsStableUnresolvedError()
+    {
+        var error = Assert.Throws<EtabsLaunchException>(() =>
+            new EtabsExecutableResolver(
+                new ConfigurationManager(),
+                new FakeDiscovery([], [])).Resolve());
+
+        Assert.Equal(EtabsLaunchErrorCodes.ExecutableUnresolved, error.Code);
+        Assert.Contains(EtabsExecutableResolver.ConfigurationKey, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LaunchRecordsOwnedIdentityEvenWhenForeignEtabsAppears()
+    {
+        var ownedIdentity = Identity(42);
+        var foreignIdentity = Identity(99);
+        var owned = new FakeOwnedProcess(ownedIdentity);
+        var processes = new FakeProcesses([
+            [],
+            [ownedIdentity, foreignIdentity]
+        ]);
+        var connector = new FakeConnector(succeedOnAttempt: 1);
+        var diagnostics = new StringWriter();
+        var launcher = CreateLauncher(owned, processes, connector, diagnostics);
+
+        using var result = launcher.Launch();
+
+        Assert.Equal(ownedIdentity, result.Identity);
+        Assert.Equal([42], connector.RequestedPids);
+        Assert.Equal(0, owned.KillCount);
+        Assert.Empty(processes.TerminatedPids);
+        Assert.Contains(
+            "⚠ Managed ETABS launch cross-check disagreed with authoritative owned PID 42: " +
+            "snapshot candidates=[42, 99]. Authoritative owned-process identity retained.",
+            diagnostics.ToString(),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AttachRetriesOnlyTheOwnedPidUntilSuccess()
+    {
+        var owned = new FakeOwnedProcess(Identity(42));
+        var connector = new FakeConnector(succeedOnAttempt: 3);
+        var clock = new FakeClock();
+        var launcher = CreateLauncher(
+            owned,
+            new FakeProcesses([[], [owned.Identity]]),
+            connector,
+            new StringWriter(),
+            clock);
+
+        using var result = launcher.Launch();
+
+        Assert.Equal([42, 42, 42], connector.RequestedPids);
+        Assert.Equal(2, clock.SleepCount);
+        Assert.Equal(0, owned.KillCount);
+    }
+
+    [Fact]
+    public void AttachDeadlineFailureKillsAndDisposesOnlyTheOwnedProcess()
+    {
+        var owned = new FakeOwnedProcess(Identity(42));
+        var processes = new FakeProcesses([[], [Identity(99)]]);
+        var connector = new FakeConnector(succeedOnAttempt: null);
+        var launcher = CreateLauncher(owned, processes, connector, new StringWriter());
+
+        var error = Assert.Throws<EtabsLaunchException>(() => launcher.Launch());
+
+        Assert.Equal(EtabsLaunchErrorCodes.AttachTimeout, error.Code);
+        Assert.All(connector.RequestedPids, pid => Assert.Equal(42, pid));
+        Assert.Equal(1, owned.KillCount);
+        Assert.Equal(1, owned.WaitForExitCount);
+        Assert.Equal(1, owned.DisposeCount);
+        Assert.Empty(processes.TerminatedPids);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_directory))
+        {
+            Directory.Delete(_directory, recursive: true);
+        }
+    }
+
+    private static ManagedEtabsLauncher CreateLauncher(
+        FakeOwnedProcess owned,
+        FakeProcesses processes,
+        FakeConnector connector,
+        TextWriter diagnostics,
+        FakeClock? clock = null) => new(
+            processes,
+            new FixedResolver(@"C:\ETABS\ETABS.exe"),
+            new FakeStarter(owned),
+            connector,
+            clock ?? new FakeClock(),
+            diagnostics);
+
+    private string CreateExecutable(string directory, string fileName)
+    {
+        var path = Path.Combine(_directory, directory, fileName);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, "fake executable");
+        return path;
+    }
+
+    private static ManagedProcessIdentity Identity(int pid) => new(
+        pid,
+        new DateTimeOffset(2026, 7, 18, 1, 2, pid % 60, TimeSpan.Zero),
+        $@"C:\ETABS-{pid}\ETABS.exe");
+
+    private sealed class FakeDiscovery(
+        IReadOnlyList<string> registry,
+        IReadOnlyList<string> defaults) : IEtabsInstallDiscovery
+    {
+        public IReadOnlyList<string> RegistryCandidates() => registry;
+        public IReadOnlyList<string> DefaultInstallCandidates() => defaults;
+    }
+
+    private sealed class FixedResolver(string path) : IEtabsExecutableResolver
+    {
+        public string Resolve() => path;
+    }
+
+    private sealed class FakeStarter(FakeOwnedProcess process) : IEtabsProcessStarter
+    {
+        public IOwnedEtabsProcess Start(string executablePath)
+        {
+            StartedPath = executablePath;
+            return process;
+        }
+
+        public string? StartedPath { get; private set; }
+    }
+
+    private sealed class FakeOwnedProcess(ManagedProcessIdentity identity) : IOwnedEtabsProcess
+    {
+        public ManagedProcessIdentity Identity { get; } = identity;
+        public bool HasExited { get; set; }
+        public int KillCount { get; private set; }
+        public int WaitForExitCount { get; private set; }
+        public int DisposeCount { get; private set; }
+
+        public void Kill()
+        {
+            KillCount++;
+            HasExited = true;
+        }
+
+        public bool WaitForExit(TimeSpan timeout)
+        {
+            WaitForExitCount++;
+            return true;
+        }
+
+        public void Dispose() => DisposeCount++;
+    }
+
+    private sealed class FakeConnector(int? succeedOnAttempt) : IManagedEtabsConnector
+    {
+        public List<int> RequestedPids { get; } = [];
+
+        public IManagedEtabsApplication? TryConnect(
+            IOwnedEtabsProcess process,
+            Guid launchRecordId,
+            out string? error)
+        {
+            RequestedPids.Add(process.Identity.Pid);
+            if (succeedOnAttempt == RequestedPids.Count)
+            {
+                error = null;
+                return new FakeManaged(process, launchRecordId);
+            }
+
+            error = "COM server not ready";
+            return null;
+        }
+    }
+
+    private sealed class FakeManaged(
+        IOwnedEtabsProcess process,
+        Guid launchRecordId) : IManagedEtabsApplication
+    {
+        public ETABSApplication Application =>
+            throw new InvalidOperationException("Fake must not expose COM");
+        public ManagedProcessIdentity Identity => process.Identity;
+        public Guid ManagedLaunchRecordId { get; } = launchRecordId;
+        public void ExitWithoutSaving() { }
+        public void Dispose() => process.Dispose();
+    }
+
+    private sealed class FakeClock : IEtabsLaunchClock
+    {
+        public DateTimeOffset UtcNow { get; private set; } =
+            new(2026, 7, 18, 0, 0, 0, TimeSpan.Zero);
+        public int SleepCount { get; private set; }
+
+        public void Sleep(TimeSpan duration)
+        {
+            SleepCount++;
+            UtcNow += duration;
+        }
+    }
+
+    private sealed class FakeProcesses : IProcessInspector
+    {
+        private readonly Queue<IReadOnlyList<ManagedProcessIdentity>> _snapshots;
+        private IReadOnlyList<ManagedProcessIdentity> _last = [];
+
+        public FakeProcesses(IEnumerable<IReadOnlyList<ManagedProcessIdentity>> snapshots) =>
+            _snapshots = new(snapshots);
+
+        public List<int> TerminatedPids { get; } = [];
+
+        public IReadOnlyList<ManagedProcessIdentity> SnapshotEtabs()
+        {
+            if (_snapshots.Count > 0)
+            {
+                _last = _snapshots.Dequeue();
+            }
+
+            return _last;
+        }
+
+        public ManagedProcessIdentity? Find(int pid) =>
+            _last.FirstOrDefault(identity => identity.Pid == pid);
+        public void Terminate(int pid) => TerminatedPids.Add(pid);
+        public bool WaitForExit(int pid, TimeSpan timeout) => true;
+    }
+}
