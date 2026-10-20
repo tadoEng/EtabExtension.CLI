@@ -27,6 +27,13 @@ internal static class AnalysisRunner
     {
         var requested = cases is { Count: > 0 } ? cases : null;
 
+        // CLI #34: clear an earlier analysis BEFORE the census, so the census describes
+        // the model this run will actually analyse.
+        if (ClearEarlierResults(api) is { } clearError)
+        {
+            return Result.Fail<RunAnalysisData>(clearError);
+        }
+
         var selection = AnalysisRunSelection.Establish(api, requested);
         if (!selection.Success || selection.Data is null)
         {
@@ -101,6 +108,47 @@ internal static class AnalysisRunner
             "ℹ Results written to sidecar files — skipping SaveFile() to preserve them");
 
         return Result.Ok(data);
+    }
+
+    /// <summary>
+    /// Makes a model that already holds results ready for a genuine re-run, or explains
+    /// why it cannot be.
+    ///
+    /// <para><b>CLI #34.</b> ETABS locks a model when it analyses it, and an engineer's
+    /// saved EDB is normally in that state. This used to be handled by UNLOCKING it
+    /// (<c>SetModelIsLocked(false)</c>). Measured live on ETABS 23.3, driving the CSI API
+    /// directly with no sidecar involved, on an analysed copy of the sanctioned model:
+    /// the unlock shrinks the run-case census from 31 cases to 23, resets the status
+    /// report to 23 cases at "not run", and the following <c>CreateAnalysisModel</c> +
+    /// <c>RunAnalysis</c> return 0 after ~6 s having analysed nothing. Every case stayed
+    /// at status 1. The same model with its results DELETED instead
+    /// (<c>DeleteResults(All)</c>) stays locked, keeps all 31 cases, and the identical
+    /// <c>CreateAnalysisModel</c> + <c>RunAnalysis</c> perform a full fresh analysis
+    /// (160 s, 31 of 31 finished).</para>
+    ///
+    /// <para>Deleting is also what makes the verdict honest. Leaving the results in place
+    /// and simply re-running would let the previous analysis's status-4 cases answer for
+    /// a run that may have done nothing. After a delete, every case starts at status 1,
+    /// so only THIS run can mark it finished.</para>
+    ///
+    /// <para>A failed delete fails the request: the earlier results would still be there,
+    /// and nothing could tell them apart from this run's.</para>
+    /// </summary>
+    private static string? ClearEarlierResults(IEtabsAnalysisApi api)
+    {
+        if (!api.GetModelIsLocked())
+        {
+            return null;
+        }
+
+        Console.Error.WriteLine(
+            "ℹ The model holds results from an earlier analysis — deleting them so this run starts fresh");
+        var ret = api.DeleteResults(string.Empty, all: true);
+        return ret == 0
+            ? null
+            : $"cAnalyze.DeleteResults(All=True) failed (ret={ret}). The model's earlier analysis " +
+              "results could not be cleared, so no analysis was run: its outcome could not be told " +
+              "apart from the earlier one.";
     }
 
     private static void ReportSelection(AnalysisRunSet runSet)

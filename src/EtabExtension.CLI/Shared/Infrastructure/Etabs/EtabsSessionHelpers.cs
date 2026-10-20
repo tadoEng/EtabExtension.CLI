@@ -66,12 +66,9 @@ internal static class EtabsSessionHelpers
     {
         await Task.CompletedTask;
 
-        if (app.Model.ModelInfo.IsLocked())
-        {
-            Console.Error.WriteLine("ℹ Clearing analysis lock...");
-            app.Model.ModelInfo.SetLocked(false);
-        }
-
+        // No unlock here (CLI #34): unlocking an analysed model makes the next run a
+        // silent no-op. AnalysisRunner deletes earlier results instead, through the same
+        // seam its tests drive.
         return AnalysisRunner.Run(
             new EtabsAnalysisApi(app), filePath, cases, unitSnapshot.Active);
     }
