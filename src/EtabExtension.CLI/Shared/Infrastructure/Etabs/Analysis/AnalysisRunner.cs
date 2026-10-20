@@ -27,6 +27,21 @@ internal static class AnalysisRunner
     {
         var requested = cases is { Count: > 0 } ? cases : null;
 
+        // A request this command will refuse must not cost anything first: ask the
+        // read-only question before any earlier result is deleted (CLI #34 review).
+        var precheck = AnalysisRunSelection.RefuseAbsentCases(api, requested);
+        if (!precheck.Success)
+        {
+            return Result.Fail<RunAnalysisData>(precheck.Error!);
+        }
+
+        // CLI #34: clear an earlier analysis before the selection is established and the
+        // run starts, so every case begins this run at status 1.
+        if (ClearEarlierResults(api) is { } clearError)
+        {
+            return Result.Fail<RunAnalysisData>(clearError);
+        }
+
         var selection = AnalysisRunSelection.Establish(api, requested);
         if (!selection.Success || selection.Data is null)
         {
@@ -101,6 +116,58 @@ internal static class AnalysisRunner
             "ℹ Results written to sidecar files — skipping SaveFile() to preserve them");
 
         return Result.Ok(data);
+    }
+
+    /// <summary>
+    /// Makes a model that already holds results ready for a genuine re-run, or explains
+    /// why it cannot be.
+    ///
+    /// <para><b>CLI #34.</b> ETABS locks a model when it analyses it, and an engineer's
+    /// saved EDB is normally in that state. This used to be handled by UNLOCKING it
+    /// (<c>SetModelIsLocked(false)</c>). Measured live on ETABS 23.3, driving the CSI API
+    /// directly with no sidecar involved, on an analysed copy of the sanctioned model:
+    /// the unlock shrinks the run-case census from 31 cases to 23 and resets the status
+    /// report to 23 cases at "not run". The following <c>CreateAnalysisModel</c> (11.9 s)
+    /// and <c>RunAnalysis</c> (6.1 s) both return 0, about 18 s together, having analysed
+    /// nothing: every case stayed at status 1. The same model with its results DELETED
+    /// instead (<c>DeleteResults(All)</c>) stays locked and keeps all 31 cases (the same
+    /// 31 names before and after the delete). The identical <c>CreateAnalysisModel</c> +
+    /// <c>RunAnalysis</c> then perform a full fresh analysis (160 s, 31 of 31 finished).</para>
+    ///
+    /// <para>Observed trigger, from one run of each variant: the unlock FOLLOWED BY
+    /// <c>CreateAnalysisModel</c>. An unlock followed by <c>RunAnalysis</c> alone did run
+    /// (155 s and 171 s). That is still not a usable repair: after the unlock the census
+    /// reports 23 of the model's 31 cases, so the run set this command reports would
+    /// misdescribe what was analysed. Evidence: <c>exp34</c> / <c>exp34b</c> on CLI #34.</para>
+    ///
+    /// <para>"Locked" is not proof that results exist: a model can be locked by hand. That
+    /// case was measured too (<c>exp34c</c>): <c>DeleteResults(All)</c> returns 0 on a
+    /// hand-locked model with no results and leaves it locked, so it never refuses a
+    /// legitimate run.</para>
+    ///
+    /// <para>Deleting is also what makes the verdict honest. Leaving the results in place
+    /// and simply re-running would let the previous analysis's status-4 cases answer for
+    /// a run that may have done nothing. After a delete, every case starts at status 1,
+    /// so only THIS run can mark it finished.</para>
+    ///
+    /// <para>A failed delete fails the request: the earlier results would still be there,
+    /// and nothing could tell them apart from this run's.</para>
+    /// </summary>
+    private static string? ClearEarlierResults(IEtabsAnalysisApi api)
+    {
+        if (!api.GetModelIsLocked())
+        {
+            return null;
+        }
+
+        Console.Error.WriteLine(
+            "ℹ The model holds results from an earlier analysis — deleting them so this run starts fresh");
+        var ret = api.DeleteResults(string.Empty, all: true);
+        return ret == 0
+            ? null
+            : $"cAnalyze.DeleteResults(All=True) failed (ret={ret}). The model's earlier analysis " +
+              "results could not be cleared, so no analysis was run: its outcome could not be told " +
+              "apart from the earlier one.";
     }
 
     private static void ReportSelection(AnalysisRunSet runSet)

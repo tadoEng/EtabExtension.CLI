@@ -405,6 +405,157 @@ public sealed class AnalysisRunSelectionTests
         Assert.Equal(0, api.RunCount);
     }
 
+    // ── CLI #34: re-analysing a model that already holds results ─────────────
+
+    /// <summary>
+    /// The shape every engineer's saved EDB is in: analysed, therefore locked, with every
+    /// case at status 4. The earlier results must be deleted before the selection is
+    /// established and the run starts, so every case begins this run at status 1.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ALockedModelHasItsEarlierResultsDeletedBeforeTheSelectionAndTheRun(bool selective)
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "MODAL") { Locked = true };
+        api.MarkFinished("DEAD", "LIVE", "MODAL");
+
+        var result = AnalysisRunner.Run(api, ModelPath, selective ? ["DEAD"] : null, null);
+
+        Assert.True(result.Success, result.Error);
+        var delete = api.Calls.IndexOf("DeleteResults(all)");
+        Assert.True(delete >= 0, "a locked model's earlier results were not deleted");
+        var firstSelection = api.Calls.FindIndex(call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+        Assert.True(delete < firstSelection, "the selection was established before the delete");
+        Assert.True(delete < api.Calls.IndexOf("RunAnalysis"), "the run started before the delete");
+        Assert.Equal(selective ? ["DEAD"] : ["DEAD", "LIVE", "MODAL"], api.LastRunSet);
+    }
+
+    /// <summary>
+    /// CLI #34 review. A request that will be refused must cost nothing. Deleting first
+    /// and refusing second would wipe an engineer's earlier results over a misspelt case
+    /// name, while the refusal claimed nothing had changed.
+    /// </summary>
+    [Fact]
+    public void ARefusedRequestOnALockedModelDeletesNothing()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE") { Locked = true };
+        api.MarkFinished("DEAD", "LIVE");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD", "NOPE"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("Refusing to run a partial analysis", result.Error!, StringComparison.Ordinal);
+        Assert.Contains("no earlier result was deleted", result.Error!, StringComparison.Ordinal);
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("DeleteResults", StringComparison.Ordinal));
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+        Assert.Equal(0, api.RunCount);
+    }
+
+    /// <summary>
+    /// The discriminating case. Live ETABS showed a re-run that returned 0 and analysed
+    /// NOTHING. Against a model that still held its earlier status-4 results, such a run
+    /// would read as a full success. With those results deleted first, only this run can
+    /// mark a case finished, so a run that did nothing fails and names every case.
+    /// </summary>
+    [Fact]
+    public void ARerunThatAnalysesNothingCannotBorrowTheEarlierAnalysisResults()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE") { Locked = true, RunAnalysisDoesNothing = true };
+        api.MarkFinished("DEAD", "LIVE");
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("did not finish 2 of the 2", result.Error!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A delete that fails leaves the earlier results in place, indistinguishable from
+    /// this run's. Nothing may run, and the failure says why.
+    /// </summary>
+    [Fact]
+    public void AFailedDeleteOfEarlierResultsRefusesTheRun()
+    {
+        var api = new FakeAnalysisApi("DEAD") { Locked = true, DeleteResultsReturnCode = 6 };
+        api.MarkFinished("DEAD");
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("DeleteResults(All=True) failed (ret=6)", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+    }
+
+    /// <summary>A model with no earlier analysis needs nothing deleted.</summary>
+    [Fact]
+    public void AnUnlockedModelIsAnalysedWithoutDeletingAnything()
+    {
+        var api = new FakeAnalysisApi("DEAD");
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.DoesNotContain("DeleteResults(all)", api.Calls);
+    }
+
+    /// <summary>
+    /// The wiring guard for CLI #34. The defect lived OUTSIDE the seam: the shared helper
+    /// unlocked the model on the live <c>ETABSApplication</c> before the runner ever saw
+    /// it, so no fake could observe it. Only the explicit <c>unlock-model</c> feature may
+    /// reach the CSI or EtabSharp lock setter. Any analysis path that does again makes a
+    /// re-run a silent no-op. The guard also requires that caller to be FOUND, so it
+    /// cannot pass by scanning nothing.
+    /// </summary>
+    [Fact]
+    public void OnlyTheExplicitUnlockCommandMayUnlockAModel()
+    {
+        var callers = ProductionCalls
+            .Where(entry => entry.Value.Any(IsExternalLockSetterCall))
+            .Select(entry => entry.Key)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+        Assert.NotEmpty(callers);
+        Assert.All(callers, caller =>
+            Assert.StartsWith("EtabExtension.CLI.Features.UnlockModel.", caller, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The guard above checks the method that touches the setter, so routing an analysis
+    /// path through the unlock FEATURE would pass it while bringing the defect back
+    /// (review M6). Only the unlock feature itself and the serve dispatcher's
+    /// <c>unlock-model</c> handler may call into it. The dispatcher must actually be found,
+    /// so this cannot pass by scanning nothing.
+    /// </summary>
+    [Fact]
+    public void OnlyTheUnlockCommandRoutesMayCallTheUnlockFeature()
+    {
+        const string feature = "EtabExtension.CLI.Features.UnlockModel.";
+        const string dispatcher = "EtabExtension.CLI.Features.Serve.ServeDispatcher.";
+
+        var callers = ProductionCalls
+            .Where(entry => entry.Value.Any(call =>
+                call.StartsWith(feature + "IUnlockModelService.", StringComparison.Ordinal)
+                || call.StartsWith(feature + "UnlockModelService.", StringComparison.Ordinal)))
+            .Select(entry => entry.Key)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Contains(callers, caller => caller.StartsWith(dispatcher, StringComparison.Ordinal));
+        Assert.All(callers, caller =>
+            Assert.True(
+                caller.StartsWith(feature, StringComparison.Ordinal)
+                || caller.StartsWith(dispatcher, StringComparison.Ordinal),
+                $"{caller} calls into the unlock feature"));
+    }
+
+    private static bool IsExternalLockSetterCall(string call) =>
+        (call.EndsWith(".SetLocked", StringComparison.Ordinal)
+         || call.EndsWith(".SetModelIsLocked", StringComparison.Ordinal))
+        && !call.StartsWith("EtabExtension.CLI.", StringComparison.Ordinal);
+
     // ── Wiring: one owner for the selection surface ──────────────────────────
 
     private static readonly IReadOnlyDictionary<string, IReadOnlyList<string>> ProductionCalls =
@@ -527,6 +678,45 @@ public sealed class AnalysisRunSelectionTests
 
         public int CreateAnalysisModelReturnCode { get; init; }
 
+        /// <summary>
+        /// The model holds results from an earlier analysis. ETABS locks a model when it
+        /// analyses it, so an engineer's saved EDB normally opens this way.
+        /// </summary>
+        public bool Locked { get; set; }
+
+        /// <summary>Return code for <c>DeleteResults</c>.</summary>
+        public int DeleteResultsReturnCode { get; init; }
+
+        /// <summary>
+        /// <c>RunAnalysis</c> returns 0 and analyses nothing: the CLI #34 failure shape,
+        /// measured live after an unlock.
+        /// </summary>
+        public bool RunAnalysisDoesNothing { get; init; }
+
+        public bool GetModelIsLocked()
+        {
+            Calls.Add("GetModelIsLocked");
+            return Locked;
+        }
+
+        public int DeleteResults(string caseName, bool all)
+        {
+            Calls.Add(all ? "DeleteResults(all)" : $"DeleteResults('{caseName}')");
+            if (DeleteResultsReturnCode != 0)
+            {
+                return DeleteResultsReturnCode;
+            }
+
+            // Measured live: DeleteResults(All) keeps the model locked and its case list
+            // intact, and puts every case back to status 1 (not run).
+            foreach (var name in _modelCases.Where(name => all || name == caseName))
+            {
+                _status[name] = 1;
+            }
+
+            return 0;
+        }
+
         public int RunAnalysisReturnCode { get; init; }
 
         /// <summary>Return code for the nth (1-based) <c>GetRunCaseFlag</c> call.</summary>
@@ -634,6 +824,12 @@ public sealed class AnalysisRunSelectionTests
             {
                 LastRunSet = [];
                 return RunAnalysisReturnCode;
+            }
+
+            if (RunAnalysisDoesNothing)
+            {
+                LastRunSet = [];
+                return 0;
             }
 
             var analysed = _modelCases.Where(name => _run[name]).ToList();

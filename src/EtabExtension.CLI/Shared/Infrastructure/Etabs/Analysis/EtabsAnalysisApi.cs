@@ -42,6 +42,19 @@ public interface IEtabsAnalysisApi
     /// </summary>
     int GetCaseStatus(out string[] caseNames, out int[] statuses);
 
+    /// <summary>
+    /// <c>cSapModel.GetModelIsLocked</c>. ETABS locks a model when it analyses it, so a
+    /// locked model NORMALLY holds earlier results, though a model can also be locked by
+    /// hand without any.
+    /// </summary>
+    bool GetModelIsLocked();
+
+    /// <summary>
+    /// <c>cAnalyze.DeleteResults</c>. When <paramref name="all"/> is true the results of
+    /// every load case are deleted and <paramref name="caseName"/> is ignored.
+    /// </summary>
+    int DeleteResults(string caseName, bool all);
+
     /// <summary><c>cAnalyze.CreateAnalysisModel</c>.</summary>
     int CreateAnalysisModel();
 
@@ -83,6 +96,10 @@ internal sealed class EtabsAnalysisApi(ETABSApplication application) : IEtabsAna
         statuses ??= [];
         return ret;
     }
+
+    public bool GetModelIsLocked() => application.SapModel.GetModelIsLocked();
+
+    public int DeleteResults(string caseName, bool all) => Analyze.DeleteResults(caseName, all);
 
     public int CreateAnalysisModel() => Analyze.CreateAnalysisModel();
 

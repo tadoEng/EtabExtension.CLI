@@ -64,6 +64,49 @@ public static class AnalysisRunSelection
     private static readonly StringComparer CaseNameComparer = StringComparer.OrdinalIgnoreCase;
 
     /// <summary>
+    /// Refuses a selective request that names any case the model does not define, WITHOUT
+    /// changing anything in the model. A default request (null or empty) always passes.
+    ///
+    /// <para>CLI #34 review: a locked model has its earlier results deleted before the
+    /// run (see <c>AnalysisRunner</c>). If that delete came before this refusal, a request
+    /// for a misspelt case would cost the engineer every earlier result, while the
+    /// refusal still claimed "no run flag was changed". So the runner asks this read-only
+    /// question first. <see cref="Establish"/> keeps its own identical check, so the rule
+    /// does not depend on callers remembering to ask.</para>
+    /// </summary>
+    public static Result RefuseAbsentCases(
+        IEtabsAnalysisApi api,
+        IReadOnlyList<string>? requestedCases)
+    {
+        ArgumentNullException.ThrowIfNull(api);
+        if (requestedCases is null or { Count: 0 })
+        {
+            return Result.Ok();
+        }
+
+        var censusRet = api.GetRunCaseFlags(out var modelCases, out _);
+        if (censusRet != 0)
+        {
+            return Result.Fail(
+                $"cAnalyze.GetRunCaseFlag failed (ret={censusRet}). The model's load-case list " +
+                "could not be read, so the requested cases could not be checked and nothing was changed.");
+        }
+
+        var resolution = Resolve(requestedCases, modelCases);
+        return resolution.NotInModel.Count > 0
+            ? Result.Fail(PartialRefusal(resolution, modelCases.Length))
+            : Result.Ok();
+    }
+
+    private static string PartialRefusal(Resolution resolution, int modelCaseCount) =>
+        "Refusing to run a partial analysis: " +
+        $"{resolution.NotInModel.Count} of the {resolution.Resolved.Count + resolution.NotInModel.Count} " +
+        "requested case(s) are not defined in this model: " +
+        $"{string.Join(", ", resolution.NotInModel)}. " +
+        "No run flag was changed, no earlier result was deleted and no analysis was run. " +
+        $"The model defines {modelCaseCount} load case(s); re-request with only those.";
+
+    /// <summary>
     /// Puts the model into the selection this request asked for, and returns what the
     /// model then reports as selected.
     ///
@@ -125,13 +168,7 @@ public static class AnalysisRunSelection
             // failed call re-read as "case not found".
             if (resolution.NotInModel.Count > 0)
             {
-                return Result.Fail<AnalysisRunSet>(
-                    "Refusing to run a partial analysis: " +
-                    $"{resolution.NotInModel.Count} of the {resolution.Resolved.Count + resolution.NotInModel.Count} " +
-                    "requested case(s) are not defined in this model: " +
-                    $"{string.Join(", ", resolution.NotInModel)}. " +
-                    "No run flag was changed and no analysis was run. " +
-                    $"The model defines {modelCases.Length} load case(s); re-request with only those.");
+                return Result.Fail<AnalysisRunSet>(PartialRefusal(resolution, modelCases.Length));
             }
 
             // ESTABLISH the requested selection outright: clear every flag first so the
