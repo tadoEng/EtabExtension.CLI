@@ -327,6 +327,16 @@ etab-cli extract-results -f <path.edb> -o <outputDir> -r '<requestJson>'
 
 Tables with `RequiresAnalysis = true` are **skipped** (not failed) when the model has not been analyzed/locked, with a clear error message. Geometry tables (`false`) always run.
 
+**Output freshness (CLI #33).** The output directory is reused across runs and the Rust calc path reads each table by its fixed filename. So once extraction starts, every *planned* table's exact `{slug}.parquet` is removed before the first table is attempted. Afterwards, a file at that path can only be one this attempt wrote. A table that produced zero rows, failed its query or write, or was skipped for missing analysis is **absent**, never left holding the previous run's bytes, and so is every later table if the extraction dies part-way. If a previous file cannot be removed, that table fails with an error naming it and is not attempted. The old file is then still readable at its path, so trust the per-table outcome, not the file's presence.
+
+A write that fails or throws removes its own partial file. A process killed mid-write can still leave a truncated file. Parquet keeps its footer at the end, so a truncated file cannot be read.
+
+Only planned tables' exact paths are touched: unplanned tables, other files and subdirectories are left alone, and nothing is deleted recursively.
+
+**Owners.** `TableExtractionRunner` handles the registry tables for `extract-results`, `snapshot-export`, `analyze-and-extract` and default-key `extract-materials`. For `extract-materials --table-key <other>`, `ExtractMaterialsService` clears its single output path *before ETABS is started*. It also refuses a key whose file would land outside the output directory. Both owners use `ExtractionOutputFile`.
+
+**Scope.** A command that fails *before* extraction starts (open, unit normalisation, analysis, E2K export) does not touch the previous run's files. That command fails as a whole, so none of its tables may be read.
+
 Returns `ExtractResultsData` — `tables` (dict of slug → `TableExtractionOutcome`), `succeededCount`, `failedCount`, `totalRowCount`, `units`, `extractionTimeMs`.
 
 ---
