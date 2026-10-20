@@ -126,6 +126,12 @@ internal static class AnalysisRunner
     /// <c>CreateAnalysisModel</c> + <c>RunAnalysis</c> perform a full fresh analysis
     /// (160 s, 31 of 31 finished).</para>
     ///
+    /// <para>The precise trigger is the unlock FOLLOWED BY <c>CreateAnalysisModel</c>:
+    /// an unlock followed by <c>RunAnalysis</c> alone did run (171 s). That is still not a
+    /// usable repair, because after the unlock the census reports 23 of the model's 31
+    /// cases, and the run set this command reports would misdescribe what was analysed.
+    /// Evidence: <c>exp34</c> / <c>exp34b</c> on CLI #34.</para>
+    ///
     /// <para>Deleting is also what makes the verdict honest. Leaving the results in place
     /// and simply re-running would let the previous analysis's status-4 cases answer for
     /// a run that may have done nothing. After a delete, every case starts at status 1,
