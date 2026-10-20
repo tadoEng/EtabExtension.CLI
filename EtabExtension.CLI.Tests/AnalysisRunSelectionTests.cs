@@ -409,23 +409,47 @@ public sealed class AnalysisRunSelectionTests
 
     /// <summary>
     /// The shape every engineer's saved EDB is in: analysed, therefore locked, with every
-    /// case at status 4. The earlier results must be deleted before anything is read or
-    /// run, so the census and the run both see the model this run will analyse.
+    /// case at status 4. The earlier results must be deleted before the selection is
+    /// established and the run starts, so every case begins this run at status 1.
     /// </summary>
-    [Fact]
-    public void ALockedModelHasItsEarlierResultsDeletedBeforeTheCensusAndTheRun()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ALockedModelHasItsEarlierResultsDeletedBeforeTheSelectionAndTheRun(bool selective)
     {
         var api = new FakeAnalysisApi("DEAD", "LIVE", "MODAL") { Locked = true };
         api.MarkFinished("DEAD", "LIVE", "MODAL");
 
-        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+        var result = AnalysisRunner.Run(api, ModelPath, selective ? ["DEAD"] : null, null);
 
         Assert.True(result.Success, result.Error);
         var delete = api.Calls.IndexOf("DeleteResults(all)");
         Assert.True(delete >= 0, "a locked model's earlier results were not deleted");
-        Assert.True(delete < api.Calls.IndexOf("GetRunCaseFlag"), "the census was read before the delete");
+        var firstSelection = api.Calls.FindIndex(call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+        Assert.True(delete < firstSelection, "the selection was established before the delete");
         Assert.True(delete < api.Calls.IndexOf("RunAnalysis"), "the run started before the delete");
-        Assert.Equal(["DEAD", "LIVE", "MODAL"], api.LastRunSet);
+        Assert.Equal(selective ? ["DEAD"] : ["DEAD", "LIVE", "MODAL"], api.LastRunSet);
+    }
+
+    /// <summary>
+    /// CLI #34 review. A request that will be refused must cost nothing. Deleting first
+    /// and refusing second would wipe an engineer's earlier results over a misspelt case
+    /// name, while the refusal claimed nothing had changed.
+    /// </summary>
+    [Fact]
+    public void ARefusedRequestOnALockedModelDeletesNothing()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE") { Locked = true };
+        api.MarkFinished("DEAD", "LIVE");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD", "NOPE"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("Refusing to run a partial analysis", result.Error!, StringComparison.Ordinal);
+        Assert.Contains("no earlier result was deleted", result.Error!, StringComparison.Ordinal);
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("DeleteResults", StringComparison.Ordinal));
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+        Assert.Equal(0, api.RunCount);
     }
 
     /// <summary>
@@ -496,6 +520,35 @@ public sealed class AnalysisRunSelectionTests
         Assert.NotEmpty(callers);
         Assert.All(callers, caller =>
             Assert.StartsWith("EtabExtension.CLI.Features.UnlockModel.", caller, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The guard above checks the method that touches the setter, so routing an analysis
+    /// path through the unlock FEATURE would pass it while bringing the defect back
+    /// (review M6). Only the unlock feature itself and the serve dispatcher's
+    /// <c>unlock-model</c> handler may call into it. The dispatcher must actually be found,
+    /// so this cannot pass by scanning nothing.
+    /// </summary>
+    [Fact]
+    public void OnlyTheUnlockCommandRoutesMayCallTheUnlockFeature()
+    {
+        const string feature = "EtabExtension.CLI.Features.UnlockModel.";
+        const string dispatcher = "EtabExtension.CLI.Features.Serve.ServeDispatcher.";
+
+        var callers = ProductionCalls
+            .Where(entry => entry.Value.Any(call =>
+                call.StartsWith(feature + "IUnlockModelService.", StringComparison.Ordinal)
+                || call.StartsWith(feature + "UnlockModelService.", StringComparison.Ordinal)))
+            .Select(entry => entry.Key)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Contains(callers, caller => caller.StartsWith(dispatcher, StringComparison.Ordinal));
+        Assert.All(callers, caller =>
+            Assert.True(
+                caller.StartsWith(feature, StringComparison.Ordinal)
+                || caller.StartsWith(dispatcher, StringComparison.Ordinal),
+                $"{caller} calls into the unlock feature"));
     }
 
     private static bool IsExternalLockSetterCall(string call) =>

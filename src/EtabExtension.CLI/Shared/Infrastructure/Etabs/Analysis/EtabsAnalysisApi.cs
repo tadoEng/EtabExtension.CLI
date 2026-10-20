@@ -43,8 +43,9 @@ public interface IEtabsAnalysisApi
     int GetCaseStatus(out string[] caseNames, out int[] statuses);
 
     /// <summary>
-    /// <c>cSapModel.GetModelIsLocked</c> — true when the model holds results from an
-    /// earlier analysis (ETABS locks a model when it analyses it).
+    /// <c>cSapModel.GetModelIsLocked</c>. ETABS locks a model when it analyses it, so a
+    /// locked model NORMALLY holds earlier results, though a model can also be locked by
+    /// hand without any.
     /// </summary>
     bool GetModelIsLocked();
 
