@@ -316,6 +316,8 @@ etab-cli extract-results -f <path.edb> -o <outputDir> -r '<requestJson>'
 
 Tables with `RequiresAnalysis = true` are **skipped** (not failed) when the model has not been analyzed/locked, with a clear error message. Geometry tables (`false`) always run.
 
+**Output freshness (CLI #33).** The output directory is reused across runs and the Rust calc path reads each table by its fixed filename. So before the first table is attempted, every *planned* table's exact `{slug}.parquet` is removed. Afterwards, a file at that path can only be one this attempt wrote. A table that produced zero rows, failed its query or write, or was skipped for missing analysis is **absent**, never left holding the previous run's bytes. If a previous file cannot be removed, that table fails with an error naming it and is not attempted. A failed or interrupted write removes its own partial file. Only planned tables' exact paths are touched: unplanned tables, other files and subdirectories are left alone. Owner: `TableExtractionRunner`, shared by `extract-results`, `extract-materials`, `snapshot-export` and `analyze-and-extract`.
+
 Returns `ExtractResultsData` — `tables` (dict of slug → `TableExtractionOutcome`), `succeededCount`, `failedCount`, `totalRowCount`, `units`, `extractionTimeMs`.
 
 ---
