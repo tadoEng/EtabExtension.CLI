@@ -209,7 +209,9 @@ Returns `ExtractResultsData` with `tables` keyed by table slug:
 }
 ```
 
-`outputFile` is only ever this run's file. Every planned table's `<slug>.parquet` is removed before extraction starts. A table with zero rows, a failed query or write, or a skipped results table therefore has **no** file at its path. It never has a previous run's file. Read a table's file only when its outcome is `success` with a non-null `outputFile`. A previous file that could not be removed fails its table with an error naming the path, and that file must not be read.
+`outputFile` is only ever this run's file. Once extraction starts, every planned table's `<slug>.parquet` is removed before the first table is attempted. A table with zero rows, a failed query or write, or a skipped results table therefore has **no** file at its path. It never has a previous run's file.
+
+Read a table's file only when the command succeeded and that table's outcome is `success` with a non-null `outputFile`. A previous file that could not be removed fails its table with an error naming the path. That file is still on disk and must not be read. The same rule applies to `extract-materials`, which clears its output path before starting ETABS.
 
 ### `extract-materials`
 

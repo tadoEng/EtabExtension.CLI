@@ -34,7 +34,7 @@ namespace EtabExtension.CLI.Features.ExtractResults.Tables;
 /// <see cref="OutputPathFor"/>. Unplanned tables, other files, and subdirectories in the
 /// caller's directory are never removed, and nothing is deleted recursively.</para>
 /// </summary>
-public static class TableExtractionRunner
+internal static class TableExtractionRunner
 {
     /// <summary>
     /// The one place a table's output path is spelled. The extractor that writes the
@@ -128,24 +128,6 @@ public static class TableExtractionRunner
     /// Removes the previous run's output for one table, or explains why it could not.
     /// A path that does not exist is already in the state this wants.
     /// </summary>
-    private static string? RemovePreviousOutput(string outputDir, string slug)
-    {
-        var path = OutputPathFor(outputDir, slug);
-        try
-        {
-            File.Delete(path);
-            return null;
-        }
-        catch (DirectoryNotFoundException)
-        {
-            // No directory, so no earlier output either.
-            return null;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return
-                $"A previous run's output for '{slug}' could not be removed ({path}): {ex.Message}. " +
-                "The table was not extracted, and that file must NOT be read as this run's result.";
-        }
-    }
+    private static string? RemovePreviousOutput(string outputDir, string slug) =>
+        ExtractionOutputFile.RemovePrevious(OutputPathFor(outputDir, slug), slug);
 }

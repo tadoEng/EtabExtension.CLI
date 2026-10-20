@@ -175,10 +175,11 @@ internal static class EtabsSessionHelpers
 
         try
         {
-            // Every caller — extract-results, extract-materials, snapshot-export and
-            // analyze-and-extract — comes through here, so this is where the CLI #33
-            // freshness invariant is established: no planned table's path may keep an
-            // earlier run's bytes.
+            // extract-results, snapshot-export, analyze-and-extract and default-key
+            // extract-materials all come through here, so this is where the CLI #33
+            // freshness invariant is established for registry tables: no planned table's
+            // path may keep an earlier run's bytes. (extract-materials --table-key <other>
+            // writes its own single file and clears it itself; see ExtractMaterialsService.)
             return await TableExtractionRunner.RunAsync(
                 registry.Entries, tables, outputDir, isAnalyzed, queryService, parquet);
         }

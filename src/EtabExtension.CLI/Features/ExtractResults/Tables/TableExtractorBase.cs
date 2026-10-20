@@ -138,22 +138,5 @@ public abstract class TableExtractorBase : ITableExtractor
         }
     }
 
-    /// <summary>
-    /// Removes whatever a failed write left at <paramref name="path"/>. Returns an empty
-    /// string when the path is clean, or a sentence to append to the failure when it
-    /// could not be cleaned, so the outcome never claims a clean failure it did not get.
-    /// </summary>
-    private static string RemovePartialOutput(string path)
-    {
-        try
-        {
-            File.Delete(path);
-            return string.Empty;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return $" A partially written file could not be removed ({path}): {ex.Message}. " +
-                   "It must NOT be read as this run's result.";
-        }
-    }
+    private static string RemovePartialOutput(string path) => ExtractionOutputFile.RemovePartial(path);
 }
