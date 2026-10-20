@@ -171,50 +171,16 @@ internal static class EtabsSessionHelpers
         TableExtractorRegistry registry,
         IParquetService parquet)
     {
-        var planned = registry.Entries
-            .Where(e => e.FilterSelector(tables) is not null)
-            .ToList();
-
         var queryService = tableFactory.CreateQueryService(app);
-        var outcomes = new Dictionary<string, TableExtractionOutcome>();
 
         try
         {
-            foreach (var entry in registry.Entries)
-            {
-                var filter = entry.FilterSelector(tables);
-                if (filter is null)
-                {
-                    continue;
-                }
-
-                Console.Error.WriteLine(
-                    $"ℹ [{outcomes.Count + 1}/{planned.Count}] Extracting: {entry.Extractor.Label}");
-
-                TableExtractionOutcome outcome;
-                // Result tables require analysis RESULTS (≥1 finished case), not a
-                // locked UI state. The lock half of this gate previously skipped
-                // extraction when ETABS did not leave the model locked post-run.
-                if (entry.Extractor.RequiresAnalysis && !isAnalyzed)
-                {
-                    outcome = TableExtractionOutcome.Fail(
-                        "Model has no analysis results. Run analysis first (run-analysis command).");
-                    Console.Error.WriteLine("  ⚠ Skipped — model not analyzed");
-                }
-                else
-                {
-                    outcome = await entry.Extractor.ExtractAsync(
-                        filter, outputDir, queryService, parquet);
-                }
-
-                outcomes[entry.Extractor.Slug] = outcome;
-                var status = outcome.Success
-                    ? $"✓ {outcome.RowCount} rows → {Path.GetFileName(outcome.OutputFile ?? "(empty)")} ({outcome.ExtractionTimeMs} ms)"
-                    : $"✗ FAILED: {outcome.Error}";
-                Console.Error.WriteLine($"  {status}");
-            }
-
-            return outcomes;
+            // Every caller — extract-results, extract-materials, snapshot-export and
+            // analyze-and-extract — comes through here, so this is where the CLI #33
+            // freshness invariant is established: no planned table's path may keep an
+            // earlier run's bytes.
+            return await TableExtractionRunner.RunAsync(
+                registry.Entries, tables, outputDir, isAnalyzed, queryService, parquet);
         }
         finally
         {

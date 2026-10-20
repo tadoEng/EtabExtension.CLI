@@ -71,6 +71,11 @@ public abstract class TableExtractorBase : ITableExtractor
         var sw = Stopwatch.StartNew();
         Logger.LogInformation("Extracting '{Label}' ({TableKey})", Label, EtabsTableKey);
 
+        // Set once a write has been started. From then on a failure may have left a
+        // truncated file at the path (the writer streams straight into it), and a reader
+        // must not mistake that for this run's table.
+        string? writing = null;
+
         try
         {
             var queryResult = await queryService.QueryAsync(BuildRequest(filter));
@@ -99,13 +104,15 @@ public abstract class TableExtractorBase : ITableExtractor
                     row.TryGetValue(f, out var v) ? v : string.Empty))
                 .ToList();
 
-            var outputFile = Path.Combine(outputDir, $"{Slug}.parquet");
+            var outputFile = TableExtractionRunner.OutputPathFor(outputDir, Slug);
+            writing = outputFile;
             var writeResult = await parquet.WriteAsync(outputFile, queryResult.FieldKeys, flatData);
 
             if (!writeResult.Success)
             {
                 Logger.LogError("'{Label}' parquet write failed: {Error}", Label, writeResult.Error);
-                return TableExtractionOutcome.Fail($"Parquet write failed: {writeResult.Error}");
+                return TableExtractionOutcome.Fail(
+                    $"Parquet write failed: {writeResult.Error}{RemovePartialOutput(outputFile)}");
             }
 
             sw.Stop();
@@ -126,7 +133,27 @@ public abstract class TableExtractorBase : ITableExtractor
         catch (Exception ex)
         {
             Logger.LogError(ex, "'{Label}' extraction threw an exception", Label);
-            return TableExtractionOutcome.Fail(ex.Message);
+            var removal = writing is null ? string.Empty : RemovePartialOutput(writing);
+            return TableExtractionOutcome.Fail($"{ex.Message}{removal}");
+        }
+    }
+
+    /// <summary>
+    /// Removes whatever a failed write left at <paramref name="path"/>. Returns an empty
+    /// string when the path is clean, or a sentence to append to the failure when it
+    /// could not be cleaned, so the outcome never claims a clean failure it did not get.
+    /// </summary>
+    private static string RemovePartialOutput(string path)
+    {
+        try
+        {
+            File.Delete(path);
+            return string.Empty;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return $" A partially written file could not be removed ({path}): {ex.Message}. " +
+                   "It must NOT be read as this run's result.";
         }
     }
 }
