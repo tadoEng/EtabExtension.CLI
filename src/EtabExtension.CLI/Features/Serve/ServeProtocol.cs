@@ -27,7 +27,47 @@ public sealed class ServeRequest
 {
     [JsonPropertyName("id")] public long Id { get; init; }
     [JsonPropertyName("command")] public string Command { get; init; } = string.Empty;
+
+    /// <summary>
+    /// The caller's declared intent for a COLD ETABS start, e.g.
+    /// <c>"visible-start-consented"</c>.
+    ///
+    /// <para>It lives on the ENVELOPE rather than in any command's payload because it
+    /// describes the request, not the work. Putting it in each payload would duplicate it
+    /// across every command and make each new command a fresh chance to forget it.</para>
+    ///
+    /// <para>Absent or unrecognised means no consent, and a cold start is refused before
+    /// any process is created. Requests that reuse an existing session ignore it.</para>
+    /// </summary>
+    [JsonPropertyName("startIntent")] public string? StartIntent { get; init; }
+
     [JsonPropertyName("request")] public JsonElement? Request { get; init; }
+}
+
+/// <summary>
+/// A request the dispatcher has ACCEPTED but cannot answer yet.
+///
+/// <para>It exists so one command can take minutes without the protocol reader taking
+/// minutes with it. A handler that returns this has finished everything that needs the
+/// request scope - its declared intent, its captured <c>EtabsWorkContext</c> - and hands
+/// back the task that will produce the real answer. <see cref="ServeLoop"/> goes straight
+/// back to stdin and writes that answer, on the same request id and in the same envelope
+/// shape as any other response, whenever it arrives.</para>
+///
+/// <para>This is never serialised: it is a signal between the dispatcher and the loop, and
+/// the caller only ever sees the result it eventually carries.</para>
+///
+/// <para><b>Wire consequence.</b> Because the reader keeps going, a response to a LATER id
+/// can now be written before the deferred one. Clients that keep a single in-flight request
+/// - which the Rust <c>SharedClient</c> does, by holding one mutex across send and receive -
+/// can never observe this. A client that wants to poll during a long run needs a stdout
+/// reader that routes responses by <c>id</c> first; one that assumes the next id-bearing
+/// line is its own answer must not send anything until it has been answered.</para>
+/// </summary>
+public sealed class DeferredServeResponse(Task<object> completion)
+{
+    /// <summary>The eventual response object, in the shape the command normally returns.</summary>
+    public Task<object> Completion { get; } = completion;
 }
 
 public sealed record ServeHandshake(

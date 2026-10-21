@@ -2,6 +2,27 @@ using System.Text.Json.Serialization;
 
 namespace EtabExtension.CLI.Features.Serve.Inspection;
 
+/// <summary>
+/// Coded reasons an inspection request is refused, so a caller can branch on the cause
+/// rather than parse a CSI return code. CLI #28.
+/// </summary>
+public static class InspectionErrorCodes
+{
+    /// <summary>The model defines the area property, but it is not a wall.</summary>
+    public const string AreaPropertyNotAWall = "ETABS_AREA_PROPERTY_NOT_A_WALL";
+
+    /// <summary>The model defines no area property with that name at all.</summary>
+    public const string AreaPropertyNotFound = "ETABS_AREA_PROPERTY_NOT_FOUND";
+
+    /// <summary>
+    /// The property's kind could not be established because CSI refused the probes. An
+    /// infrastructure failure, deliberately distinct from both semantic answers above: a
+    /// caller must be able to tell "your name is wrong" from "ETABS would not answer".
+    /// </summary>
+    public const string AreaPropertyClassificationFailed =
+        "ETABS_AREA_PROPERTY_CLASSIFICATION_FAILED";
+}
+
 public sealed class InspectWallPropertyRequest
 {
     [JsonPropertyName("name")]

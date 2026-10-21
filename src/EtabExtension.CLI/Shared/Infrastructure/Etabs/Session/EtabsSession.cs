@@ -1,3 +1,5 @@
+using System.Diagnostics.CodeAnalysis;
+using EtabExtension.CLI.Shared.Common;
 using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
@@ -8,6 +10,28 @@ public interface IEtabsSession : IDisposable
     IManagedEtabsApplication GetOrStartOwned();
     bool IsStarted { get; }
     int? ProcessId { get; }
+
+    /// <summary>
+    /// Shows the managed ETABS window because the USER asked to see it.
+    ///
+    /// <para>The session is created hidden and stays hidden for every background
+    /// command, so this is the only way it ever reaches the screen. Callers must invoke
+    /// it only after the requested model is confirmed open — revealing before that is
+    /// exactly the blank <c>(Untitled)</c> window CLI #22 exists to remove.</para>
+    /// </summary>
+    Result RevealForExplicitUserRequest();
+
+    /// <summary>
+    /// CLI #24: fails the CURRENT request if the session was materially on screen during
+    /// background work. Called after every ETABS-backed command and before its response is
+    /// written, because a sticky exposure that only surfaced at session creation would let
+    /// the very request that caused it answer success.
+    /// </summary>
+    Result CertifyNoUnconsentedExposure();
+
+    /// <summary>Labels what the session is doing, for CLI #24's exposure evidence.</summary>
+    void MarkVisibilityStage(string stage);
+
     ManagedEtabsShutdownResult Shutdown();
 }
 
@@ -17,6 +41,16 @@ public sealed class EtabsSession : IEtabsSession
     private readonly IProcessInspector _processes;
     private readonly ISessionRecordStore _records;
     private readonly IManagedEtabsShutdownMachine _shutdownMachine;
+    private readonly IEtabsWorkScope _work;
+    private string? _commandStage;
+
+    // Borrowed, never owned: this is Console.Error in production and a test's buffer under
+    // test, so the session must not close it when it disposes.
+    [SuppressMessage(
+        "Usage",
+        "CA2213:Disposable fields should be disposed",
+        Justification = "The diagnostics writer is owned by the caller, not by the session.")]
+    private readonly TextWriter _diagnostics;
     private readonly object _gate = new();
     private IManagedEtabsApplication? _owned;
     private bool _ready;
@@ -26,8 +60,9 @@ public sealed class EtabsSession : IEtabsSession
     public EtabsSession(
         IManagedEtabsLauncher launcher,
         IProcessInspector processes,
-        ISessionRecordStore records)
-        : this(launcher, processes, records, new ManagedEtabsShutdownMachine(records))
+        ISessionRecordStore records,
+        IEtabsWorkScope work)
+        : this(launcher, processes, records, new ManagedEtabsShutdownMachine(records), work)
     {
     }
 
@@ -35,12 +70,26 @@ public sealed class EtabsSession : IEtabsSession
         IManagedEtabsLauncher launcher,
         IProcessInspector processes,
         ISessionRecordStore records,
-        IManagedEtabsShutdownMachine shutdownMachine)
+        IManagedEtabsShutdownMachine shutdownMachine,
+        IEtabsWorkScope work)
+        : this(launcher, processes, records, shutdownMachine, work, Console.Error)
+    {
+    }
+
+    internal EtabsSession(
+        IManagedEtabsLauncher launcher,
+        IProcessInspector processes,
+        ISessionRecordStore records,
+        IManagedEtabsShutdownMachine shutdownMachine,
+        IEtabsWorkScope work,
+        TextWriter diagnostics)
     {
         _launcher = launcher;
         _processes = processes;
         _records = records;
         _shutdownMachine = shutdownMachine;
+        _work = work;
+        _diagnostics = diagnostics;
     }
 
     public bool IsStarted
@@ -74,7 +123,18 @@ public sealed class EtabsSession : IEtabsSession
 
             if (_owned is null)
             {
-                Console.Error.WriteLine("ℹ Starting ETABS (shared serve session)...");
+                // THE consent gate. Before CreateObject, before anything is started, and
+                // before any diagnostic claims a start is under way.
+                //
+                // It guards a COLD start only. A session that already exists — hidden, or
+                // deliberately shown to the engineer — serves later background work without
+                // asking again, because nothing about reusing it puts a new window on
+                // screen. It is process CREATION that the engineer had to agree to.
+                RequireVisibleStartConsent();
+
+                _diagnostics.WriteLine(
+                    "ℹ Starting ETABS (shared serve session; the engineer consented to a " +
+                    "visible start)...");
                 var launched = Launch();
                 _owned = launched;
                 try
@@ -102,9 +162,22 @@ public sealed class EtabsSession : IEtabsSession
                     throw _launchFailure;
                 }
 
-                var initializationFailure = Initialize(launched)
-                    ?? CompleteReadiness(launched);
-                if (initializationFailure is not null)
+                // Readiness and hidden state are one gate, not two. The candidate #20
+                // rejected treated the hide as advisory and printed a "started hidden"
+                // success line straight after failing to confirm it; here an unconfirmed
+                // hidden state ends the session on the same path a failed
+                // InitializeNewModel does, so that line can only ever follow a proof.
+                //
+                // What is proven changed after #20: the gate is the exact-owned Windows
+                // census, not cOAPI.Visible(). InitializeNewModel is precisely when ETABS
+                // builds the (Untitled) model behind its frame, so this second census is
+                // where a window that surfaced during initialization has to be accounted
+                // for — the guard will already have taken it down on the window event.
+                launched.MarkVisibilityStage("cSapModel.InitializeNewModel");
+                var creationFailure = Initialize(launched)
+                    ?? CompleteReadiness(launched)
+                    ?? ConfirmHiddenForBackgroundWork(launched);
+                if (creationFailure is not null)
                 {
                     var cleanup = _shutdownMachine.Shutdown(launched);
                     _shutdownResult = cleanup;
@@ -114,16 +187,24 @@ public sealed class EtabsSession : IEtabsSession
                     }
                     _ready = false;
                     _launchFailure = new EtabsLaunchException(
-                        EtabsLaunchErrorCodes.ModelInitializationFailed,
+                        creationFailure.Value.Code,
                         WithTerminalFacts(
-                            initializationFailure.Value.Diagnostic,
+                            creationFailure.Value.Diagnostic,
                             cleanup),
-                        initializationFailure.Value.Exception);
+                        creationFailure.Value.Exception);
                     throw _launchFailure;
                 }
 
                 _ready = true;
-                Console.Error.WriteLine($"✓ ETABS started (PID {_owned.Identity.Pid})");
+                _diagnostics.WriteLine($"✓ ETABS started hidden (PID {_owned.Identity.Pid})");
+
+                // The launch owned the stage until now. Hand it back to whatever command
+                // is actually running, so the next observation is attributed to the work
+                // and not to the initialization that preceded it.
+                if (_commandStage is { } pending)
+                {
+                    _owned.MarkVisibilityStage(pending);
+                }
             }
 
             try
@@ -147,6 +228,78 @@ public sealed class EtabsSession : IEtabsSession
                 throw;
             }
         }
+    }
+
+    /// <summary>
+    /// Ends the session because its on-screen state can no longer be vouched for.
+    ///
+    /// <para><b>Why terminal.</b> Two routes reach here and they share one property. A
+    /// failed reveal has already issued or attempted <c>cOAPI.Unhide()</c> and left the
+    /// protected interval, so ETABS may be visible or may not be. A certification whose
+    /// census could not run knows even less: nothing was observed at all. In both cases the
+    /// session is UNCERTAIN, not proven clean.</para>
+    ///
+    /// <para>Returning a failure while keeping the session reusable would leave later
+    /// background work running against an unwatched session that might be sitting in front
+    /// of the engineer. That is exactly the case CLI #24 exists to refuse, so an uncertain
+    /// session is spent rather than reused - and the next request cold-starts a fresh one,
+    /// asking the engineer for consent again.</para>
+    /// </summary>
+    private Result EndUncertainSession(IManagedEtabsApplication owned, string diagnostic)
+    {
+        var cleanup = _shutdownMachine.Shutdown(owned);
+        _shutdownResult = cleanup;
+        if (cleanup.Data.ProcessExitConfirmed)
+        {
+            _owned = null;
+        }
+
+        _ready = false;
+        return Result.Fail(WithTerminalFacts(diagnostic, cleanup));
+    }
+
+    /// <summary>
+    /// Refuses a cold start that nobody declared an intent for.
+    ///
+    /// <para>Fails BEFORE <c>cHelper.CreateObject</c>, which is the only useful place: once
+    /// that call returns, ETABS is already starting and already heading for the screen.
+    /// The refusal is typed so the desktop can tell "you must ask the engineer first" apart
+    /// from every other launch failure and show the consent prompt rather than an error.</para>
+    ///
+    /// <para>The intent is never inferred from the command name. A command called
+    /// <c>snapshot-export</c> tells us what work was asked for, not whether anyone warned
+    /// the engineer that a window is about to appear — and inferring the second from the
+    /// first is exactly how an unconsented exposure would get rationalised as expected.</para>
+    /// </summary>
+    private void RequireVisibleStartConsent()
+    {
+        // Read from the EXECUTION context. Reading a request-lifetime value here was the
+        // defect: a queued operation runs after its request returned, so it would see
+        // whatever the ambient field had decayed to - or worse, whatever a later polling
+        // request had just published into it.
+        var intent = _work.Current.StartIntent;
+        if (intent == ManagedEtabsStartIntent.VisibleByConsent)
+        {
+            return;
+        }
+
+        // Thrown WITHOUT populating _launchFailure. That latch is for failures which
+        // leave the world in a state this session can no longer reason about - a started
+        // process it could not resolve, a recovery record it could not write. A refusal is
+        // the opposite: nothing happened at all, and the very next request may legitimately
+        // arrive with consent after the desktop has prompted. Caching it here would make
+        // the intended flow - request, refusal, prompt, retry - impossible without
+        // restarting the daemon.
+        throw new EtabsLaunchException(
+            EtabsLaunchErrorCodes.VisibleStartConsentMissing,
+            EtabsApiDiagnosticFormatter.Bounded(string.Join(
+                "; ",
+                $"declaredIntent={intent}",
+                $"expected={ManagedEtabsStartIntents.VisibleByConsent}",
+                "starting ETABS puts it on screen for several seconds and that cannot be " +
+                "prevented on this ETABS build, so a cold start requires the caller to " +
+                "declare that the engineer was told and agreed. No process was created, " +
+                "and this refusal does not persist: retry with the intent declared.")));
     }
 
     /// <summary>
@@ -178,7 +331,7 @@ public sealed class EtabsSession : IEtabsSession
     /// zero. A wrap failure is a launch failure: the session must not be exposed holding a
     /// handle nothing can use.
     /// </summary>
-    private static (string Diagnostic, Exception? Exception)? CompleteReadiness(
+    private static (string Code, string Diagnostic, Exception? Exception)? CompleteReadiness(
         IManagedEtabsApplication owned)
     {
         try
@@ -188,13 +341,16 @@ public sealed class EtabsSession : IEtabsSession
         }
         catch (Exception exception)
         {
-            return (EtabsApiDiagnosticFormatter.InfrastructureException(
-                "ETABSWrapper.WrapExisting",
-                exception), exception);
+            return (
+                EtabsLaunchErrorCodes.ModelInitializationFailed,
+                EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "ETABSWrapper.WrapExisting",
+                    exception),
+                exception);
         }
     }
 
-    private static (string Diagnostic, Exception? Exception)? Initialize(
+    private static (string Code, string Diagnostic, Exception? Exception)? Initialize(
         IManagedEtabsApplication owned)
     {
         try
@@ -202,15 +358,21 @@ public sealed class EtabsSession : IEtabsSession
             var returnCode = owned.InitializeNewModel();
             return returnCode == 0
                 ? null
-                : (EtabsApiDiagnosticFormatter.ApiReturn(
-                    "cSapModel.InitializeNewModel",
-                    returnCode), null);
+                : (
+                    EtabsLaunchErrorCodes.ModelInitializationFailed,
+                    EtabsApiDiagnosticFormatter.ApiReturn(
+                        "cSapModel.InitializeNewModel",
+                        returnCode),
+                    (Exception?)null);
         }
         catch (Exception exception)
         {
-            return (EtabsApiDiagnosticFormatter.Exception(
-                "cSapModel.InitializeNewModel",
-                exception), exception);
+            return (
+                EtabsLaunchErrorCodes.ModelInitializationFailed,
+                EtabsApiDiagnosticFormatter.Exception(
+                    "cSapModel.InitializeNewModel",
+                    exception),
+                exception);
         }
     }
 
@@ -238,6 +400,227 @@ public sealed class EtabsSession : IEtabsSession
         }
     }
 
+    /// <summary>
+    /// The second and last background-suppression proof of a session's life, taken once
+    /// <c>InitializeNewModel</c> has produced the blank model and the EtabSharp wrap
+    /// exists, and still before the application is handed to any command.
+    ///
+    /// <para>The launcher already proved suppression right after <c>ApplicationStart</c>.
+    /// This is not redundant: <c>InitializeNewModel</c> is what puts the blank
+    /// <c>(Untitled)</c> model behind the frame, and the #20 timeline shows ETABS building
+    /// UI long after the start call returns. A second exact-owned census costs one window
+    /// enumeration and covers everything that surfaced in between.</para>
+    ///
+    /// <para><b>Failure is terminal.</b> An unproven Windows state returns a launch failure
+    /// rather than a warning, and the caller tears the session down through the same
+    /// cleanup a failed initialization uses — the authoritative owned process is exited,
+    /// not left running with a window on screen.</para>
+    ///
+    /// <para>It runs ONLY while the session is being created. That is the whole reason a
+    /// background command can safely reuse a session the user asked to see: nothing on the
+    /// command path ever suppresses anything.</para>
+    /// </summary>
+    private (string Code, string Diagnostic, Exception? Exception)? ConfirmHiddenForBackgroundWork(
+        IManagedEtabsApplication owned)
+    {
+        var confirmation = owned.ConfirmWindowsSuppressed();
+        if (!confirmation.Confirmed)
+        {
+            return (
+                EtabsLaunchErrorCodes.HiddenStateNotEstablished,
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    confirmation.Diagnostic
+                        ?? "Managed ETABS window suppression could not be confirmed.",
+                    "stage=after cSapModel.InitializeNewModel"),
+                (Exception?)null);
+        }
+
+        // CLI #24. "Hidden now" is not the question the product asks. An earlier candidate
+        // logged "started hidden" truthfully seconds after putting a full-screen ETABS
+        // window in front of the engineer, because a point-in-time census cannot see what
+        // already happened. Readiness therefore needs BOTH: currently hidden, AND never
+        // materially on screen since the consent interval closed.
+        var exposure = owned.Exposure;
+        if (exposure.Observed)
+        {
+            return (
+                EtabsLaunchErrorCodes.HiddenStateNotEstablished,
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    exposure.Describe(),
+                    "stage=after cSapModel.InitializeNewModel; " +
+                    "a later hidden census cannot clear an exposure that already happened"),
+                (Exception?)null);
+        }
+
+        _diagnostics.WriteLine(
+            "✓ ETABS background UI suppression confirmed before use " +
+            $"(observations={confirmation.Observations}, " +
+            $"waitedMs={(long)confirmation.Waited.TotalMilliseconds}, " +
+            $"state={owned.VisibilityState}, unconsentedExposure=false).");
+        return null;
+    }
+
+    /// <inheritdoc />
+    public void MarkVisibilityStage(string stage)
+    {
+        lock (_gate)
+        {
+            // Remembered unconditionally. The first command on a cold daemon marks its
+            // stage BEFORE the session exists, and the launch then walks through its own
+            // stages - cOAPI.ApplicationStart, cSapModel.InitializeNewModel. Without this
+            // memory, nobody reapplied the command's label afterwards and an exposure
+            // during the actual work was filed under a stage that had already finished.
+            _commandStage = stage;
+            if (_owned is not null && _ready)
+            {
+                _owned.MarkVisibilityStage(stage);
+            }
+        }
+    }
+
+    /// <summary>
+    /// CLI #24's per-request certification. A background command that put ETABS on screen
+    /// must not be able to return success just because ETABS hid itself again before the
+    /// response was written.
+    ///
+    /// <para>The readiness gate cannot cover this: it runs once, while the session is being
+    /// created. Everything after that - every export, every extraction - runs against an
+    /// already-ready session, and without this the daemon would observe the exposure,
+    /// record it faithfully, and still answer <c>success:true</c> to the very request that
+    /// caused it.</para>
+    ///
+    /// <para>The session is then TERMINATED rather than left running. The evidence is
+    /// sticky by design, so every later request would fail this same check anyway; ending
+    /// it cleanly turns a permanently-failing zombie into a fresh start that will ask the
+    /// engineer for consent again.</para>
+    /// </summary>
+    public Result CertifyNoUnconsentedExposure()
+    {
+        lock (_gate)
+        {
+            if (_owned is null || !_ready)
+            {
+                return Result.Ok();
+            }
+
+            // Visibility the engineer asked for, or is in the act of asking for, is not a
+            // breach. Only the protected background interval is certified.
+            if (_owned.VisibilityState != ManagedEtabsVisibilityState.BackgroundHidden)
+            {
+                return Result.Ok();
+            }
+
+            // A forced census, not a read. The accumulated evidence alone cannot see a
+            // window that surfaced moments ago whose event callback has not been delivered
+            // yet - which is precisely the window this command would otherwise report
+            // success over.
+            ManagedEtabsExposureEvidence exposure;
+            try
+            {
+                exposure = _owned.CertifyExposure();
+            }
+            catch (Exception censusFailure)
+            {
+                // FAIL CLOSED. The census is the visibility authority; if it could not run,
+                // the session's on-screen state at this instant is unknown, and "unknown"
+                // must never be spent as "clean". Failing the request alone would leave the
+                // same uncertified session ready to serve the next background command -
+                // possibly in front of the engineer - which is the identical
+                // uncertain-session class that already makes a failed reveal terminal.
+                //
+                // Every exception is caught on purpose. This is the last gate before a
+                // response leaves the daemon, and there is no exception type whose arrival
+                // here would make reusing the session safe.
+                return EndUncertainSession(
+                    _owned,
+                    EtabsApiDiagnosticFormatter.Bounded(string.Join(
+                        "; ",
+                        ManagedEtabsWindowErrorCodes.ExposureNotCertified,
+                        $"ownedPid={_owned.Identity.Pid}",
+                        EtabsApiDiagnosticFormatter.InfrastructureException(
+                            "ManagedEtabsWindowGuard.CertifyExposure",
+                            censusFailure),
+                        "the visibility authority could not certify the session's final " +
+                        "on-screen state; this request is failed and the session has been " +
+                        "ended rather than reused")));
+            }
+
+            if (!exposure.Observed)
+            {
+                return Result.Ok();
+            }
+
+            return EndUncertainSession(
+                _owned,
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    exposure.Describe(),
+                    "the managed ETABS session was materially on screen during background " +
+                    "work the engineer did not ask to see; this request is failed and the " +
+                    "session has been ended"));
+        }
+    }
+
+    /// <inheritdoc />
+    public Result RevealForExplicitUserRequest()
+    {
+        lock (_gate)
+        {
+            var owned = GetOrStartOwned();
+
+            // Order is the contract, and every step of it is load bearing.
+            //
+            // The caller has already confirmed the requested model is open. The protected
+            // interval is retired FIRST so that the observer cannot record the reveal
+            // itself as an unconsented exposure, and so nothing re-arms behind it.
+            //
+            // What changed with CLI #22: this step used to also put our own hidden HWNDs
+            // back with ShowWindow(SW_SHOW), and that restore was what actually reached
+            // the screen, because the stuck cOAPI.Visible() flag made the CSI policy skip
+            // its Unhide entirely. Diagnostic #4 removed both halves of that workaround and
+            // measured the result: with ShowWindow impossible in either direction, an
+            // unconditional raw Unhide put the window back 14 ms later. Windows observes;
+            // CSI acts.
+            owned.ReleaseWindowGuardForExplicitUserAction();
+
+            // CSI mutates, unconditionally. A throw means the call never happened, so
+            // there is nothing for the census to certify.
+            var csi = owned.ApplyCsiUnhideForExplicitUserAction();
+            if (!csi.Issued)
+            {
+                return EndUncertainSession(
+                    owned,
+                    EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                        csi.Diagnostic ?? "cOAPI.Unhide could not be issued.",
+                        "csiTransitionIssued=false"));
+            }
+
+            // THE gate: Windows itself must report an owned top-level ETABS window
+            // materially on screen. "Open in ETABS" that shows nothing has not done what
+            // was asked, whatever CSI says about it.
+            var windows = owned.ConfirmWindowsRevealed();
+            if (!windows.Confirmed)
+            {
+                return EndUncertainSession(
+                    owned,
+                    EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                        windows.Diagnostic
+                            ?? "No owned ETABS window could be confirmed visible.",
+                        $"csiReturnCode={csi.ReturnCode}; csiConfirmed={csi.Confirmed}"));
+            }
+
+            // Only now is the session UserVisible. Later background work reuses it as-is
+            // and must never quietly take the screen back.
+            owned.EnterUserVisible();
+
+            _diagnostics.WriteLine(
+                $"✓ ETABS shown (PID {owned.Identity.Pid}; " +
+                $"visibleOwnedWindows={windows.ObservedWindows.Count}, " +
+                $"csiReturnCode={csi.ReturnCode}, state={owned.VisibilityState})");
+
+                        return Result.Ok();
+        }
+    }
+
     public ManagedEtabsShutdownResult Shutdown()
     {
         lock (_gate)
@@ -262,7 +645,7 @@ public sealed class EtabsSession : IEtabsSession
                 _owned = null;
             }
             _ready = false;
-            Console.Error.WriteLine("ℹ Shared ETABS session shut down.");
+            _diagnostics.WriteLine("ℹ Shared ETABS session shut down.");
             return _shutdownResult;
         }
     }

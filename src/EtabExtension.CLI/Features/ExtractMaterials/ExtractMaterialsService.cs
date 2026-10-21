@@ -4,6 +4,7 @@
 using EtabExtension.CLI.Features.ExtractMaterials.Models;
 using EtabExtension.CLI.Features.ExtractResults;
 using EtabExtension.CLI.Features.ExtractResults.Models;
+using EtabExtension.CLI.Features.ExtractResults.Tables;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
@@ -87,7 +88,12 @@ public class ExtractMaterialsService : IExtractMaterialsService
         var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(request.Units);
         if (unitsError is not null) return Result.Fail<ExtractMaterialsData>(unitsError);
         Directory.CreateDirectory(request.OutputDir);
-        var outputFile = Path.Combine(request.OutputDir, $"{ToSlug(tableKey)}.parquet");
+        // CLI #33: clear this table's fixed path BEFORE any ETABS work, so every way this
+        // command can end without writing - open failure, query failure, zero rows, write
+        // failure - leaves the path absent rather than holding an earlier run's table.
+        if (PrepareOwnedOutputFile(request.OutputDir, tableKey, out var outputFile) is { } prepareError)
+            return Result.Fail<ExtractMaterialsData>(prepareError);
+        string? writing = null;
         var sw = Stopwatch.StartNew();
         try
         {
@@ -100,12 +106,30 @@ public class ExtractMaterialsService : IExtractMaterialsService
             if (query.FieldKeys.Count == 0) return Result.Fail<ExtractMaterialsData>($"Table '{tableKey}' returned no fields — check that the table key is correct.");
             if (query.RowCount == 0) return Result.Ok(new ExtractMaterialsData { FilePath = request.FilePath, TableKey = tableKey, Units = units.Active, DiscardedRowCount = query.DiscardedRowCount, ExtractionTimeMs = sw.ElapsedMilliseconds });
             var flat = query.Rows.SelectMany(row => query.FieldKeys.Select(f => row.TryGetValue(f, out var value) ? value : string.Empty)).ToList();
+            writing = outputFile;
             var write = await _parquet.WriteAsync(outputFile, query.FieldKeys, flat);
-            if (!write.Success) return Result.Fail<ExtractMaterialsData>($"Parquet write failed: {write.Error}");
+            if (!write.Success) return Result.Fail<ExtractMaterialsData>($"Parquet write failed: {write.Error}{ExtractionOutputFile.RemovePartial(outputFile)}");
             sw.Stop();
             return Result.Ok(new ExtractMaterialsData { FilePath = request.FilePath, OutputFile = outputFile, TableKey = tableKey, RowCount = write.RowCount, DiscardedRowCount = query.DiscardedRowCount, Columns = write.Columns, Units = units.Active, ExtractionTimeMs = sw.ElapsedMilliseconds });
         }
-        catch (Exception ex) { return Result.Fail<ExtractMaterialsData>($"Fatal error: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            var removal = writing is null ? string.Empty : ExtractionOutputFile.RemovePartial(writing);
+            return Result.Fail<ExtractMaterialsData>($"Fatal error: {ex.Message}{removal}");
+        }
+    }
+
+    /// <summary>
+    /// Resolves the non-default table's output path and removes any earlier run's file
+    /// there (CLI #33). Returns an error message when the caller-supplied table key does
+    /// not map to a plain file directly inside the output directory, or when an earlier
+    /// file cannot be removed; in both cases nothing must be attempted.
+    /// </summary>
+    internal static string? PrepareOwnedOutputFile(string outputDir, string tableKey, out string outputFile)
+    {
+        if (!ExtractionOutputFile.TryResolve(outputDir, ToSlug(tableKey), out outputFile, out var resolveError))
+            return resolveError;
+        return ExtractionOutputFile.RemovePrevious(outputFile, ToSlug(tableKey));
     }
 
     private async Task<Result<ExtractMaterialsData>> ExtractViaCombinedResultsPathAsync(
@@ -167,10 +191,12 @@ public class ExtractMaterialsService : IExtractMaterialsService
         if (unitsError is not null)
             return Result.Fail<ExtractMaterialsData>(unitsError);
 
-        var tableSlug = ToSlug(tableKey);
-        var outputFile = Path.Combine(request.OutputDir, $"{tableSlug}.parquet");
-
         Directory.CreateDirectory(request.OutputDir);
+
+        // CLI #33: clear this table's fixed path before ETABS is even started.
+        if (PrepareOwnedOutputFile(request.OutputDir, tableKey, out var outputFile) is { } prepareError)
+            return Result.Fail<ExtractMaterialsData>(prepareError);
+        string? writing = null;
 
         Console.Error.WriteLine(
             $"ℹ extract-materials: '{tableKey}' → {outputFile}");
@@ -254,9 +280,11 @@ public class ExtractMaterialsService : IExtractMaterialsService
                     row.TryGetValue(f, out var v) ? v : string.Empty))
                 .ToList();
 
+            writing = outputFile;
             var writeResult = await _parquet.WriteAsync(outputFile, queryResult.FieldKeys, flatData);
             if (!writeResult.Success)
-                return Result.Fail<ExtractMaterialsData>($"Parquet write failed: {writeResult.Error}");
+                return Result.Fail<ExtractMaterialsData>(
+                    $"Parquet write failed: {writeResult.Error}{ExtractionOutputFile.RemovePartial(outputFile)}");
 
             sw.Stop();
             Console.Error.WriteLine(
@@ -276,7 +304,8 @@ public class ExtractMaterialsService : IExtractMaterialsService
         }
         catch (Exception ex)
         {
-            return Result.Fail<ExtractMaterialsData>($"Fatal error: {ex.Message}");
+            var removal = writing is null ? string.Empty : ExtractionOutputFile.RemovePartial(writing);
+            return Result.Fail<ExtractMaterialsData>($"Fatal error: {ex.Message}{removal}");
         }
         finally
         {

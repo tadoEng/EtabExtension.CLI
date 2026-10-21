@@ -1,4 +1,6 @@
-﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
+﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
 using Xunit;
 
@@ -64,7 +66,7 @@ public sealed class ManagedSessionTests
         var launcher = new FakeLauncher(managed, events);
         var store = new MemoryStore(events);
         var processes = new FakeProcesses { Live = Identity };
-        var session = new EtabsSession(launcher, processes, store);
+        var session = new EtabsSession(launcher, processes, store, Consented());
 
         var first = session.GetOrStartOwned();
         var second = session.GetOrStartOwned();
@@ -76,8 +78,270 @@ public sealed class ManagedSessionTests
         Assert.True(session.IsStarted);
         Assert.NotNull(store.Record);
         Assert.Equal(
-            ["launch", "ownership-proven", "record-write", "initialize", "wrap-existing"],
+            [
+                "launch",
+                "ownership-proven",
+                // The launcher's atomic census: it both confirms suppression and closes
+                // the startup-consent interval, in one step and before the session sees
+                // the application at all.
+                "confirm-windows-suppressed",
+                "enter-background-hidden",
+                "record-write",
+                "initialize",
+                "wrap-existing",
+                // Re-proven suppressed after InitializeNewModel — the call that puts the
+                // blank (Untitled) model behind the window — and still before the session
+                // is handed to any command. The proof is the exact-owned Windows census,
+                // not cOAPI.Visible(), which #20 showed never clears.
+                "confirm-windows-suppressed"
+            ],
             events);
+    }
+
+    /// <summary>
+    /// The background half of the CLI #22 contract. A session created because some
+    /// background command needed COM must be PROVEN suppressed by the time anything can use
+    /// it, and proven exactly once: re-proving on every request would put a Windows census
+    /// on the command path, and re-suppressing is how a session the user asked to see would
+    /// get yanked off the screen.
+    /// </summary>
+    [Fact]
+    public void ACreatedSessionIsProvenSuppressedOnceBeforeAnyCommandCanUseIt()
+    {
+        var fixture = VisibilityFixture.Create();
+
+        fixture.Session.GetOrStartOwned();
+        fixture.Session.GetOrStartOwned();
+
+        // Two: the launcher's atomic census that closes the consent interval, then the
+        // session's re-check after InitializeNewModel. Both are real proofs of Windows
+        // state and both are load bearing - the second exists because initialization is
+        // what builds the blank model behind the frame.
+        Assert.Equal(2, fixture.Managed.SuppressionConfirmations);
+        Assert.Equal(0, fixture.Managed.RevealCalls);
+        Assert.Equal(0, fixture.Managed.RevealConfirmations);
+    }
+
+    /// <summary>
+    /// The explicit half. Nothing else in the daemon can make ETABS visible, so this is
+    /// the single transition the "Open in ETABS" intent travels through.
+    /// </summary>
+    [Fact]
+    public void AnExplicitUserRequestMakesTheManagedSessionVisible()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+
+        var revealed = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.True(revealed.Success);
+        Assert.Null(revealed.Error);
+        Assert.Equal(1, fixture.Managed.RevealCalls);
+        Assert.True(fixture.Managed.IsVisible);
+    }
+
+    /// <summary>
+    /// The reveal order, every step of which is load bearing. The requested model is
+    /// already confirmed open by the time this method is reached; suppression is retired
+    /// FIRST (which is also what puts our own suppressed windows back), the CSI hint is
+    /// given its chance, and Windows has the last word. Retiring after the transition would
+    /// leave the guard free to take the engineer's window straight back down.
+    /// </summary>
+    [Fact]
+    public void AnExplicitRevealRetiresSuppressionThenAsksCsiThenConfirmsFromWindows()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Events.Clear();
+
+        fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.Equal(
+            ["window-guard-release", "csi-unhide", "confirm-windows-revealed", "enter-user-visible"],
+            fixture.Events);
+        Assert.Equal(1, fixture.Managed.WindowGuardReleaseCalls);
+    }
+
+    /// <summary>
+    /// The trap the ruling called out explicitly. With <c>cOAPI.Visible()</c> stuck true,
+    /// the CSI policy reads "already visible" and issues no <c>Unhide</c> at all — so a
+    /// reveal that accepted CSI's word would report success with nothing on screen.
+    /// </summary>
+    [Fact]
+    public void ARevealCannotSucceedFromCsiAloneWhenNoOwnedWindowIsVisible()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.IsVisible = true;            // CSI already thinks it is visible
+        fixture.Managed.WindowsRevealConfirmed = false;
+        fixture.Session.GetOrStartOwned();
+
+        var revealed = fixture.Session.RevealForExplicitUserRequest();
+
+        // CSI was asked, agreed, and changed nothing — and that is not a reveal.
+        Assert.False(revealed.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.RevealNotConfirmed,
+            revealed.Error!,
+            StringComparison.Ordinal);
+        Assert.Contains("csiConfirmed=True", revealed.Error!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the mirror: CSI refusing the transition does not fail a reveal that Windows can
+    /// see. The restore of our own suppressed handles is what reaches the screen.
+    /// </summary>
+    [Fact]
+    public void ARevealSucceedsOnWindowsEvidenceEvenWhenCsiRefuses()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.RevealSucceeds = false;
+        fixture.Session.GetOrStartOwned();
+
+        var revealed = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.True(revealed.Success);
+        Assert.Equal(1, fixture.Managed.RevealConfirmations);
+    }
+
+    /// <summary>
+    /// A reveal that fails still leaves the guard retired. Re-arming after a failed reveal
+    /// would be the one path back to hiding a window the user asked for.
+    /// </summary>
+    [Fact]
+    public void AFailedRevealStillLeavesTheWindowGuardRetired()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.WindowsRevealConfirmed = false;
+        fixture.Session.GetOrStartOwned();
+
+        var revealed = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.False(revealed.Success);
+        Assert.Equal(1, fixture.Managed.WindowGuardReleaseCalls);
+    }
+
+    /// <summary>
+    /// The reuse rule, and the reason the hide lives at creation rather than at the head
+    /// of every background command: a background command running against a session the
+    /// user explicitly opened must leave it on screen.
+    /// </summary>
+    [Fact]
+    public void ABackgroundCommandReusingARevealedSessionLeavesItVisible()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Session.RevealForExplicitUserRequest();
+
+        // Stands in for snapshot-export / analyze-and-extract asking the shared session
+        // for its application.
+        fixture.Session.GetOrStartOwned();
+        fixture.Session.GetOrStartOwned();
+
+        Assert.True(fixture.Managed.IsVisible);
+        Assert.Equal(1, fixture.Managed.RevealCalls);
+
+        // Suppression was proven once, at creation, and never re-proven or re-armed: the
+        // guard is released exactly once, by the reveal, and no amount of later background
+        // reuse touches it again.
+        // Two: the launcher's atomic census that closes the consent interval, then the
+        // session's re-check after InitializeNewModel. Both are real proofs of Windows
+        // state and both are load bearing - the second exists because initialization is
+        // what builds the blank model behind the frame.
+        Assert.Equal(2, fixture.Managed.SuppressionConfirmations);
+        Assert.Equal(1, fixture.Managed.WindowGuardReleaseCalls);
+        Assert.Equal(0, fixture.Managed.WindowGuardDisposeCalls);
+    }
+
+    /// <summary>
+    /// The policy the #20 certification forced, now resting on the right oracle. An
+    /// unproven WINDOWS state ends the session and cleans up the exact owned process;
+    /// warning and continuing is what the earlier RC did and what #20 measured a visible
+    /// window through.
+    /// </summary>
+    [Fact]
+    public void AnUnprovenWindowsStateFailsSessionCreationAndCleansUp()
+    {
+        var fixture = VisibilityFixture.Create(waitResults: [true]);
+        fixture.Managed.WindowsSuppressionConfirmed = false;
+
+        var error = Assert.Throws<EtabsLaunchException>(() => fixture.Session.GetOrStartOwned());
+        var repeated = Assert.Throws<EtabsLaunchException>(() => fixture.Session.GetOrStartOwned());
+
+        Assert.Equal(EtabsLaunchErrorCodes.HiddenStateNotEstablished, error.Code);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.SuppressionNotConfirmed,
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.Contains("0x2A4", error.Message, StringComparison.Ordinal);
+        Assert.Contains("processExitConfirmed=True", error.Message, StringComparison.Ordinal);
+        Assert.Equal(error.Message, repeated.Message);
+        Assert.False(fixture.Session.IsStarted);
+
+        // The exact owned process is exited, not abandoned with a window on screen.
+        // Two: the launcher's atomic census that closes the consent interval, then the
+        // session's re-check after InitializeNewModel. Both are real proofs of Windows
+        // state and both are load bearing - the second exists because initialization is
+        // what builds the blank model behind the frame.
+        Assert.Equal(2, fixture.Managed.SuppressionConfirmations);
+        Assert.Equal(1, fixture.Managed.ExitCount);
+        Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
+        Assert.Equal(1, fixture.Managed.WindowGuardDisposeCalls);
+    }
+
+    /// <summary>
+    /// The exact #20 failure, inverted into the behaviour that was asked for. CSI can go on
+    /// reporting <c>Visible=true</c> forever; if the exact-owned Windows census says nothing
+    /// of ours is on screen, background readiness SUCCEEDS. Gating on CSI here is what
+    /// returned <c>snapshot-export success=false</c> against a session that was hidden.
+    /// </summary>
+    [Fact]
+    public void BackgroundReadinessSucceedsWhileCsiKeepsReportingVisible()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.HideSucceeds = false;        // cOAPI.Visible() never clears
+        fixture.Managed.WindowsSuppressionConfirmed = true;
+
+        var owned = fixture.Session.GetOrStartOwned();
+
+        Assert.Same(fixture.Managed, owned);
+        Assert.True(fixture.Session.IsStarted);
+        Assert.Contains(
+            "suppression confirmed",
+            fixture.Diagnostics.ToString(),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The false-success line the #20 run caught: "✓ ETABS started hidden (PID …)" printed
+    /// immediately after two "could not be confirmed hidden" warnings. It is now
+    /// unreachable — the same failure path that tears the session down is the only exit
+    /// from an unproven Windows state, so no run can report a hidden state nothing observed.
+    /// </summary>
+    [Fact]
+    public void NoStartedHiddenSuccessLineIsEmittedWhenTheWindowsStateIsUnproven()
+    {
+        var fixture = VisibilityFixture.Create(waitResults: [true]);
+        fixture.Managed.WindowsSuppressionConfirmed = false;
+
+        Assert.Throws<EtabsLaunchException>(() => fixture.Session.GetOrStartOwned());
+
+        var written = fixture.Diagnostics.ToString();
+        Assert.DoesNotContain("started hidden", written, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("suppression confirmed", written, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>The other side of it: a confirmed hide still reports the success it proved.</summary>
+    [Fact]
+    public void AConfirmedHideReportsTheStartedHiddenSuccessLine()
+    {
+        var fixture = VisibilityFixture.Create();
+
+        fixture.Session.GetOrStartOwned();
+
+        Assert.Contains(
+            "started hidden",
+            fixture.Diagnostics.ToString(),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -99,7 +363,8 @@ public sealed class ManagedSessionTests
         var session = new EtabsSession(
             launcher,
             new FakeProcesses { Live = Identity },
-            store);
+            store,
+            Consented());
 
         var first = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
         var second = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
@@ -120,8 +385,15 @@ public sealed class ManagedSessionTests
             [
                 "launch",
                 "ownership-proven",
+                // The launcher's atomic census: it both confirms suppression and closes
+                // the startup-consent interval, in one step and before the session sees
+                // the application at all.
+                "confirm-windows-suppressed",
+                "enter-background-hidden",
                 "record-write",
                 "initialize",
+                // Shutdown retires the window guard first, on every route in.
+                "window-guard-dispose",
                 "application-exit",
                 "wait-10",
                 "record-clear",
@@ -150,7 +422,8 @@ public sealed class ManagedSessionTests
         var session = new EtabsSession(
             launcher,
             new FakeProcesses { Live = Identity },
-            store);
+            store,
+            Consented());
 
         var error = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
         session.Dispose();
@@ -209,7 +482,7 @@ public sealed class ManagedSessionTests
             }
         };
         var store = new MemoryStore(events);
-        var session = new EtabsSession(launcher, new FakeProcesses(), store);
+        var session = new EtabsSession(launcher, new FakeProcesses(), store, Consented());
 
         var first = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
         var second = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
@@ -259,7 +532,8 @@ public sealed class ManagedSessionTests
         var session = new EtabsSession(
             launcher,
             new FakeProcesses { Live = Identity },
-            new MemoryStore(events));
+            new MemoryStore(events),
+            Consented());
 
         Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
         launcher.Failure = null;
@@ -287,7 +561,8 @@ public sealed class ManagedSessionTests
         var session = new EtabsSession(
             new FakeLauncher(managed, events),
             new FakeProcesses { Live = Identity },
-            store);
+            store,
+            Consented());
         session.GetOrStartOwned();
 
         session.Dispose();
@@ -415,7 +690,16 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, fixture.Managed.KillCount);
         Assert.Equal([ManagedEtabsShutdownMachine.GracefulExitTimeout], fixture.Managed.WaitTimeouts);
         Assert.Null(fixture.Store.Record);
-        Assert.Equal(["application-exit", "wait-10", "record-clear", "process-handle-release", "release-api-references"], fixture.Events);
+        Assert.Equal(
+            [
+                "window-guard-dispose",
+                "application-exit",
+                "wait-10",
+                "record-clear",
+                "process-handle-release",
+                "release-api-references"
+            ],
+            fixture.Events);
     }
 
     [Fact]
@@ -531,7 +815,11 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Empty(fixture.Managed.WaitTimeouts);
         Assert.NotNull(fixture.Store.Record);
-        Assert.Empty(fixture.Events);
+
+        // The mismatch refuses to touch the PROCESS, but the guard is this session's own
+        // resource and is retired on every shutdown route — including the ones that
+        // terminate without exiting anything.
+        Assert.Equal(["window-guard-dispose"], fixture.Events);
     }
 
     [Fact]
@@ -551,7 +839,8 @@ public sealed class ManagedSessionTests
         var session = new EtabsSession(
             new FakeLauncher(managed, events),
             new FakeProcesses { Live = Identity },
-            store);
+            store,
+            Consented());
         session.GetOrStartOwned();
         store.Record = store.Record! with { ManagedLaunchRecordId = Guid.NewGuid() };
 
@@ -590,7 +879,7 @@ public sealed class ManagedSessionTests
         // not a reason to keep holding references.
         Assert.Equal(1, fixture.Managed.ApiReferenceReleaseCount);
         Assert.Equal(
-            ["record-clear", "process-handle-release", "release-api-references"],
+            ["window-guard-dispose", "record-clear", "process-handle-release", "release-api-references"],
             fixture.Events);
     }
 
@@ -615,7 +904,7 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Empty(fixture.Managed.WaitTimeouts);
         Assert.NotNull(fixture.Store.Record);
-        Assert.Empty(fixture.Events);
+        Assert.Equal(["window-guard-dispose"], fixture.Events);
 
     }
 
@@ -735,6 +1024,45 @@ public sealed class ManagedSessionTests
         launchId,
         DateTimeOffset.UtcNow);
 
+    /// <summary>A ready session over a fake managed application, for visibility tests.</summary>
+    private sealed class VisibilityFixture(
+        EtabsSession session,
+        FakeManaged managed,
+        List<string> events,
+        StringWriter diagnostics)
+    {
+        public EtabsSession Session { get; } = session;
+        public FakeManaged Managed { get; } = managed;
+        public List<string> Events { get; } = events;
+
+        /// <summary>What the session actually printed, so success lines are assertable.</summary>
+        public StringWriter Diagnostics { get; } = diagnostics;
+
+        public static VisibilityFixture Create(IEnumerable<bool>? waitResults = null)
+        {
+            var events = new List<string>();
+            var launchId = Guid.NewGuid();
+            var managed = new FakeManaged(
+                Identity,
+                launchId,
+                events,
+                exitReturnCode: 0,
+                exitException: null,
+                waitResults: waitResults ?? [],
+                hasExited: false);
+            var store = new MemoryStore(events);
+            var diagnostics = new StringWriter();
+            var session = new EtabsSession(
+                new FakeLauncher(managed, events),
+                new FakeProcesses { Live = Identity },
+                store,
+                new ManagedEtabsShutdownMachine(store),
+                Consented(),
+                diagnostics);
+            return new(session, managed, events, diagnostics);
+        }
+    }
+
     private sealed class ShutdownFixture
     {
         private ShutdownFixture(
@@ -822,7 +1150,8 @@ public sealed class ManagedSessionTests
             var session = new EtabsSession(
                 new FakeLauncher(managed, events),
                 new FakeProcesses { Live = Identity },
-                store);
+                store,
+                Consented());
             return new(session, store, managed, writeException, events);
         }
     }
@@ -896,8 +1225,665 @@ public sealed class ManagedSessionTests
             }
 
             events.Add("ownership-proven");
+
+            // Mirrors the real launcher's final act: the atomic census that both confirms
+            // suppression and closes the startup-consent interval. Without it these
+            // fixtures would leave every session in StartingVisibleByConsent, and the
+            // CLI #24 certification - which only applies to the protected interval - would
+            // silently pass every test by never engaging at all.
+            _ = managed.ConfirmWindowsSuppressedAndCloseConsentInterval();
             return managed;
         }
+    }
+
+
+    // ── Repairs found in exact-head review ───────────────────────────────────
+
+    /// <summary>
+    /// DEFECT 1. The whole point of the consent gate is the retry: request, refusal,
+    /// desktop prompt, retry WITH consent — in the same daemon.
+    ///
+    /// <para>The previous shape cached the refusal in the sticky launch-failure latch,
+    /// which <c>GetOrStartOwned</c> checks before it ever looks at the new request's
+    /// intent. That made the intended flow impossible without restarting the daemon, and
+    /// no test caught it because every fixture consented on the first try.</para>
+    /// </summary>
+    [Fact]
+    public void AConsentRefusalDoesNotPoisonTheSessionForTheRetryThatFollows()
+    {
+        var events = new List<string>();
+        var managed = Managed(events);
+        var launcher = new FakeLauncher(managed, events);
+        var scope = new EtabsWorkScope();
+        var session = new EtabsSession(
+            launcher,
+            new FakeProcesses { Live = Identity },
+            new MemoryStore(events),
+            scope);
+
+        // Request 1: nothing declared.
+        var refusal = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+        Assert.Equal(EtabsLaunchErrorCodes.VisibleStartConsentMissing, refusal.Code);
+        Assert.Equal(0, launcher.LaunchCount);
+
+        // Request 2: the desktop prompted, the engineer agreed.
+        using (scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntent.VisibleByConsent,
+            "retry")))
+        {
+            Assert.Same(managed, session.GetOrStartOwned());
+        }
+
+        Assert.Equal(1, launcher.LaunchCount);
+    }
+
+    /// <summary>
+    /// And a refusal repeated many times still never latches — an impatient desktop must
+    /// not be able to wedge the daemon by asking before it prompts.
+    /// </summary>
+    [Fact]
+    public void RepeatedRefusalsStillLeaveTheSessionStartable()
+    {
+        var events = new List<string>();
+        var managed = Managed(events);
+        var launcher = new FakeLauncher(managed, events);
+        var scope = new EtabsWorkScope();
+        var session = new EtabsSession(
+            launcher,
+            new FakeProcesses { Live = Identity },
+            new MemoryStore(events),
+            scope);
+
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            _ = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+        }
+
+        using (scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntent.VisibleByConsent,
+            "retry")))
+        {
+            Assert.Same(managed, session.GetOrStartOwned());
+        }
+    }
+
+    /// <summary>
+    /// DEFECT 3. A reveal that cannot be completed leaves the session's on-screen state
+    /// unknown, so the session is ENDED rather than left reusable.
+    ///
+    /// <para>The previous shape returned a failure while keeping the session ready — and
+    /// because the observer had already been retired before the CSI call, later background
+    /// work could run against a session that might be sitting in front of the engineer with
+    /// nothing watching it.</para>
+    /// </summary>
+    [Fact]
+    public void ARevealThatCannotBeIssuedEndsTheSessionRatherThanLeavingItReusable()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Managed.RevealIssuable = false;
+
+        var result = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.False(result.Success);
+        Assert.False(fixture.Session.IsStarted);
+        _ = Assert.Throws<InvalidOperationException>(() => fixture.Session.GetOrStartOwned());
+    }
+
+    /// <summary>The same for a reveal Windows will not certify.</summary>
+    [Fact]
+    public void ARevealWindowsWillNotCertifyEndsTheSessionRatherThanLeavingItReusable()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Managed.WindowsRevealConfirmed = false;
+
+        var result = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.False(result.Success);
+        Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
+    /// A census that cannot RUN is not a clean census.
+    ///
+    /// <para>The forced observation is a Win32 enumeration and it can fail. Failing only
+    /// the request would leave this same session ready, with its final on-screen state
+    /// never established, to serve the next background command - possibly in front of the
+    /// engineer. "Unknown" is not spendable as "clean", so the session ends, exactly as it
+    /// does for a reveal that could not be confirmed.</para>
+    /// </summary>
+    [Fact]
+    public void ACensusThatCannotRunFailsTheRequestAndEndsTheSession()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        Assert.True(fixture.Session.IsStarted);
+
+        fixture.Managed.CertifyExposureException =
+            new InvalidOperationException("EnumWindows failed: 0x5");
+
+        var certified = fixture.Session.CertifyNoUnconsentedExposure();
+
+        Assert.False(certified.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.ExposureNotCertified,
+            certified.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("EnumWindows failed", certified.Error, StringComparison.Ordinal);
+        Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
+    /// And it does not propagate. The envelope calls this as its last act before a response
+    /// leaves the daemon; an exception escaping here would replace whatever the command
+    /// itself reported, losing the failure the engineer actually asked about.
+    /// </summary>
+    [Fact]
+    public void ACensusFailureIsReportedAsAResultRatherThanThrown()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Managed.CertifyExposureException = new InvalidOperationException("boom");
+
+        var certified = fixture.Session.CertifyNoUnconsentedExposure();
+
+        Assert.False(certified.Success);
+    }
+
+    /// <summary>
+    /// End to end through the envelope, case 1: the work SUCCEEDED and the final census
+    /// could not run. The successful result must not reach the caller, and the session must
+    /// be gone.
+    /// </summary>
+    [Fact]
+    public async Task SuccessfulWorkWhoseFinalCensusFailsIsFailedAndEndsTheSession()
+    {
+        var fixture = VisibilityFixture.Create();
+        var envelope = WorkEnvelopeFixtures.Consented(fixture.Session);
+
+        var returned = await envelope.RunAsync(envelope.Capture("snapshot-export"), () =>
+        {
+            fixture.Session.GetOrStartOwned();
+            fixture.Managed.CertifyExposureException =
+                new InvalidOperationException("EnumWindows failed: 0x5");
+            return Task.FromResult<object>(Result.Ok());
+        });
+
+        var result = Assert.IsType<Result>(returned, exactMatch: false);
+        Assert.False(result.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.ExposureNotCertified,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
+    /// Case 2: the work THREW and the final census could not run either. Both facts have to
+    /// survive - the command failure is what the engineer asked about, the certification
+    /// failure is why the session is gone - and the session must still be terminal.
+    /// </summary>
+    [Fact]
+    public async Task WorkThatThrewAndACensusThatFailedBothSurviveAndTheSessionEnds()
+    {
+        var fixture = VisibilityFixture.Create();
+        var envelope = WorkEnvelopeFixtures.Consented(fixture.Session);
+
+        var returned = await envelope.RunAsync(envelope.Capture("extract-results"), () =>
+        {
+            fixture.Session.GetOrStartOwned();
+            fixture.Managed.CertifyExposureException =
+                new InvalidOperationException("EnumWindows failed: 0x5");
+            throw new InvalidOperationException("cSapModel.Results.BaseReact returned 1");
+        });
+
+        var result = Assert.IsType<Result>(returned, exactMatch: false);
+        Assert.False(result.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.ExposureNotCertified,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("BaseReact returned 1", result.Error, StringComparison.Ordinal);
+        Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
+    /// The certification must FORCE a census, not read the accumulated evidence.
+    ///
+    /// <para>The window surfaced moments ago and its event callback has not been delivered
+    /// yet, so the sticky evidence still reads clean. A certification that only reads would
+    /// let the request that caused the exposure answer success, and the callback would land
+    /// immediately afterwards - recorded faithfully, and far too late to matter.</para>
+    /// </summary>
+    [Fact]
+    public void CertificationForcesAFinalCensusRatherThanReadingStaleEvidence()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+
+        // Clean to a reader; a forced census would find the window.
+        fixture.Managed.UndeliveredObservation = new ManagedEtabsExposureEvidence(
+            Observed: true,
+            Observations: 1,
+            First: new ManagedEtabsExposureObservation(
+                (nint)0x3C1, new WindowBounds(0, 0, 1920, 1080), 210, "snapshot-export"),
+            Last: new ManagedEtabsExposureObservation(
+                (nint)0x3C1, new WindowBounds(0, 0, 1920, 1080), 210, "snapshot-export"),
+            ObservedTotalVisibleMs: 0,
+            ObservedMaxContiguousVisibleMs: 0,
+            ObservationDurationMs: 3000);
+        Assert.False(fixture.Managed.Exposure.Observed);
+
+        var certified = fixture.Session.CertifyNoUnconsentedExposure();
+
+        Assert.False(certified.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.UnconsentedExposure,
+            certified.Error,
+            StringComparison.Ordinal);
+        Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
+    /// CLI #24 evidence has to name the command that caused the exposure. The FIRST command
+    /// on a cold daemon marks its stage before the session exists; the launch then walks
+    /// through its own stages, and without handing the label back afterwards an exposure
+    /// during the actual work is filed under an initialization step that had already
+    /// finished.
+    /// </summary>
+    [Fact]
+    public void TheCommandStageIsReappliedOnceTheColdStartIsReady()
+    {
+        var fixture = VisibilityFixture.Create();
+
+        fixture.Session.MarkVisibilityStage("snapshot-export");
+        fixture.Session.GetOrStartOwned();
+
+        Assert.Equal("cSapModel.InitializeNewModel", fixture.Managed.Stages[0]);
+        Assert.Equal("snapshot-export", fixture.Managed.Stages[^1]);
+    }
+
+    /// <summary>And on a warm session the label is applied immediately, not deferred.</summary>
+    [Fact]
+    public void AWarmSessionTakesTheCommandStageStraightAway()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+
+        fixture.Session.MarkVisibilityStage("run-analysis");
+
+        Assert.Equal("run-analysis", fixture.Managed.Stages[^1]);
+    }
+
+    /// <summary>
+    /// DEFECT 5. A background command that put ETABS on screen fails THAT request, not
+    /// merely a future one.
+    ///
+    /// <para>The readiness gate runs once, while the session is being created. Everything
+    /// afterwards runs against an already-ready session — so without a per-request
+    /// certification the daemon would observe the exposure, record it faithfully, and still
+    /// answer success to the very request that caused it.</para>
+    /// </summary>
+    [Fact]
+    public void ABackgroundRequestThatExposedEtabsIsFailedAndEndsTheSession()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+
+        Assert.True(fixture.Session.CertifyNoUnconsentedExposure().Success);
+
+        fixture.Managed.Exposure = new ManagedEtabsExposureEvidence(
+            Observed: true,
+            Observations: 3,
+            First: new ManagedEtabsExposureObservation(
+                (nint)0x2A4, new WindowBounds(-8, -8, 1928, 1040), 40, "snapshot-export"),
+            Last: new ManagedEtabsExposureObservation(
+                (nint)0x2A4, new WindowBounds(-8, -8, 1928, 1040), 900, "snapshot-export"),
+            ObservedTotalVisibleMs: 860,
+            ObservedMaxContiguousVisibleMs: 860,
+            ObservationDurationMs: 5000);
+
+        var certified = fixture.Session.CertifyNoUnconsentedExposure();
+
+        Assert.False(certified.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.UnconsentedExposure,
+            certified.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("snapshot-export", certified.Error, StringComparison.Ordinal);
+
+        // The session is ended rather than left to fail every later request identically.
+        Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
+    /// Certification does not fire for visibility the engineer asked for. A UserVisible
+    /// session running later background work is not in breach.
+    /// </summary>
+    [Fact]
+    public void CertificationIgnoresVisibilityTheEngineerAskedFor()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        Assert.True(fixture.Session.RevealForExplicitUserRequest().Success);
+
+        fixture.Managed.Exposure = new ManagedEtabsExposureEvidence(
+            Observed: true,
+            Observations: 1,
+            First: new ManagedEtabsExposureObservation(
+                (nint)0x2A4, new WindowBounds(-8, -8, 1928, 1040), 10, "open-model"),
+            Last: new ManagedEtabsExposureObservation(
+                (nint)0x2A4, new WindowBounds(-8, -8, 1928, 1040), 10, "open-model"));
+
+        Assert.True(fixture.Session.CertifyNoUnconsentedExposure().Success);
+        Assert.True(fixture.Session.IsStarted);
+    }
+
+    // ── CLI #25: a cold start needs declared consent ─────────────────────────
+
+    /// <summary>
+    /// The gate, in its most important form: with no declared intent, NO PROCESS IS
+    /// CREATED.
+    ///
+    /// <para>This is the whole reason the field exists. CLI #22 established over seven
+    /// supervised runs that ETABS puts itself on screen for 8.76–13.42 s during startup and
+    /// that neither the API nor Windows can prevent it. The CLI cannot manufacture consent
+    /// after the fact — by the time a window is up, asking is pointless — so the refusal has
+    /// to happen before <c>cHelper.CreateObject</c>. Asserting the launcher was never
+    /// invoked is what makes this a real gate rather than a late apology.</para>
+    /// </summary>
+    [Fact]
+    public void AColdStartWithoutDeclaredConsentIsRefusedBeforeAnyProcessIsCreated()
+    {
+        var events = new List<string>();
+        var managed = Managed(events);
+        var launcher = new FakeLauncher(managed, events);
+        var session = new EtabsSession(
+            launcher,
+            new FakeProcesses { Live = Identity },
+            new MemoryStore(events),
+            new EtabsWorkScope());
+
+        var error = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+
+        Assert.Equal(EtabsLaunchErrorCodes.VisibleStartConsentMissing, error.Code);
+        Assert.Equal(0, launcher.LaunchCount);
+        Assert.Empty(events);
+    }
+
+    /// <summary>
+    /// An unrecognised token is not consent either. A newer desktop must not be able to
+    /// cold-start an older sidecar by sending an intent this build has never heard of —
+    /// failing closed on the unknown is the point of parsing rather than truthiness.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("yes")]
+    [InlineData("visible-start-consented-v2")]
+    [InlineData("VISIBLE-START-CONSENTED")]
+    public void AnUnrecognisedIntentIsRefusedExactlyLikeAMissingOne(string wireValue)
+    {
+        var events = new List<string>();
+        var launcher = new FakeLauncher(Managed(events), events);
+        var scope = new EtabsWorkScope();
+        _ = scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntents.Parse(wireValue),
+            "cold-start"));
+        var session = new EtabsSession(
+            launcher,
+            new FakeProcesses { Live = Identity },
+            new MemoryStore(events),
+            scope);
+
+        var error = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+
+        Assert.Equal(EtabsLaunchErrorCodes.VisibleStartConsentMissing, error.Code);
+        Assert.Equal(0, launcher.LaunchCount);
+    }
+
+    /// <summary>The declared value does start a session, so the gate is not simply refusing everything.</summary>
+    [Fact]
+    public void AColdStartWithDeclaredConsentProceeds()
+    {
+        var events = new List<string>();
+        var managed = Managed(events);
+        var launcher = new FakeLauncher(managed, events);
+        var scope = new EtabsWorkScope();
+        _ = scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntents.Parse(ManagedEtabsStartIntents.VisibleByConsent),
+            "cold-start"));
+        var session = new EtabsSession(
+            launcher,
+            new FakeProcesses { Live = Identity },
+            new MemoryStore(events),
+            scope);
+
+        Assert.Same(managed, session.GetOrStartOwned());
+        Assert.Equal(1, launcher.LaunchCount);
+    }
+
+    /// <summary>
+    /// Consent is scoped to ONE request. A session that was consented for cannot leave its
+    /// consent lying around for the next request — otherwise the second background command
+    /// of a daemon's life could cold-start ETABS on the strength of a prompt the engineer
+    /// answered minutes ago for something else.
+    /// </summary>
+    [Fact]
+    public void ConsentIsClearedWhenTheExecutionScopeEnds()
+    {
+        var scope = new EtabsWorkScope();
+
+        using (scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntent.VisibleByConsent,
+            "retry")))
+        {
+            Assert.Equal(ManagedEtabsStartIntent.VisibleByConsent, scope.Current.StartIntent);
+        }
+
+        Assert.Equal(ManagedEtabsStartIntent.Unspecified, scope.Current.StartIntent);
+    }
+
+    /// <summary>
+    /// But an EXISTING session serves later background work without asking again. It is
+    /// process creation the engineer agreed to; reusing a session that is already hidden
+    /// puts nothing new on screen, and re-prompting for it would train people to click
+    /// through the prompt that actually matters.
+    /// </summary>
+    [Fact]
+    public void AnExistingHiddenSessionServesLaterWorkWithoutFurtherConsent()
+    {
+        var events = new List<string>();
+        var managed = Managed(events);
+        var launcher = new FakeLauncher(managed, events);
+        var scope = new EtabsWorkScope();
+        var session = new EtabsSession(
+            launcher,
+            new FakeProcesses { Live = Identity },
+            new MemoryStore(events),
+            scope);
+
+        using (scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntent.VisibleByConsent,
+            "retry")))
+        {
+            _ = session.GetOrStartOwned();
+        }
+
+        // A later request declaring nothing at all.
+        Assert.Equal(ManagedEtabsStartIntent.Unspecified, scope.Current.StartIntent);
+        Assert.Same(managed, session.GetOrStartOwned());
+        Assert.Equal(1, launcher.LaunchCount);
+    }
+
+    /// <summary>
+    /// And a session the engineer has been SHOWN is reused as-is. Nothing on the command
+    /// path may quietly hide it again — the reveal was explicit, and taking the window away
+    /// because a background export happened to run next would be the inverse of the defect
+    /// this whole contract exists to fix.
+    /// </summary>
+    [Fact]
+    public void AUserVisibleSessionIsReusedWithoutBeingHiddenAgain()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        Assert.True(fixture.Session.RevealForExplicitUserRequest().Success);
+        Assert.Equal(ManagedEtabsVisibilityState.UserVisible, fixture.Managed.VisibilityState);
+
+        var hidesBefore = fixture.Managed.HiddenCalls;
+        fixture.Events.Clear();
+
+        // Background work reuses the session.
+        _ = fixture.Session.GetOrStartOwned();
+
+        Assert.Equal(hidesBefore, fixture.Managed.HiddenCalls);
+        Assert.Equal(ManagedEtabsVisibilityState.UserVisible, fixture.Managed.VisibilityState);
+        Assert.DoesNotContain("csi-hide", fixture.Events);
+        Assert.DoesNotContain("enter-background-hidden", fixture.Events);
+    }
+
+    // ── CLI #24: readiness is temporal, not a final census ───────────────────
+
+    /// <summary>
+    /// THE #24 regression at session level. The census says hidden; the accumulated
+    /// evidence says the engineer already saw ETABS. Readiness must fail.
+    ///
+    /// <para>This is the exact shape a prior candidate shipped: "✓ ETABS started hidden"
+    /// logged truthfully, seconds after a full-screen ETABS window had been in front of the
+    /// engineer for 8.76 s, because the gate asked "is it hidden now?". Deleting the
+    /// exposure check turns this green again, which is what makes it load bearing.</para>
+    /// </summary>
+    [Fact]
+    public void AHiddenCensusCannotClearAnExposureThatAlreadyHappened()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.WindowsSuppressionConfirmed = true;
+        fixture.Managed.Exposure = new ManagedEtabsExposureEvidence(
+            Observed: true,
+            Observations: 4,
+            First: new ManagedEtabsExposureObservation(
+                (nint)0x2A4, new WindowBounds(-8, -8, 1928, 1040), 120, "snapshot-export"),
+            Last: new ManagedEtabsExposureObservation(
+                (nint)0x2A4, new WindowBounds(-8, -8, 1928, 1040), 8760, "snapshot-export"),
+            ObservedTotalVisibleMs: 8640,
+            ObservedMaxContiguousVisibleMs: 8640,
+            ObservationDurationMs: 12000);
+
+        var error = Assert.Throws<EtabsLaunchException>(
+            () => fixture.Session.GetOrStartOwned());
+
+        Assert.Equal(EtabsLaunchErrorCodes.HiddenStateNotEstablished, error.Code);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.UnconsentedExposure,
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.Contains("0x2A4", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And a clean session still starts. The sticky check must not be a blanket refusal.
+    /// </summary>
+    [Fact]
+    public void ASessionWithNoRecordedExposureBecomesReady()
+    {
+        var fixture = VisibilityFixture.Create();
+
+        _ = fixture.Session.GetOrStartOwned();
+
+        Assert.False(fixture.Managed.Exposure.Observed);
+        Assert.Contains(
+            "unconsentedExposure=false",
+            fixture.Diagnostics.ToString(),
+            StringComparison.Ordinal);
+    }
+
+    // ── The reveal is CSI-driven and Windows-certified ───────────────────────
+
+    /// <summary>
+    /// A reveal whose CSI call could not be ISSUED fails, and does not go on to ask Windows
+    /// to certify a transition nobody requested. Diagnostic #3 measured this class of
+    /// failure for real.
+    /// </summary>
+    [Fact]
+    public void ARevealWhoseCsiCallCannotBeIssuedFailsWithoutConsultingWindows()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Managed.RevealIssuable = false;
+        fixture.Events.Clear();
+
+        var result = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.False(result.Success);
+        Assert.Contains("cOAPI.Unhide", result.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("confirm-windows-revealed", fixture.Events);
+        Assert.NotEqual(
+            ManagedEtabsVisibilityState.UserVisible,
+            fixture.Managed.VisibilityState);
+    }
+
+    /// <summary>
+    /// A reveal Windows will not certify fails even though CSI accepted it — and the
+    /// session does NOT claim the user can see ETABS. "Open in ETABS" that shows nothing
+    /// has not done what was asked.
+    /// </summary>
+    [Fact]
+    public void ARevealWindowsWillNotCertifyFailsAndDoesNotBecomeUserVisible()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Managed.WindowsRevealConfirmed = false;
+
+        var result = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.False(result.Success);
+        Assert.NotEqual(
+            ManagedEtabsVisibilityState.UserVisible,
+            fixture.Managed.VisibilityState);
+    }
+
+    /// <summary>
+    /// A non-zero CSI return does NOT fail a reveal Windows confirms. Cardex documents
+    /// exactly that return for "already visible", and the census is the authority.
+    /// </summary>
+    [Fact]
+    public void ANonZeroUnhideReturnDoesNotFailARevealWindowsConfirms()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Managed.RevealSucceeds = false;   // issued, but returns non-zero
+
+        var result = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.True(result.Success);
+        Assert.Equal(
+            ManagedEtabsVisibilityState.UserVisible,
+            fixture.Managed.VisibilityState);
+    }
+
+    /// <summary>A managed application fixture with nothing unusual about it.</summary>
+    private static FakeManaged Managed(List<string> events) => new(
+        Identity,
+        Guid.NewGuid(),
+        events,
+        exitReturnCode: 0,
+        exitException: null,
+        waitResults: [],
+        hasExited: false);
+
+    /// <summary>
+    /// A request that declared visible-start consent — the state every one of these
+    /// fixtures assumes, because they exercise launch and shutdown behaviour rather than
+    /// the consent gate. The refusal path has its own tests, which deliberately do NOT
+    /// use this.
+    /// </summary>
+    private static IEtabsWorkScope Consented()
+    {
+        var scope = new EtabsWorkScope();
+        _ = scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntent.VisibleByConsent,
+            "test-command"));
+        return scope;
     }
 
     private sealed class FakeManaged : IManagedEtabsApplication
@@ -950,6 +1936,194 @@ public sealed class ManagedSessionTests
         {
             _events.Add("wrap-existing");
             ReadinessCount++;
+        }
+
+        public bool IsVisible { get; set; } = true;
+        public int HiddenCalls { get; private set; }
+        public int RevealCalls { get; private set; }
+        public bool HideSucceeds { get; set; } = true;
+        public bool RevealSucceeds { get; set; } = true;
+
+        /// <summary>Whether the CSI call itself can be made at all. False models a throw.</summary>
+        public bool HideIssuable { get; set; } = true;
+
+        public bool RevealIssuable { get; set; } = true;
+
+        public ManagedEtabsVisibilityOutcome ApplyCsiHideForBackgroundWork()
+        {
+            _events.Add("csi-hide");
+            HiddenCalls++;
+            if (!HideIssuable)
+            {
+                return new(
+                    ManagedEtabsVisibilityIntent.Hidden,
+                    Issued: false,
+                    Confirmed: false,
+                    ReturnCode: 0,
+                    CsiVisibleAfter: null,
+                    "ETABS_COM_OPERATION_FAILED; operation=cOAPI.Hide");
+            }
+
+            IsVisible = false;
+            return new(
+                ManagedEtabsVisibilityIntent.Hidden,
+                Issued: true,
+                Confirmed: HideSucceeds,
+                ReturnCode: HideSucceeds ? 0 : 1,
+                CsiVisibleAfter: IsVisible,
+                HideSucceeds ? null : "ETABS_VISIBILITY_NOT_CONFIRMED; operation=cOAPI.Hide");
+        }
+
+        public ManagedEtabsVisibilityOutcome ApplyCsiUnhideForExplicitUserAction()
+        {
+            _events.Add("csi-unhide");
+            RevealCalls++;
+            if (!RevealIssuable)
+            {
+                return new(
+                    ManagedEtabsVisibilityIntent.Visible,
+                    Issued: false,
+                    Confirmed: false,
+                    ReturnCode: 0,
+                    CsiVisibleAfter: null,
+                    "ETABS_COM_OPERATION_FAILED; operation=cOAPI.Unhide");
+            }
+
+            IsVisible = true;
+            return new(
+                ManagedEtabsVisibilityIntent.Visible,
+                Issued: true,
+                Confirmed: RevealSucceeds,
+                ReturnCode: RevealSucceeds ? 0 : 1,
+                CsiVisibleAfter: IsVisible,
+                RevealSucceeds ? null : "ETABS_VISIBILITY_NOT_CONFIRMED; operation=cOAPI.Unhide");
+        }
+
+        public ManagedEtabsVisibilityState VisibilityState { get; private set; } =
+            ManagedEtabsVisibilityState.StartingVisibleByConsent;
+
+        /// <summary>CLI #24 evidence the test can plant, to prove readiness reads it.</summary>
+        public ManagedEtabsExposureEvidence Exposure { get; set; } =
+            ManagedEtabsExposureEvidence.None;
+
+        /// <summary>
+        /// Evidence that only a FORCED census would find: the window surfaced, but its
+        /// event callback has not been delivered yet, so a plain read of
+        /// <c>Exposure</c> still reports clean. This is the exact race the certification
+        /// primitive exists to close, so the fake has to be able to reproduce it.
+        /// </summary>
+        public ManagedEtabsExposureEvidence? UndeliveredObservation { get; set; }
+
+        public int CertifyExposureCalls { get; private set; }
+
+        /// <summary>
+        /// Makes the forced final census fail, as a Win32 enumeration genuinely can. The
+        /// certification must treat "I could not look" as a failure, never as "clean".
+        /// </summary>
+        public Exception? CertifyExposureException { get; set; }
+
+        public ManagedEtabsExposureEvidence CertifyExposure()
+        {
+            CertifyExposureCalls++;
+            if (CertifyExposureException is { } failure)
+            {
+                throw failure;
+            }
+
+            if (UndeliveredObservation is { } pending)
+            {
+                Exposure = pending;
+                UndeliveredObservation = null;
+            }
+
+            return Exposure;
+        }
+
+        public int EnterBackgroundHiddenCalls { get; private set; }
+
+        public int EnterUserVisibleCalls { get; private set; }
+
+        public List<string> Stages { get; } = [];
+
+        public void MarkVisibilityStage(string stage) => Stages.Add(stage);
+
+        public void BeginExplicitReveal()
+        {
+            _events.Add("begin-explicit-reveal");
+            VisibilityState = ManagedEtabsVisibilityState.RevealPending;
+        }
+
+        public ManagedEtabsWindowConfirmation ConfirmWindowsSuppressedAndCloseConsentInterval()
+        {
+            var confirmation = ConfirmWindowsSuppressed();
+            if (confirmation.Confirmed)
+            {
+                _events.Add("enter-background-hidden");
+                EnterBackgroundHiddenCalls++;
+                VisibilityState = ManagedEtabsVisibilityState.BackgroundHidden;
+            }
+
+            return confirmation;
+        }
+
+        public void EnterUserVisible()
+        {
+            _events.Add("enter-user-visible");
+            EnterUserVisibleCalls++;
+            VisibilityState = ManagedEtabsVisibilityState.UserVisible;
+        }
+
+        public int WindowGuardReleaseCalls { get; private set; }
+        public int WindowGuardDisposeCalls { get; private set; }
+        public int SuppressionConfirmations { get; private set; }
+        public int RevealConfirmations { get; private set; }
+
+        /// <summary>Whether the exact-owned Windows census agrees that nothing is on screen.</summary>
+        public bool WindowsSuppressionConfirmed { get; set; } = true;
+
+        /// <summary>Whether an owned top-level window is Windows-visible after a reveal.</summary>
+        public bool WindowsRevealConfirmed { get; set; } = true;
+
+        public ManagedEtabsWindowConfirmation ConfirmWindowsSuppressed()
+        {
+            _events.Add("confirm-windows-suppressed");
+            SuppressionConfirmations++;
+            return WindowsSuppressionConfirmed
+                ? new(true, 1, TimeSpan.Zero, [], null)
+                : new(
+                    false,
+                    3,
+                    TimeSpan.FromSeconds(5),
+                    [(nint)0x2A4],
+                    $"{ManagedEtabsWindowErrorCodes.SuppressionNotConfirmed}; " +
+                    $"ownedPid={Identity.Pid}; handles=[0x2A4]");
+        }
+
+        public ManagedEtabsWindowConfirmation ConfirmWindowsRevealed()
+        {
+            _events.Add("confirm-windows-revealed");
+            RevealConfirmations++;
+            return WindowsRevealConfirmed
+                ? new(true, 1, TimeSpan.Zero, [(nint)0x2A4], null)
+                : new(
+                    false,
+                    3,
+                    TimeSpan.FromSeconds(5),
+                    [],
+                    $"{ManagedEtabsWindowErrorCodes.RevealNotConfirmed}; " +
+                    $"ownedPid={Identity.Pid}");
+        }
+
+        public void ReleaseWindowGuardForExplicitUserAction()
+        {
+            _events.Add("window-guard-release");
+            WindowGuardReleaseCalls++;
+        }
+
+        public void DisposeWindowGuard()
+        {
+            _events.Add("window-guard-dispose");
+            WindowGuardDisposeCalls++;
         }
 
         public void ReleaseApiReferences()

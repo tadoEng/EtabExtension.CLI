@@ -1,0 +1,847 @@
+// Copyright (c) Thanh Tu. All rights reserved.
+// Licensed under the MIT License.
+
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Analysis;
+using Xunit;
+
+namespace EtabExtension.CLI.Tests;
+
+/// <summary>
+/// CLI #31 — <c>run-analysis</c> truthfulness.
+///
+/// <para>Two independent lies were reported by <c>run-analysis</c>, and both are
+/// reproduced below against a model that REMEMBERS, because the persistent daemon keeps
+/// one ETABS alive across requests and that is the whole reason they were reachable.</para>
+///
+/// <list type="number">
+/// <item><b>Stale case selection.</b> A default run set no run flag at all. After a
+/// <c>--cases</c>-scoped request narrowed the model's selection, the next default request
+/// printed "Running all cases", ran only the still-selected one, and passed.</item>
+/// <item><b>Success from unrelated cases.</b> The verdict counted cases at status 4
+/// across the WHOLE model, so results left behind by earlier runs carried a request whose
+/// own case had failed.</item>
+/// </list>
+///
+/// <para>Status codes and return-code meanings here are Cardex's (<c>etabs-api-23.3</c>):
+/// <c>cAnalyze.GetCaseStatus</c> reports 1 = not run, 2 = could not start, 3 = not
+/// finished, 4 = finished; <c>cAnalyze.SetRunCaseFlag</c>, <c>GetRunCaseFlag</c> and
+/// <c>RunAnalysis</c> each return zero on success and nonzero on FAILURE — none of them
+/// documents a nonzero value that means anything about the model.</para>
+/// </summary>
+public sealed class AnalysisRunSelectionTests
+{
+    private const string ModelPath = @"D:\Models\tower.edb";
+
+    // ── Defect 1: a default run must restore, never inherit ──────────────────
+
+    /// <summary>
+    /// The reported regression, end to end on one long-lived model: scope a run to DEAD,
+    /// then ask for a default run. The default run must actually run all three cases.
+    /// </summary>
+    [Fact]
+    public void DefaultRunAfterASelectiveRunRunsEveryCase()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "WIND");
+
+        var selective = AnalysisRunner.Run(api, ModelPath, ["DEAD"], null);
+        Assert.True(selective.Success, selective.Error);
+        Assert.Equal(["DEAD"], api.LastRunSet);
+
+        var byDefault = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.True(byDefault.Success, byDefault.Error);
+        Assert.Equal(["DEAD", "LIVE", "WIND"], api.LastRunSet);
+        Assert.Equal(["DEAD", "LIVE", "WIND"], byDefault.Data!.CasesRun);
+        Assert.Equal(3, byDefault.Data.CasesRunFinishedCount);
+        Assert.Empty(byDefault.Data.CasesNotFinished);
+    }
+
+    /// <summary>The restore is an explicit CSI call, not an assumption about the model.</summary>
+    [Fact]
+    public void DefaultRunSetsTheAllCasesFlagBeforeAnalysing()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE");
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Contains("SetRunCaseFlag(all, run=True)", api.Calls);
+        Assert.True(
+            api.Calls.IndexOf("SetRunCaseFlag(all, run=True)") < api.Calls.IndexOf("RunAnalysis"),
+            "the selection must be restored BEFORE the analysis runs");
+    }
+
+    /// <summary>
+    /// If the restore cannot be made, the run does not happen. Running anyway would be the
+    /// original defect with an extra step.
+    /// </summary>
+    [Fact]
+    public void DefaultRunFailsWhenTheAllCasesSelectionCannotBeRestored()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE") { AllTrueSelectReturnCode = 3 };
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("ret=3", result.Error!, StringComparison.Ordinal);
+        Assert.Contains("SetRunCaseFlag", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+    }
+
+    /// <summary>
+    /// A selective request establishes its selection outright — it selects what it wants
+    /// AND deselects what it does not — instead of assuming the model starts clean.
+    /// </summary>
+    [Fact]
+    public void SelectiveRunDeselectsWhateverThePreviousRequestLeftSelected()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "WIND");
+        api.SetRunCaseFlag(string.Empty, run: false, all: true);
+        api.SetRunCaseFlag("WIND", run: true, all: false);
+        api.Calls.Clear();
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD"], null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(["DEAD"], api.LastRunSet);
+        Assert.Contains("SetRunCaseFlag(all, run=False)", api.Calls);
+        Assert.Equal(["DEAD"], result.Data!.CasesRun);
+    }
+
+    /// <summary>
+    /// A selection that silently does not take is caught by reading the flags back. Without
+    /// the readback the command would still announce a run set the model does not hold.
+    /// </summary>
+    [Fact]
+    public void ASelectionThatDoesNotTakeIsCaughtByReadingTheFlagsBack()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE") { AcceptsSelectionsWithoutApplyingThem = true };
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("did not take", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+    }
+
+    // ── Every CSI selection call is validated ────────────────────────────────
+
+    /// <summary>
+    /// A nonzero <c>SetRunCaseFlag</c> is a FAILED CALL. It must surface as one — not be
+    /// converted into the semantic claim "case not found", which is the exact defect class
+    /// CLI #28 and #29 already repaired here twice.
+    /// </summary>
+    [Fact]
+    public void ASelectionCallThatFailsIsReportedAsAFailedCallNotAsAMissingCase()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE");
+        api.SelectionFailures.Add("DEAD");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("SetRunCaseFlag('DEAD', Run=True) failed (ret=7)", result.Error!, StringComparison.Ordinal);
+        Assert.DoesNotContain("not found", result.Error!, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, api.RunCount);
+    }
+
+    /// <summary>
+    /// A case that could not be selected is never quietly dropped from a run that then
+    /// reports success on the rest.
+    /// </summary>
+    [Fact]
+    public void ACaseThatCannotBeSelectedIsNotSilentlyDroppedFromTheRun()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "WIND");
+        api.SelectionFailures.Add("WIND");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD", "WIND"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("WIND", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+    }
+
+    /// <summary>
+    /// The load-case census is what decides whether a case exists. If the census call
+    /// fails, nothing is claimed about the model at all.
+    /// </summary>
+    [Fact]
+    public void ACensusCallThatFailsFailsTheRunRatherThanAssumingTheCaseList()
+    {
+        var api = new FakeAnalysisApi("DEAD") { CensusReturnCodeForCall = _ => 5 };
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("GetRunCaseFlag failed (ret=5)", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+    }
+
+    /// <summary>
+    /// Partial fulfilment is not success. Asking for DEAD and GHOST where the model has no
+    /// GHOST used to run DEAD, return TOP-LEVEL SUCCESS, and record the omission only in a
+    /// per-case field — and no shipping consumer reads one: <c>AnalyzeFileResult</c> in
+    /// <c>crates/ext-api/src/analyze.rs</c> carries just the legacy totals, so the product
+    /// would ask for two cases, get one, and see a clean pass. The whole request is refused
+    /// instead.
+    ///
+    /// <para>This is the same rule the all-absent case already had, at the honest boundary:
+    /// ANY absent case, not all of them.</para>
+    /// </summary>
+    [Fact]
+    public void ARequestNamingEvenOneUndefinedCaseIsRefusedRatherThanPartiallyRun()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD", "GHOST"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("GHOST", result.Error!, StringComparison.Ordinal);
+        Assert.Contains("Refusing to run a partial analysis", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+    }
+
+    /// <summary>
+    /// The refusal happens BEFORE any run flag moves, so it cannot leave the model in a
+    /// state the next request inherits — which is the whole failure mode this issue is
+    /// about. Nothing but the census is even called.
+    /// </summary>
+    [Fact]
+    public void RefusingAPartialRequestChangesNothingAboutTheModel()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "WIND");
+        api.SetRunCaseFlag(string.Empty, run: false, all: true);
+        api.SetRunCaseFlag("WIND", run: true, all: false);
+        api.Calls.Clear();
+
+        var refused = AnalysisRunner.Run(api, ModelPath, ["DEAD", "GHOST"], null);
+
+        Assert.False(refused.Success);
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+        Assert.Equal(["WIND"], api.SelectedCases);
+    }
+
+    /// <summary>
+    /// A refusal poisons nothing: the very next valid request still runs, and a default run
+    /// after it still restores the full set. The round-trip property CLI #30 needed.
+    /// </summary>
+    [Fact]
+    public void AValidRequestStillWorksAfterAPartialOneWasRefused()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "WIND");
+
+        var refused = AnalysisRunner.Run(api, ModelPath, ["DEAD", "GHOST"], null);
+        Assert.False(refused.Success);
+
+        var selective = AnalysisRunner.Run(api, ModelPath, ["DEAD"], null);
+        Assert.True(selective.Success, selective.Error);
+        Assert.Equal(["DEAD"], api.LastRunSet);
+
+        var byDefault = AnalysisRunner.Run(api, ModelPath, null, null);
+        Assert.True(byDefault.Success, byDefault.Error);
+        Assert.Equal(["DEAD", "LIVE", "WIND"], api.LastRunSet);
+    }
+
+    [Fact]
+    public void ARequestNamingOnlyUndefinedCasesFailsWithoutRunning()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["GHOST", "PHANTOM"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("GHOST, PHANTOM", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Absence is fatal now, which makes it more important, not less, that only a census
+    /// that SUCCEEDED can establish it. A failed census must still read as a failed call.
+    /// </summary>
+    [Fact]
+    public void AFailedCensusIsNeverReadAsTheCaseBeingAbsent()
+    {
+        var api = new FakeAnalysisApi("DEAD") { CensusReturnCodeForCall = _ => 5 };
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD", "GHOST"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("GetRunCaseFlag failed (ret=5)", result.Error!, StringComparison.Ordinal);
+        Assert.DoesNotContain("GHOST", result.Error!, StringComparison.Ordinal);
+        Assert.DoesNotContain("partial", result.Error!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Requests are matched to the model's own spelling of the case name.</summary>
+    [Fact]
+    public void ARequestedNameIsResolvedToTheModelsSpelling()
+    {
+        var api = new FakeAnalysisApi("Modal (Rizt)", "DEAD");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["modal (rizt)"], null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(["Modal (Rizt)"], api.LastRunSet);
+        Assert.Equal(["Modal (Rizt)"], result.Data!.CasesRun);
+    }
+
+    [Fact]
+    public void AModelWithNoLoadCasesFailsInsteadOfRunningNothingSuccessfully()
+    {
+        var api = new FakeAnalysisApi();
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("no load cases", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+    }
+
+    // ── Defect 2: the verdict is the requested run set, nothing else ─────────
+
+    /// <summary>
+    /// The reported case, exactly: twelve unrelated cases sit at status 4 from an earlier
+    /// run, the one case this request asked for does not finish. The command FAILS.
+    /// </summary>
+    [Fact]
+    public void ARequestedCaseThatDoesNotFinishFailsDespiteTwelveStaleFinishedCases()
+    {
+        var stale = Enumerable.Range(1, 12).Select(i => $"OLD{i}").ToArray();
+        var api = new FakeAnalysisApi([.. stale, "EQX"]);
+        api.MarkFinished(stale);
+        api.CasesThatDoNotFinish.Add("EQX");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["EQX"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("EQX (not finished)", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(12, result.Data!.FinishedCaseCount);
+        Assert.Equal(0, result.Data.CasesRunFinishedCount);
+        Assert.Equal(["EQX (not finished)"], result.Data.CasesNotFinished);
+    }
+
+    /// <summary>A case the model never even reports on cannot pass either.</summary>
+    [Fact]
+    public void ARequestedCaseWithNoReportedStatusFailsTheRun()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE");
+        api.MarkFinished("LIVE");
+        api.OmitFromStatusReport.Add("DEAD");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("DEAD (no status reported)", result.Error!, StringComparison.Ordinal);
+    }
+
+    /// <summary>One failed case fails a default run, however many of its siblings passed.</summary>
+    [Fact]
+    public void OneUnfinishedCaseFailsADefaultRunOfManyCases()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "WIND");
+        api.CasesThatDoNotFinish.Add("WIND");
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("WIND (not finished)", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(2, result.Data!.CasesRunFinishedCount);
+        Assert.Equal(2, result.Data.FinishedCaseCount);
+    }
+
+    /// <summary>A run whose whole set finishes is the only thing that passes.</summary>
+    [Fact]
+    public void AllRequestedCasesFinishingIsWhatSuccessMeans()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "WIND");
+        api.MarkFinished("WIND");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD", "LIVE"], null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(2, result.Data!.CasesRunFinishedCount);
+        Assert.Equal(3, result.Data.CaseCount);
+        Assert.Equal(3, result.Data.FinishedCaseCount);
+        Assert.Equal(["DEAD", "LIVE"], result.Data.CasesRun);
+    }
+
+    /// <summary>
+    /// If the outcome cannot be read, the run is not successful — even though every
+    /// requested case did in fact finish. An unreadable outcome is not a pass.
+    /// </summary>
+    [Fact]
+    public void AnUnreadableOutcomeIsNotAPass()
+    {
+        var api = new FakeAnalysisApi("DEAD") { CaseStatusReturnCode = 9 };
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("GetCaseStatus failed (ret=9)", result.Error!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AFailedRunAnalysisCallFailsTheCommand()
+    {
+        var api = new FakeAnalysisApi("DEAD") { RunAnalysisReturnCode = 2 };
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("Analysis failed (ret=2)", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(["DEAD"], result.Data!.CasesRun);
+    }
+
+    [Fact]
+    public void AFailedCreateAnalysisModelCallFailsTheCommand()
+    {
+        var api = new FakeAnalysisApi("DEAD") { CreateAnalysisModelReturnCode = 4 };
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("CreateAnalysisModel failed (ret=4)", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+    }
+
+    // ── CLI #34: re-analysing a model that already holds results ─────────────
+
+    /// <summary>
+    /// The shape every engineer's saved EDB is in: analysed, therefore locked, with every
+    /// case at status 4. The earlier results must be deleted before the selection is
+    /// established and the run starts, so every case begins this run at status 1.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ALockedModelHasItsEarlierResultsDeletedBeforeTheSelectionAndTheRun(bool selective)
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "MODAL") { Locked = true };
+        api.MarkFinished("DEAD", "LIVE", "MODAL");
+
+        var result = AnalysisRunner.Run(api, ModelPath, selective ? ["DEAD"] : null, null);
+
+        Assert.True(result.Success, result.Error);
+        var delete = api.Calls.IndexOf("DeleteResults(all)");
+        Assert.True(delete >= 0, "a locked model's earlier results were not deleted");
+        var firstSelection = api.Calls.FindIndex(call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+        Assert.True(delete < firstSelection, "the selection was established before the delete");
+        Assert.True(delete < api.Calls.IndexOf("RunAnalysis"), "the run started before the delete");
+        Assert.Equal(selective ? ["DEAD"] : ["DEAD", "LIVE", "MODAL"], api.LastRunSet);
+    }
+
+    /// <summary>
+    /// CLI #34 review. A request that will be refused must cost nothing. Deleting first
+    /// and refusing second would wipe an engineer's earlier results over a misspelt case
+    /// name, while the refusal claimed nothing had changed.
+    /// </summary>
+    [Fact]
+    public void ARefusedRequestOnALockedModelDeletesNothing()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE") { Locked = true };
+        api.MarkFinished("DEAD", "LIVE");
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD", "NOPE"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("Refusing to run a partial analysis", result.Error!, StringComparison.Ordinal);
+        Assert.Contains("no earlier result was deleted", result.Error!, StringComparison.Ordinal);
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("DeleteResults", StringComparison.Ordinal));
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+        Assert.Equal(0, api.RunCount);
+    }
+
+    /// <summary>
+    /// The discriminating case. Live ETABS showed a re-run that returned 0 and analysed
+    /// NOTHING. Against a model that still held its earlier status-4 results, such a run
+    /// would read as a full success. With those results deleted first, only this run can
+    /// mark a case finished, so a run that did nothing fails and names every case.
+    /// </summary>
+    [Fact]
+    public void ARerunThatAnalysesNothingCannotBorrowTheEarlierAnalysisResults()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE") { Locked = true, RunAnalysisDoesNothing = true };
+        api.MarkFinished("DEAD", "LIVE");
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("did not finish 2 of the 2", result.Error!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A delete that fails leaves the earlier results in place, indistinguishable from
+    /// this run's. Nothing may run, and the failure says why.
+    /// </summary>
+    [Fact]
+    public void AFailedDeleteOfEarlierResultsRefusesTheRun()
+    {
+        var api = new FakeAnalysisApi("DEAD") { Locked = true, DeleteResultsReturnCode = 6 };
+        api.MarkFinished("DEAD");
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.False(result.Success);
+        Assert.Contains("DeleteResults(All=True) failed (ret=6)", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+    }
+
+    /// <summary>A model with no earlier analysis needs nothing deleted.</summary>
+    [Fact]
+    public void AnUnlockedModelIsAnalysedWithoutDeletingAnything()
+    {
+        var api = new FakeAnalysisApi("DEAD");
+
+        var result = AnalysisRunner.Run(api, ModelPath, null, null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.DoesNotContain("DeleteResults(all)", api.Calls);
+    }
+
+    /// <summary>
+    /// The wiring guard for CLI #34. The defect lived OUTSIDE the seam: the shared helper
+    /// unlocked the model on the live <c>ETABSApplication</c> before the runner ever saw
+    /// it, so no fake could observe it. Only the explicit <c>unlock-model</c> feature may
+    /// reach the CSI or EtabSharp lock setter. Any analysis path that does again makes a
+    /// re-run a silent no-op. The guard also requires that caller to be FOUND, so it
+    /// cannot pass by scanning nothing.
+    /// </summary>
+    [Fact]
+    public void OnlyTheExplicitUnlockCommandMayUnlockAModel()
+    {
+        var callers = ProductionCalls
+            .Where(entry => entry.Value.Any(IsExternalLockSetterCall))
+            .Select(entry => entry.Key)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+        Assert.NotEmpty(callers);
+        Assert.All(callers, caller =>
+            Assert.StartsWith("EtabExtension.CLI.Features.UnlockModel.", caller, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The guard above checks the method that touches the setter, so routing an analysis
+    /// path through the unlock FEATURE would pass it while bringing the defect back
+    /// (review M6). Only the unlock feature itself and the serve dispatcher's
+    /// <c>unlock-model</c> handler may call into it. The dispatcher must actually be found,
+    /// so this cannot pass by scanning nothing.
+    /// </summary>
+    [Fact]
+    public void OnlyTheUnlockCommandRoutesMayCallTheUnlockFeature()
+    {
+        const string feature = "EtabExtension.CLI.Features.UnlockModel.";
+        const string dispatcher = "EtabExtension.CLI.Features.Serve.ServeDispatcher.";
+
+        var callers = ProductionCalls
+            .Where(entry => entry.Value.Any(call =>
+                call.StartsWith(feature + "IUnlockModelService.", StringComparison.Ordinal)
+                || call.StartsWith(feature + "UnlockModelService.", StringComparison.Ordinal)))
+            .Select(entry => entry.Key)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Contains(callers, caller => caller.StartsWith(dispatcher, StringComparison.Ordinal));
+        Assert.All(callers, caller =>
+            Assert.True(
+                caller.StartsWith(feature, StringComparison.Ordinal)
+                || caller.StartsWith(dispatcher, StringComparison.Ordinal),
+                $"{caller} calls into the unlock feature"));
+    }
+
+    private static bool IsExternalLockSetterCall(string call) =>
+        (call.EndsWith(".SetLocked", StringComparison.Ordinal)
+         || call.EndsWith(".SetModelIsLocked", StringComparison.Ordinal))
+        && !call.StartsWith("EtabExtension.CLI.", StringComparison.Ordinal);
+
+    // ── Wiring: one owner for the selection surface ──────────────────────────
+
+    private static readonly IReadOnlyDictionary<string, IReadOnlyList<string>> ProductionCalls =
+        VisibilityCallGraph.ByProductionMethod(typeof(IEtabsAnalysisApi).Assembly);
+
+    /// <summary>
+    /// The revert guard. <c>run-analysis</c> and <c>analyze-and-extract</c> each carried
+    /// their own copy of the selection sequence, which is how one bug became two. Exactly
+    /// one production method may reach <c>cAnalyze.SetRunCaseFlag</c>; anything else
+    /// re-opens that seam.
+    /// </summary>
+    [Fact]
+    public void OnlyTheAnalysisApiAdapterTouchesTheRunCaseFlag()
+    {
+        var callers = ProductionCalls
+            .Where(entry => entry.Value.Any(IsExternalRunCaseFlagCall))
+            .Select(entry => entry.Key)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Equal(
+            [$"{typeof(IEtabsAnalysisApi).Namespace}.EtabsAnalysisApi.SetRunCaseFlag"],
+            callers);
+    }
+
+    /// <summary>
+    /// A <c>SetRunCaseFlag</c> on something OUTSIDE this codebase — the CSI
+    /// <c>cAnalyze</c> itself, or the EtabSharp wrapper over it. Calls onto the CLI's own
+    /// <see cref="IEtabsAnalysisApi"/> are the abstraction working and are not the subject
+    /// of the rule.
+    /// </summary>
+    private static bool IsExternalRunCaseFlagCall(string call) =>
+        call.EndsWith(".SetRunCaseFlag", StringComparison.Ordinal)
+        && !call.StartsWith("EtabExtension.CLI.", StringComparison.Ordinal);
+
+    /// <summary>
+    /// That adapter must reach the RAW CSI surface. The EtabSharp <c>AnalyzeManager</c>
+    /// wrapper throws on a nonzero return, and a thrown wrapper exception is exactly what
+    /// the old code caught and re-published as "case not found".
+    /// </summary>
+    [Fact]
+    public void TheAdapterCallsTheRawCsiSelectionSurface()
+    {
+        var calls = ProductionCalls[$"{typeof(IEtabsAnalysisApi).Namespace}.EtabsAnalysisApi.SetRunCaseFlag"];
+
+        Assert.Contains("ETABSv1.cAnalyze.SetRunCaseFlag", calls, StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// Both analysis entry points share one runner, so a repair to one cannot leave the
+    /// other lying.
+    /// </summary>
+    [Fact]
+    public void EverySelectionDecisionIsMadeInOnePlace()
+    {
+        var callers = ProductionCalls
+            .Where(entry => entry.Value.Any(call =>
+                call.EndsWith(".AnalysisRunSelection.Establish", StringComparison.Ordinal)))
+            .Select(entry => entry.Key)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Equal([$"{typeof(IEtabsAnalysisApi).Namespace}.AnalysisRunner.Run"], callers);
+    }
+
+    /// <summary>
+    /// A model that remembers what the last request did to it — which is what makes the
+    /// stale-selection defect reachable at all on the persistent daemon.
+    /// </summary>
+    private sealed class FakeAnalysisApi : IEtabsAnalysisApi
+    {
+        private const int SelectionFailureCode = 7;
+
+        private readonly List<string> _modelCases;
+        private readonly Dictionary<string, bool> _run = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, int> _status = new(StringComparer.OrdinalIgnoreCase);
+
+        public FakeAnalysisApi(params string[] modelCases)
+        {
+            _modelCases = [.. modelCases];
+            foreach (var name in _modelCases)
+            {
+                // A freshly opened model: every case selected, none run yet (status 1).
+                _run[name] = true;
+                _status[name] = 1;
+            }
+        }
+
+        /// <summary>Every call made on this API, in order, for ordering assertions.</summary>
+        public List<string> Calls { get; } = [];
+
+        /// <summary>The cases the most recent RunAnalysis actually analysed, sorted.</summary>
+        public IReadOnlyList<string> LastRunSet { get; private set; } = [];
+
+        public int RunCount { get; private set; }
+
+        /// <summary>The cases the model currently holds a run flag for, sorted.</summary>
+        public IReadOnlyList<string> SelectedCases =>
+            [.. _modelCases.Where(name => _run[name]).Order(StringComparer.Ordinal)];
+
+        /// <summary>Cases whose <c>SetRunCaseFlag</c> refuses with a nonzero return.</summary>
+        public HashSet<string> SelectionFailures { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Cases that end a run at status 3 (not finished).</summary>
+        public HashSet<string> CasesThatDoNotFinish { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Cases the status report leaves out entirely.</summary>
+        public HashSet<string> OmitFromStatusReport { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Return code for <c>SetRunCaseFlag(All=True, Run=True)</c>.</summary>
+        public int AllTrueSelectReturnCode { get; init; }
+
+        /// <summary>Return code for <c>SetRunCaseFlag(All=True, Run=False)</c>.</summary>
+        public int AllFalseSelectReturnCode { get; init; }
+
+        /// <summary>Accepts every selection with ret=0 and applies none of it.</summary>
+        public bool AcceptsSelectionsWithoutApplyingThem { get; init; }
+
+        public int CaseStatusReturnCode { get; init; }
+
+        public int CreateAnalysisModelReturnCode { get; init; }
+
+        /// <summary>
+        /// The model holds results from an earlier analysis. ETABS locks a model when it
+        /// analyses it, so an engineer's saved EDB normally opens this way.
+        /// </summary>
+        public bool Locked { get; set; }
+
+        /// <summary>Return code for <c>DeleteResults</c>.</summary>
+        public int DeleteResultsReturnCode { get; init; }
+
+        /// <summary>
+        /// <c>RunAnalysis</c> returns 0 and analyses nothing: the CLI #34 failure shape,
+        /// measured live after an unlock.
+        /// </summary>
+        public bool RunAnalysisDoesNothing { get; init; }
+
+        public bool GetModelIsLocked()
+        {
+            Calls.Add("GetModelIsLocked");
+            return Locked;
+        }
+
+        public int DeleteResults(string caseName, bool all)
+        {
+            Calls.Add(all ? "DeleteResults(all)" : $"DeleteResults('{caseName}')");
+            if (DeleteResultsReturnCode != 0)
+            {
+                return DeleteResultsReturnCode;
+            }
+
+            // Measured live: DeleteResults(All) keeps the model locked and its case list
+            // intact, and puts every case back to status 1 (not run).
+            foreach (var name in _modelCases.Where(name => all || name == caseName))
+            {
+                _status[name] = 1;
+            }
+
+            return 0;
+        }
+
+        public int RunAnalysisReturnCode { get; init; }
+
+        /// <summary>Return code for the nth (1-based) <c>GetRunCaseFlag</c> call.</summary>
+        public Func<int, int>? CensusReturnCodeForCall { get; init; }
+
+        private int _censusCalls;
+
+        public void MarkFinished(params string[] caseNames)
+        {
+            foreach (var name in caseNames)
+            {
+                _status[name] = 4;
+            }
+        }
+
+        public int GetRunCaseFlags(out string[] caseNames, out bool[] run)
+        {
+            _censusCalls++;
+            Calls.Add("GetRunCaseFlag");
+            var code = CensusReturnCodeForCall?.Invoke(_censusCalls) ?? 0;
+            if (code != 0)
+            {
+                caseNames = [];
+                run = [];
+                return code;
+            }
+
+            caseNames = [.. _modelCases];
+            run = [.. _modelCases.Select(name => _run[name])];
+            return 0;
+        }
+
+        public int SetRunCaseFlag(string caseName, bool run, bool all)
+        {
+            Calls.Add(all
+                ? $"SetRunCaseFlag(all, run={run})"
+                : $"SetRunCaseFlag('{caseName}', run={run})");
+
+            if (all)
+            {
+                var code = run ? AllTrueSelectReturnCode : AllFalseSelectReturnCode;
+                if (code != 0)
+                {
+                    return code;
+                }
+
+                if (!AcceptsSelectionsWithoutApplyingThem)
+                {
+                    foreach (var name in _modelCases)
+                    {
+                        _run[name] = run;
+                    }
+                }
+
+                return 0;
+            }
+
+            if (SelectionFailures.Contains(caseName))
+            {
+                return SelectionFailureCode;
+            }
+
+            if (!_run.ContainsKey(caseName))
+            {
+                // What a real cAnalyze does with a name it does not know: it refuses. The
+                // refusal is a failed call, and nothing here turns it into a diagnosis.
+                return SelectionFailureCode;
+            }
+
+            if (!AcceptsSelectionsWithoutApplyingThem)
+            {
+                _run[caseName] = run;
+            }
+
+            return 0;
+        }
+
+        public int GetCaseStatus(out string[] caseNames, out int[] statuses)
+        {
+            Calls.Add("GetCaseStatus");
+            if (CaseStatusReturnCode != 0)
+            {
+                caseNames = [];
+                statuses = [];
+                return CaseStatusReturnCode;
+            }
+
+            var reported = _modelCases.Where(name => !OmitFromStatusReport.Contains(name)).ToList();
+            caseNames = [.. reported];
+            statuses = [.. reported.Select(name => _status[name])];
+            return 0;
+        }
+
+        public int CreateAnalysisModel()
+        {
+            Calls.Add("CreateAnalysisModel");
+            return CreateAnalysisModelReturnCode;
+        }
+
+        public int RunAnalysis()
+        {
+            Calls.Add("RunAnalysis");
+            RunCount++;
+            if (RunAnalysisReturnCode != 0)
+            {
+                LastRunSet = [];
+                return RunAnalysisReturnCode;
+            }
+
+            if (RunAnalysisDoesNothing)
+            {
+                LastRunSet = [];
+                return 0;
+            }
+
+            var analysed = _modelCases.Where(name => _run[name]).ToList();
+            foreach (var name in analysed)
+            {
+                // Cases left deselected keep whatever result they already had — which is
+                // precisely how stale status-4 results survive into the next request.
+                _status[name] = CasesThatDoNotFinish.Contains(name) ? 3 : 4;
+            }
+
+            LastRunSet = [.. analysed.Order(StringComparer.Ordinal)];
+            return 0;
+        }
+    }
+}

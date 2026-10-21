@@ -1,6 +1,8 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
 namespace EtabExtension.CLI.Features.Serve.Operations;
 
@@ -39,6 +41,7 @@ public sealed class OperationManager : IOperationManager
     private readonly IStaExecutionWorker _worker;
     private readonly IOperationEventJournalFactory _journals;
     private readonly IOperationClock _clock;
+    private readonly IEtabsWorkEnvelope _envelope;
     private readonly Dictionary<string, IOperationDefinition> _definitions;
     private readonly Dictionary<string, OperationState> _operations = new(StringComparer.Ordinal);
     private string? _activeOperationId;
@@ -47,11 +50,13 @@ public sealed class OperationManager : IOperationManager
         IStaExecutionWorker worker,
         IOperationEventJournalFactory journals,
         IOperationClock clock,
+        IEtabsWorkEnvelope envelope,
         IEnumerable<IOperationDefinition> definitions)
     {
         _worker = worker;
         _journals = journals;
         _clock = clock;
+        _envelope = envelope;
         _definitions = definitions.ToDictionary(item => item.Kind, StringComparer.Ordinal);
     }
 
@@ -66,14 +71,43 @@ public sealed class OperationManager : IOperationManager
         }
     }
 
+    /// <summary>
+    /// Accepts one operation, or refuses it. There is no third outcome: this method must
+    /// never leave the daemon holding a lease for work that will not run.
+    ///
+    /// <para>The order below is the whole point. Everything that can fail - the kind, the
+    /// payload, the journal - fails BEFORE <see cref="_activeOperationId"/> is published,
+    /// and from the moment it is published to the moment this returns nothing can throw.
+    /// The previous order copied the payload after the lease was live, and a
+    /// <c>start-operation</c> that omitted "payload" therefore threw out of here with the
+    /// lease still held and no owner left to release it: every synchronous ETABS command
+    /// afterwards answered "a daemon operation is active" and every later start answered
+    /// "Operation already active", until the daemon was restarted. One malformed request
+    /// bricked the session.</para>
+    /// </summary>
     public Result<StartOperationData> Start(string kind, JsonElement payload)
     {
+        // The protocol requires start-operation to carry BOTH a kind and a payload. A
+        // missing kind used to reach the dictionary below and come back as an
+        // ArgumentNullException, which a caller can only read as an internal fault.
+        if (string.IsNullOrWhiteSpace(kind))
+        {
+            return Result.Fail<StartOperationData>(
+                "Operation requires a 'kind'; the request carried none");
+        }
+
         if (!_definitions.TryGetValue(kind, out var definition))
         {
             return Result.Fail<StartOperationData>($"Unsupported operation kind: '{kind}'");
         }
 
+        if (!TryCopyPayload(kind, payload, out var accepted, out var rejection))
+        {
+            return Result.Fail<StartOperationData>(rejection);
+        }
+
         OperationState state;
+        string operationId;
         lock (_gate)
         {
             if (_activeOperationId is not null)
@@ -82,32 +116,93 @@ public sealed class OperationManager : IOperationManager
                     $"Operation already active: '{_activeOperationId}'");
             }
 
-            var operationId = Guid.NewGuid().ToString("N");
+            operationId = Guid.NewGuid().ToString("N");
             var now = _clock.UtcNow;
+
+            // Captured HERE, on the protocol thread, while the request that declared it is
+            // still in flight. The operation executes later on the STA worker, long after
+            // this request returned and possibly while a polling request is publishing its
+            // own (undeclared) intent - so the consent has to travel WITH the work.
+            var work = _envelope.Capture(kind);
             try
             {
                 state = new OperationState(
                     operationId,
                     kind,
+                    work,
                     now,
                     definition.OperationBudget,
                     definition.StepBudget,
                     _journals.Create(operationId));
-                _operations.Add(operationId, state);
-                _activeOperationId = operationId;
                 Append(state, "operation-queued", OperationPhase.Queued, "Operation accepted");
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                _operations.Remove(operationId);
-                _activeOperationId = null;
+                // Nothing was published, so there is nothing to roll back - and no journal
+                // entry survives claiming this operation was queued.
                 return Result.Fail<StartOperationData>(
                     $"Could not create durable operation journal: {ex.Message}");
             }
+
+            // Published last, once nothing above threw. RunAsync now owns the release.
+            _operations.Add(operationId, state);
+            _activeOperationId = operationId;
         }
 
-        _ = RunAsync(state, definition, payload.Clone());
-        return Result.Ok(new StartOperationData(state.OperationId));
+        // Cannot throw synchronously: RunAsync is an async method, so a failure before its
+        // first await lands on the (deliberately discarded) task, where its own finally
+        // still releases the lease.
+        _ = RunAsync(state, definition, accepted);
+        return Result.Ok(new StartOperationData(operationId));
+    }
+
+    /// <summary>
+    /// Copies the caller's payload into a document this manager owns, or explains why it
+    /// cannot.
+    ///
+    /// <para><see cref="StartOperationRequest.Payload"/> is a non-nullable
+    /// <see cref="JsonElement"/>, so a request that omits <c>"payload"</c> arrives as
+    /// <c>default(JsonElement)</c> - an element with no backing document, whose
+    /// <see cref="JsonElement.Clone"/> throws. That is a malformed request, and the
+    /// protocol's answer to a malformed request is an explicit error, not an invented empty
+    /// payload that would send the operation off to fail somewhere less legible.</para>
+    ///
+    /// <para>Only EXISTENCE and copyability are checked here. The payload's shape belongs
+    /// to the operation definition: this type is generic over kinds and must not learn any
+    /// kind's schema.</para>
+    /// </summary>
+    private static bool TryCopyPayload(
+        string kind,
+        JsonElement payload,
+        out JsonElement copy,
+        [NotNullWhen(false)] out string? rejection)
+    {
+        copy = default;
+
+        // Undefined is an omitted payload; Null is an explicitly empty one. Neither carries
+        // an operation request, so both fail closed, naming what actually arrived.
+        if (payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+        {
+            rejection =
+                $"Operation '{kind}' requires a 'payload'; the request carried none " +
+                $"(payload kind: {payload.ValueKind})";
+            return false;
+        }
+
+        try
+        {
+            // Detached from the caller's document on purpose: the operation runs long after
+            // the request that carried the payload has gone.
+            copy = payload.Clone();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
+        {
+            rejection = $"Operation '{kind}' payload could not be read: {ex.Message}";
+            return false;
+        }
+
+        rejection = null;
+        return true;
     }
 
     public Result<OperationStatusData> GetStatus(string operationId)
@@ -210,9 +305,20 @@ public sealed class OperationManager : IOperationManager
 
     public Task<T> ExecuteSynchronousAsync<T>(Func<Task<T>> action) => _worker.ExecuteAsync(action);
 
+    /// <summary>
+    /// Runs one accepted operation and, whatever happens, gives the lease back.
+    ///
+    /// <para>The release is in a <c>finally</c> rather than on the way out of the happy
+    /// path because the journal writes below can themselves fail - a spill directory that
+    /// vanished, a full disk - and an operation that dies while recording how it died must
+    /// not also cost the daemon every command that comes after it. That is the same
+    /// permanent poisoning the missing-payload defect caused, just triggered later.</para>
+    /// </summary>
     private async Task RunAsync(OperationState state, IOperationDefinition definition, JsonElement payload)
     {
-        object result;
+        // Only observable if a journal write threw on the way out of every other path;
+        // saying so is better than completing an operation with a stale or absent result.
+        object result = Result.Fail("Operation ended without recording a result");
         try
         {
             result = await _worker.ExecuteAsync(async () =>
@@ -228,7 +334,15 @@ public sealed class OperationManager : IOperationManager
                 var context = new OperationExecutionContext(
                     (index, total, csiOperation, action) => RunStepAsync(
                         state, index, total, csiOperation, action));
-                return await definition.ExecuteAsync(payload, context);
+
+                // The same envelope the synchronous lane uses. Queued work gets the stage
+                // label and the completion certification by construction rather than by
+                // each operation definition remembering to ask for them - and a breach
+                // here fails the OPERATION, so its journal and its terminal phase both say
+                // so instead of recording a success the engineer should not act on.
+                return await _envelope.RunAsync(
+                    state.Work,
+                    () => definition.ExecuteAsync(payload, context));
             });
 
             lock (_gate)
@@ -272,14 +386,16 @@ public sealed class OperationManager : IOperationManager
                 Append(state, "operation-failed", state.Phase, ex.Message);
             }
         }
-
-        lock (_gate)
+        finally
         {
-            if (_activeOperationId == state.OperationId)
+            lock (_gate)
             {
-                _activeOperationId = null;
+                if (_activeOperationId == state.OperationId)
+                {
+                    _activeOperationId = null;
+                }
+                state.Completion.TrySetResult(result);
             }
-            state.Completion.TrySetResult(result);
         }
     }
 
@@ -356,6 +472,7 @@ public sealed class OperationManager : IOperationManager
     private sealed class OperationState(
         string operationId,
         string kind,
+        EtabsWorkContext work,
         DateTimeOffset startedAt,
         TimeSpan operationBudget,
         TimeSpan stepBudget,
@@ -363,6 +480,10 @@ public sealed class OperationManager : IOperationManager
     {
         public string OperationId { get; } = operationId;
         public string Kind { get; } = kind;
+
+        /// <summary>The consent and stage this operation was accepted with. Immutable.</summary>
+        public EtabsWorkContext Work { get; } = work;
+
         public DateTimeOffset StartedAt { get; } = startedAt;
         public TimeSpan OperationBudget { get; } = operationBudget;
         public TimeSpan StepBudget { get; } = stepBudget;

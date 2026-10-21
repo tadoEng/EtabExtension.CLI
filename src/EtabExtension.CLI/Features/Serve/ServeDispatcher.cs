@@ -10,6 +10,7 @@ using EtabExtension.CLI.Features.GenerateE2K;
 using EtabExtension.CLI.Features.GetStatus;
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Features.OpenModel;
+using EtabExtension.CLI.Features.OpenModel.Models;
 using EtabExtension.CLI.Features.ReadModelMetadata;
 using EtabExtension.CLI.Features.RunAnalysis;
 using EtabExtension.CLI.Features.Serve.Inspection;
@@ -18,6 +19,7 @@ using EtabExtension.CLI.Features.SnapshotExport;
 using EtabExtension.CLI.Features.SnapshotExport.Models;
 using EtabExtension.CLI.Features.UnlockModel;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
 namespace EtabExtension.CLI.Features.Serve;
@@ -46,6 +48,7 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly ICachedSessionStatus _cachedStatus;
     private readonly IProcessInspector _processes;
     private readonly IRunAnalysisService _runAnalysis;
+    private readonly IEtabsWorkEnvelope _envelope;
     private readonly Dictionary<
         string,
         Func<JsonElement?, CancellationToken, Task<object>>> _handlers;
@@ -69,7 +72,8 @@ public sealed class ServeDispatcher : IServeDispatcher
         IOperationManager operations,
         ICachedSessionStatus cachedStatus,
         IProcessInspector processes,
-        IRunAnalysisService runAnalysis)
+        IRunAnalysisService runAnalysis,
+        IEtabsWorkEnvelope envelope)
     {
         _session = session;
         _status = status;
@@ -88,6 +92,7 @@ public sealed class ServeDispatcher : IServeDispatcher
         _cachedStatus = cachedStatus;
         _processes = processes;
         _runAnalysis = runAnalysis;
+        _envelope = envelope;
 
         var handlers = new Dictionary<
             string,
@@ -122,6 +127,18 @@ public sealed class ServeDispatcher : IServeDispatcher
         JsonElement? request,
         CancellationToken ct)
     {
+        // Freeze this request's declared intent and its CLI #24 label into one immutable
+        // context, on the thread where the declaration is valid. Nothing about the session
+        // is touched here: while an async operation runs, the worker holds the session lock
+        // for its whole duration, and a protocol thread that blocked on it would stop
+        // answering get-operation-status - the one thing that must keep working.
+        //
+        // That guarantee is now true of the legacy analyze-and-extract lane as well: it
+        // ACCEPTS here and defers its answer, rather than awaiting the whole operation and
+        // taking the reader down with it. Exactly one dispatch is ever executing, so the
+        // ambient request state below stays single-writer.
+        _pendingWork = _envelope.Capture(command);
+
         return _handlers.TryGetValue(command, out var handler)
             ? handler(request, ct)
             : Task.FromResult<object>(Result.Fail(
@@ -141,7 +158,8 @@ public sealed class ServeDispatcher : IServeDispatcher
             return ReadActiveStatus();
         }
 
-        return await _operations.ExecuteSynchronousAsync(() =>
+        var work = _pendingWork;
+        return await _operations.ExecuteSynchronousAsync(() => _envelope.RunAsync(work, () =>
         {
             try
             {
@@ -161,7 +179,7 @@ public sealed class ServeDispatcher : IServeDispatcher
                 return Task.FromResult<object>(Result.Fail<GetStatusData>(
                     $"ETABS process observation failed: {ex.Message}"));
             }
-        });
+        }));
     }
 
     private Task<object> DispatchStartOperationAsync(
@@ -200,31 +218,86 @@ public sealed class ServeDispatcher : IServeDispatcher
         return Task.FromResult<object>(_operations.Cancel(req.OperationId));
     }
 
+    /// <summary>
+    /// The daemon's only user-visible ETABS intent.
+    ///
+    /// <para>Every other handler here is background work against a session that was
+    /// created hidden and stays hidden. This one — and only this one — ends with ETABS on
+    /// screen, because the engineer asked to look at a model.</para>
+    /// </summary>
     private async Task<object> DispatchOpenModelAsync(
         JsonElement? request,
         CancellationToken ct)
     {
         _ = ct;
         var req = Deserialize<ServeOpenModelRequest>(request);
-        return await ExecuteComAsync(async () => await _open.OpenModelOnAppAsync(
-            _session.GetOrStart(), req.FilePath, req.SaveOnClose));
+        return await ExecuteComAsync(async () => (object)RevealAfterConfirmedOpen(
+            await _open.OpenModelOnAppAsync(
+                _session.GetOrStart(),
+                req.FilePath,
+                req.SaveOnClose)));
     }
 
-    private async Task<object> DispatchAnalyzeAndExtractAsync(
+    /// <summary>
+    /// Shows ETABS once the requested model is confirmed open — never before.
+    ///
+    /// <para>The ordering is the point of CLI #22. Revealing first is exactly the
+    /// packaged-RC symptom: a blank <c>(Untitled)</c> window on screen for seconds while
+    /// the real model is still loading, which reads as a hung application. A failed open
+    /// therefore reveals nothing at all.</para>
+    ///
+    /// <para>An open that cannot be made visible is reported as a FAILURE even though the
+    /// model is loaded: "Open in ETABS" that leaves nothing on screen has not done what was
+    /// asked, and the response names the CSI call that disagreed rather than claiming a
+    /// success the engineer cannot see.</para>
+    /// </summary>
+    private Result<OpenModelData> RevealAfterConfirmedOpen(Result<OpenModelData> opened)
+    {
+        if (!opened.Success)
+        {
+            return opened;
+        }
+
+        var revealed = _session.RevealForExplicitUserRequest();
+        return revealed.Success
+            ? opened
+            : Result.Fail<OpenModelData>(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                revealed.Error ?? "Managed ETABS could not be confirmed visible.",
+                $"modelOpened={opened.Data?.FilePath}"));
+    }
+
+    /// <summary>
+    /// The legacy synchronous command, kept synchronous ON THE WIRE without holding the
+    /// protocol reader hostage for the length of an analysis.
+    ///
+    /// <para>Frozen Rust compatibility is unchanged: one request in, one response out, on
+    /// the same id, carrying the original <c>Result&lt;AnalyzeAndExtractData&gt;</c>. What
+    /// changed is WHO waits. This method used to <c>await</c> the entire operation - up to
+    /// the 60-minute operation budget - and because <see cref="ServeLoop"/> awaits each
+    /// dispatch before reading the next line, the daemon read NOTHING for that whole time.
+    /// <c>get-operation-status</c>, <c>get-operation-events</c>, <c>cancel-operation</c>
+    /// and even <c>shutdown</c> were unreachable exactly while they mattered most - the
+    /// opposite of the guarantee stated in <see cref="DispatchAsync"/>.</para>
+    ///
+    /// <para>So only the WAITING moves. Everything that needs the live request - accepting
+    /// the operation, and with it the <c>EtabsWorkContext</c> capture that has to happen on
+    /// the protocol thread while the declaring request is alive - still happens here,
+    /// synchronously, before this returns.</para>
+    /// </summary>
+    private Task<object> DispatchAnalyzeAndExtractAsync(
         JsonElement? request,
         CancellationToken ct)
     {
-        // Frozen Rust compatibility: start through the generic envelope,
-        // then internally wait and return the original Result<T> unchanged.
         var payload = RequirePayload(request);
         var started = _operations.Start("analyze-and-extract", payload);
         if (!started.Success || started.Data is null)
         {
-            return Result.Fail<AnalyzeAndExtractData>(
-                started.Error ?? "Could not start analyze-and-extract operation");
+            return Task.FromResult<object>(Result.Fail<AnalyzeAndExtractData>(
+                started.Error ?? "Could not start analyze-and-extract operation"));
         }
 
-        return await _operations.WaitAsync(started.Data.OperationId, ct);
+        return Task.FromResult<object>(new DeferredServeResponse(
+            _operations.WaitAsync(started.Data.OperationId, ct)));
     }
 
     private async Task<object> DispatchSnapshotExportAsync(
@@ -374,11 +447,50 @@ public sealed class ServeDispatcher : IServeDispatcher
     private static JsonElement RequirePayload(JsonElement? request) => request
         ?? throw new InvalidOperationException("Missing 'request' payload for this command");
 
-    private Task<object> ExecuteComAsync(Func<Task<object>> action) =>
-        _operations.HasActiveOperation
-            ? Task.FromResult<object>(Result.Fail(
-                "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"))
-            : _operations.ExecuteSynchronousAsync(action);
+    /// <summary>
+    /// The context captured for the request currently being dispatched.
+    ///
+    /// <para>Written on the protocol thread at the top of
+    /// <see cref="DispatchAsync"/> and read there again when the synchronous lane hands
+    /// work to the COM worker - both on the same thread, and the serve loop dispatches
+    /// strictly one request at a time. From the hand-off onwards the value travels as an
+    /// immutable copy, so nothing the worker relies on can be overwritten underneath
+    /// it.</para>
+    ///
+    /// <para>A DEFERRED response does not weaken that. The deferring handler reads this
+    /// field (if at all) before it returns, and the loop only reads the next line once the
+    /// dispatch task has completed - so a later request's write still cannot land while an
+    /// earlier dispatch is looking at it. What outlives the request is the captured
+    /// <see cref="EtabsWorkContext"/> copy, never this field.</para>
+    /// </summary>
+    private EtabsWorkContext _pendingWork = EtabsWorkContext.None;
+
+    /// <summary>
+    /// Every ETABS-backed command runs through here, which makes it the one place a
+    /// CLI #24 certification can cover them all.
+    ///
+    /// <para>The check runs AFTER the work and BEFORE the response leaves: a background
+    /// command that put ETABS on screen must not answer success just because ETABS hid
+    /// itself again first. A failed certification replaces the result outright rather than
+    /// annotating it - a partially-successful export whose session breached the visibility
+    /// contract is not a success the desktop should act on.</para>
+    /// </summary>
+    /// <summary>
+    /// The synchronous ETABS lane. Same envelope as the queued lane - captured context in,
+    /// stage labelled, completion certified - so the two lanes cannot drift apart in what
+    /// the visibility contract means.
+    /// </summary>
+    private Task<object> ExecuteComAsync(Func<Task<object>> action)
+    {
+        if (_operations.HasActiveOperation)
+        {
+            return Task.FromResult<object>(Result.Fail(
+                "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"));
+        }
+
+        var work = _pendingWork;
+        return _operations.ExecuteSynchronousAsync(() => _envelope.RunAsync(work, action));
+    }
 
     private Result<GetStatusData> ReadActiveStatus()
     {

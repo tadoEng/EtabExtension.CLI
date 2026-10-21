@@ -3,6 +3,7 @@ using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Features.ExtractResults.Tables;
 using EtabExtension.CLI.Features.RunAnalysis.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Analysis;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Metadata;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
@@ -10,7 +11,6 @@ using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using EtabSharp.Core;
 using EtabSharp.System.Models;
 using ETABSv1;
-using System.Diagnostics;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs;
 
@@ -21,19 +21,22 @@ internal static class EtabsSessionHelpers
         if (app.Application.Visible()) app.Application.Hide();
     }
 
+    /// <summary>
+    /// Opens a model on an already-owned session through the one canonical
+    /// <see cref="EtabsModelOpen"/> primitive. This helper owns no OpenFile call of
+    /// its own, so its callers — <c>analyze-and-extract</c> and
+    /// <c>read-model-metadata</c> — cannot drift from the validated
+    /// <c>open-model</c> boundary. Other combined-session commands still open
+    /// directly; see <see cref="EtabsModelOpen"/> for which ones and why.
+    /// </summary>
     internal static async Task<Result> OpenFileAsync(ETABSApplication app, string filePath)
     {
         await Task.CompletedTask;
 
-        Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");
-        int openRet = app.Model.Files.OpenFile(filePath);
-        if (openRet != 0)
-        {
-            return Result.Fail($"OpenFile failed (ret={openRet})");
-        }
-
-        Console.Error.WriteLine($"✓ Opened ({app.FullVersion})");
-        return Result.Ok();
+        var opened = EtabsModelOpen.OpenOnApp(app, filePath, save: false);
+        return opened.Success
+            ? Result.Ok()
+            : Result.Fail(opened.Error ?? "OpenFile failed");
     }
 
     /// <summary>
@@ -50,6 +53,11 @@ internal static class EtabsSessionHelpers
         return unitSnapshot;
     }
 
+    /// <summary>
+    /// Runs analysis on an already-open model through the one shared
+    /// <see cref="AnalysisRunner"/>, so the selection and the success verdict cannot
+    /// drift from the standalone <c>run-analysis</c> command's.
+    /// </summary>
     internal static async Task<Result<RunAnalysisData>> RunAnalysisOnOpenModelAsync(
         ETABSApplication app,
         string filePath,
@@ -58,104 +66,11 @@ internal static class EtabsSessionHelpers
     {
         await Task.CompletedTask;
 
-        var hasSpecificCases = cases is { Count: > 0 };
-        var stopwatch = Stopwatch.StartNew();
-
-        if (app.Model.ModelInfo.IsLocked())
-        {
-            Console.Error.WriteLine("ℹ Clearing analysis lock...");
-            app.Model.ModelInfo.SetLocked(false);
-        }
-
-        if (hasSpecificCases)
-        {
-            app.Model.Analyze.SetRunCaseFlag(caseName: string.Empty, run: false, all: true);
-            Console.Error.WriteLine("ℹ Set all cases to skip");
-
-            var notFound = new List<string>();
-            foreach (var caseName in cases!)
-            {
-                try
-                {
-                    app.Model.Analyze.SetRunCaseFlag(caseName: caseName, run: true, all: false);
-                    Console.Error.WriteLine($"  ✓ '{caseName}' set to run");
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"  ⚠ '{caseName}' not found: {ex.Message}");
-                    notFound.Add(caseName);
-                }
-            }
-
-            if (notFound.Count == cases!.Count)
-            {
-                return Result.Fail<RunAnalysisData>(
-                    $"None of the requested cases were found: {string.Join(", ", notFound)}");
-            }
-        }
-        else
-        {
-            Console.Error.WriteLine("ℹ Running all cases (default)");
-        }
-
-        Console.Error.WriteLine("ℹ Running analysis...");
-
-        int analysisRet = hasSpecificCases
-            ? RunSpecificCases(app)
-            : app.Model.Analyze.RunCompleteAnalysis();
-
-        stopwatch.Stop();
-
-        if (analysisRet != 0)
-        {
-            return Result.Fail<RunAnalysisData>($"Analysis failed (ret={analysisRet})")
-                with
-            {
-                Data = new RunAnalysisData
-                {
-                    FilePath = filePath,
-                    CasesRequested = hasSpecificCases ? cases : null,
-                    AnalysisTimeMs = stopwatch.ElapsedMilliseconds
-                }
-            };
-        }
-
-        var caseStatuses = app.Model.Analyze.GetCaseStatus();
-        var finishedCount = caseStatuses.Count(cs => cs.IsFinished);
-
-        Console.Error.WriteLine(
-            $"✓ Analysis complete ({caseStatuses.Count} cases, {finishedCount} finished, {stopwatch.ElapsedMilliseconds} ms)");
-
-        if (finishedCount == 0)
-        {
-            return Result.Fail<RunAnalysisData>(
-                "Analysis completed, but no cases were marked finished. Check ETABS run-case selections.")
-                with
-            {
-                Data = new RunAnalysisData
-                {
-                    FilePath = filePath,
-                    CasesRequested = hasSpecificCases ? cases : null,
-                    CaseCount = caseStatuses.Count,
-                    FinishedCaseCount = finishedCount,
-                    AnalysisTimeMs = stopwatch.ElapsedMilliseconds,
-                    Units = unitSnapshot.Active
-                }
-            };
-        }
-
-        Console.Error.WriteLine(
-            "ℹ Results written to sidecar files — skipping SaveFile() to preserve them");
-
-        return Result.Ok(new RunAnalysisData
-        {
-            FilePath = filePath,
-            CasesRequested = hasSpecificCases ? cases : null,
-            CaseCount = caseStatuses.Count,
-            FinishedCaseCount = finishedCount,
-            AnalysisTimeMs = stopwatch.ElapsedMilliseconds,
-            Units = unitSnapshot.Active
-        });
+        // No unlock here (CLI #34): unlocking an analysed model makes the next run a
+        // silent no-op. AnalysisRunner deletes earlier results instead, through the same
+        // seam its tests drive.
+        return AnalysisRunner.Run(
+            new EtabsAnalysisApi(app), filePath, cases, unitSnapshot.Active);
     }
 
     internal static async Task<Dictionary<string, TableExtractionOutcome>> ExtractTablesOnOpenModelAsync(
@@ -168,50 +83,17 @@ internal static class EtabsSessionHelpers
         TableExtractorRegistry registry,
         IParquetService parquet)
     {
-        var planned = registry.Entries
-            .Where(e => e.FilterSelector(tables) is not null)
-            .ToList();
-
         var queryService = tableFactory.CreateQueryService(app);
-        var outcomes = new Dictionary<string, TableExtractionOutcome>();
 
         try
         {
-            foreach (var entry in registry.Entries)
-            {
-                var filter = entry.FilterSelector(tables);
-                if (filter is null)
-                {
-                    continue;
-                }
-
-                Console.Error.WriteLine(
-                    $"ℹ [{outcomes.Count + 1}/{planned.Count}] Extracting: {entry.Extractor.Label}");
-
-                TableExtractionOutcome outcome;
-                // Result tables require analysis RESULTS (≥1 finished case), not a
-                // locked UI state. The lock half of this gate previously skipped
-                // extraction when ETABS did not leave the model locked post-run.
-                if (entry.Extractor.RequiresAnalysis && !isAnalyzed)
-                {
-                    outcome = TableExtractionOutcome.Fail(
-                        "Model has no analysis results. Run analysis first (run-analysis command).");
-                    Console.Error.WriteLine("  ⚠ Skipped — model not analyzed");
-                }
-                else
-                {
-                    outcome = await entry.Extractor.ExtractAsync(
-                        filter, outputDir, queryService, parquet);
-                }
-
-                outcomes[entry.Extractor.Slug] = outcome;
-                var status = outcome.Success
-                    ? $"✓ {outcome.RowCount} rows → {Path.GetFileName(outcome.OutputFile ?? "(empty)")} ({outcome.ExtractionTimeMs} ms)"
-                    : $"✗ FAILED: {outcome.Error}";
-                Console.Error.WriteLine($"  {status}");
-            }
-
-            return outcomes;
+            // extract-results, snapshot-export, analyze-and-extract and default-key
+            // extract-materials all come through here, so this is where the CLI #33
+            // freshness invariant is established for registry tables: no planned table's
+            // path may keep an earlier run's bytes. (extract-materials --table-key <other>
+            // writes its own single file and clears it itself; see ExtractMaterialsService.)
+            return await TableExtractionRunner.RunAsync(
+                registry.Entries, tables, outputDir, isAnalyzed, queryService, parquet);
         }
         finally
         {
@@ -227,7 +109,7 @@ internal static class EtabsSessionHelpers
         await Task.CompletedTask;
 
         Console.Error.WriteLine("ℹ Collecting model metadata...");
-        _warnings = [];
+        BeginMetadataWarnings();
         var groups = ReadGroups(app);
 
         var metadata = new ModelMetadata
@@ -269,11 +151,15 @@ internal static class EtabsSessionHelpers
         }
     }
 
-    private static int RunSpecificCases(ETABSApplication app)
-    {
-        app.SapModel.Analyze.CreateAnalysisModel();
-        return app.SapModel.Analyze.RunAnalysis();
-    }
+    /// <summary>Starts a fresh warning collection for a metadata read on this thread.</summary>
+    internal static void BeginMetadataWarnings() => _warnings = [];
+
+    /// <summary>
+    /// The warnings raised so far by this thread's metadata read. The warning list is part
+    /// of the metadata contract — it is where everything the reader could NOT establish is
+    /// recorded — so it is readable rather than write-only.
+    /// </summary>
+    internal static IReadOnlyList<MetadataWarning> CollectedMetadataWarnings => _metadataWarnings;
 
     private static List<LoadPatternInfo> ReadLoadPatterns(ETABSApplication app)
     {
@@ -615,21 +501,23 @@ internal static class EtabsSessionHelpers
         }
     }
 
+    /// <summary>
+    /// The model's area properties, each labelled with the kind ETABS can be shown to
+    /// assign it.
+    ///
+    /// <para><b>CLI #29.</b> The type used to come from
+    /// <c>cPropArea.GetPropertyType</c>, which is <c>GetTypeOAPI</c>'s PropType
+    /// (1=Shell, 2=Plane, 3=Asolid) read through an enum whose 1 means Wall. Every ETABS
+    /// area property is a Shell, so every one of them came back "Wall" - decks and slabs
+    /// included. See <see cref="AreaPropertyClassifier"/> for what replaced it and why.</para>
+    /// </summary>
     private static List<AreaSectionInfo> ReadAreaSections(ETABSApplication app)
     {
         try
         {
-            return app.Model.PropArea.GetNameList()
-                .Select(name =>
-                {
-                    var propertyType = ReadItemOrDefault(
-                        "areaSections",
-                        $"area section '{name}' type",
-                        () => app.Model.PropArea.GetPropertyType(name).ToString(),
-                        "Unknown");
-                    return new AreaSectionInfo(name, propertyType);
-                })
-                .ToList();
+            return ClassifyAreaSections(
+                app.Model.PropArea.GetNameList(),
+                new CsiAreaPropertyProbes(app.SapModel));
         }
         catch (Exception ex)
         {
@@ -637,6 +525,25 @@ internal static class EtabsSessionHelpers
             return [];
         }
     }
+
+    /// <summary>
+    /// Labels an already-censused set of area property names. A name whose kind the model
+    /// will not establish becomes an explicit <see cref="AreaPropertyClassifier.Unknown"/>
+    /// and a metadata warning carrying the probe evidence - never a guessed type, and never
+    /// a silently dropped property.
+    /// </summary>
+    internal static List<AreaSectionInfo> ClassifyAreaSections(
+        IEnumerable<string> names,
+        IAreaPropertyProbes probes) =>
+        names
+            .Select(name => new AreaSectionInfo(
+                name,
+                ReadItemOrDefault(
+                    "areaSections",
+                    $"area section '{name}' type",
+                    () => AreaPropertyClassifier.Classify(probes, name),
+                    AreaPropertyClassifier.Unknown)))
+            .ToList();
 
     private static T ReadOrDefault<T>(string label, Func<T> read, T fallback)
     {

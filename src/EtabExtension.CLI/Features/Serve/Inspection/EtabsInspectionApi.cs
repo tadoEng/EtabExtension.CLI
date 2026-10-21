@@ -30,7 +30,37 @@ public interface IEtabsInspectionApi
     int GetWall(string name, out RawWallProperty property);
     int GetModifiers(string name, out double[] modifiers);
     int GetShellDesign(string name, out RawShellDesign shellDesign);
-    int GetWallPropertyNames(out string[] names);
+    /// <summary>
+    /// Every SHELL area property in the model - walls, slabs, decks and mats alike.
+    ///
+    /// <para>Named for what <c>cPropArea.GetNameList(PropType=1)</c> actually returns. It
+    /// was previously called <c>GetWallPropertyNames</c>, which is where CLI #28 came from:
+    /// PropType 1 is "Shell" in the ETABS API (0=All, 1=Shell, 2=Plane, 3=Asolid) and there
+    /// is no wall value at all, so the name promised a filter the API cannot perform.</para>
+    /// </summary>
+    int GetShellPropertyNames(out string[] names);
+
+    /// <summary>
+    /// EVERY area property the model defines, of any type
+    /// (<c>cPropArea.GetNameList(PropType=0)</c>).
+    ///
+    /// <para>This is the existence authority. A nonzero status from a per-name probe is a
+    /// FAILED probe, not proof of absence; only a census that itself succeeded can show
+    /// that a name is genuinely not defined.</para>
+    /// </summary>
+    int GetAllAreaPropertyNames(out string[] names);
+
+    /// <summary>
+    /// <c>cPropArea.GetSlab</c>, used purely as a classification probe: zero means the
+    /// model classifies this property as a slab.
+    /// </summary>
+    int ProbeSlab(string name);
+
+    /// <summary>
+    /// <c>cPropArea.GetDeck</c>, used purely as a classification probe: zero means the
+    /// model classifies this property as a deck.
+    /// </summary>
+    int ProbeDeck(string name);
     int GetAreaNames(out string[] names);
     int GetAreaProperty(string name, out string propertyName);
     int GetAreaLabelAndStory(string name, out string label, out string story);
@@ -135,13 +165,64 @@ internal sealed class EtabsInspectionApi(ETABSApplication application) : IEtabsI
         return ret;
     }
 
-    public int GetWallPropertyNames(out string[] names)
+    public int GetShellPropertyNames(out string[] names)
     {
         var count = 0;
         names = [];
+        // PropType 1 = Shell. Not wall - the enum has no wall value.
         var ret = Model.PropArea.GetNameList(ref count, ref names, 1);
         names ??= [];
         return ret;
+    }
+
+    public int GetAllAreaPropertyNames(out string[] names)
+    {
+        var count = 0;
+        names = [];
+        // PropType 0 = All.
+        var ret = Model.PropArea.GetNameList(ref count, ref names, 0);
+        names ??= [];
+        return ret;
+    }
+
+    public int ProbeSlab(string name)
+    {
+        var slabType = default(eSlabType);
+        var shellType = default(eShellType);
+        var materialProperty = string.Empty;
+        var thickness = 0d;
+        var color = 0;
+        var notes = string.Empty;
+        var globalId = string.Empty;
+        return Model.PropArea.GetSlab(
+            name,
+            ref slabType,
+            ref shellType,
+            ref materialProperty,
+            ref thickness,
+            ref color,
+            ref notes,
+            ref globalId);
+    }
+
+    public int ProbeDeck(string name)
+    {
+        var deckType = default(eDeckType);
+        var shellType = default(eShellType);
+        var materialProperty = string.Empty;
+        var thickness = 0d;
+        var color = 0;
+        var notes = string.Empty;
+        var globalId = string.Empty;
+        return Model.PropArea.GetDeck(
+            name,
+            ref deckType,
+            ref shellType,
+            ref materialProperty,
+            ref thickness,
+            ref color,
+            ref notes,
+            ref globalId);
     }
 
     public int GetAreaNames(out string[] names)

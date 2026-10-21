@@ -1,5 +1,6 @@
 using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Features.Serve.Operations;
+using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
 using Microsoft.Extensions.DependencyInjection;
@@ -224,11 +225,21 @@ public sealed class ServeShutdownCoordinatorTests
         ManagedEtabsShutdownResult terminal,
         List<string> events) : IEtabsSession
     {
+        /// <summary>CLI #24 certification the test can force to fail.</summary>
+        public Result ExposureCertification { get; set; } = Result.Ok();
+
+        public List<string> Stages { get; } = [];
+
+        public Result CertifyNoUnconsentedExposure() => ExposureCertification;
+
+        public void MarkVisibilityStage(string stage) => Stages.Add(stage);
+
         public int ShutdownCount { get; private set; }
         public bool IsStarted => true;
         public int? ProcessId => terminal.Data.OwnedPid;
         public ETABSApplication GetOrStart() => throw new NotSupportedException();
         public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();
+        public Result RevealForExplicitUserRequest() => throw new NotSupportedException();
 
         public ManagedEtabsShutdownResult Shutdown()
         {

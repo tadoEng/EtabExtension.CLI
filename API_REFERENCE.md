@@ -161,6 +161,9 @@ Returns `RunAnalysisData`:
   "casesRequested": ["DEAD"],
   "caseCount": 12,
   "finishedCaseCount": 12,
+  "casesRun": ["DEAD"],
+  "casesRunFinishedCount": 1,
+  "casesNotFinished": [],
   "analysisTimeMs": 90000,
   "units": {
     "force": "kip",
@@ -169,6 +172,24 @@ Returns `RunAnalysisData`:
   }
 }
 ```
+
+A default run (no `--cases`) explicitly RESTORES the all-cases selection before
+analysing, so it never inherits the narrowed selection an earlier `--cases`
+request left behind on a long-lived `serve` session. A `--cases` run establishes
+its selection outright — selecting what it asked for and deselecting the rest.
+Either way the selection is read back from the model before anything runs, and
+`casesRun` reports what the model actually held.
+
+A `--cases` run is all-or-nothing. If ANY requested case is absent from the
+model's load-case list, the command fails and names it, without changing a single
+run flag and without running analysis — partial analysis is never returned as
+success. Absence is established only from a census call that itself succeeded; a
+failed census fails the command as a failed call, never as "case not found".
+
+Success is judged against `casesRun` alone. `finishedCaseCount` is a fact about
+the whole model, including results left over from earlier runs, and cannot carry
+a run: if a requested case does not finish, the command fails and names it in
+`casesNotFinished`.
 
 ### `extract-results`
 
@@ -208,6 +229,10 @@ Returns `ExtractResultsData` with `tables` keyed by table slug:
   "extractionTimeMs": 2500
 }
 ```
+
+`outputFile` is only ever this run's file. Once extraction starts, every planned table's `<slug>.parquet` is removed before the first table is attempted. A table with zero rows, a failed query or write, or a skipped results table therefore has **no** file at its path. It never has a previous run's file.
+
+Read a table's file only when the command succeeded and that table's outcome is `success` with a non-null `outputFile`. A previous file that could not be removed fails its table with an error naming the path. That file is still on disk and must not be read. The same rule applies to `extract-materials`, which clears its output path before starting ETABS.
 
 ### `extract-materials`
 
@@ -265,6 +290,15 @@ configuration validation.
   "collectedAt": "2026-05-06T00:00:00Z"
 }
 ```
+
+`areaSections[].propertyType` is `Wall`, `Slab`, `Deck`, or `Unknown`. The kind
+comes from which typed accessor ETABS lets read the property
+(`cPropArea.GetWall` / `GetSlab` / `GetDeck`), because ETABS has no call that
+returns an area property's kind as a label. A property no accessor claims — or
+that two of them claim — is reported as `Unknown` with a `warnings` entry
+carrying the probe return codes; it is never guessed from the name, nor from
+`GetTypeOAPI`, whose PropType is 1=Shell, 2=Plane, 3=Asolid and so answers
+"Shell" for every ETABS area property.
 
 ### Run Metrics Schema v1
 

@@ -33,6 +33,7 @@ public sealed class AnalyzeAndExtractOperationTests : IDisposable
             new StaExecutionWorker(),
             new OperationEventJournalFactory(_directory),
             new SystemOperationClock(),
+            WorkEnvelopeFixtures.Consented(session),
             [definition]);
         var payload = JsonSerializer.Deserialize<JsonElement>(
             """{"filePath":"C:\\v1\\model.edb","outputDir":"C:\\v1\\results","units":"US_Kip_Ft","cases":["DEAD"],"tables":{"baseReactions":{"loadCases":["*"]}}}""");
@@ -48,6 +49,9 @@ public sealed class AnalyzeAndExtractOperationTests : IDisposable
         Assert.Equal("US_Kip_Ft", analyze.Request!.Units);
         Assert.NotNull(analyze.Progress);
         Assert.Equal(1, session.GetOrStartCalls);
+        // CLI #22: analyze-and-extract is background work. It uses the shared session and
+        // never asks for it to be put on screen.
+        Assert.Equal(0, session.RevealCalls);
     }
 
     public void Dispose()
@@ -99,6 +103,15 @@ public sealed class AnalyzeAndExtractOperationTests : IDisposable
 
     private sealed class FakeSession : IEtabsSession
     {
+        /// <summary>CLI #24 certification the test can force to fail.</summary>
+        public Result ExposureCertification { get; set; } = Result.Ok();
+
+        public List<string> Stages { get; } = [];
+
+        public Result CertifyNoUnconsentedExposure() => ExposureCertification;
+
+        public void MarkVisibilityStage(string stage) => Stages.Add(stage);
+
         public int GetOrStartCalls { get; private set; }
         public bool IsStarted => true;
         public int? ProcessId => 42;
@@ -108,6 +121,12 @@ public sealed class AnalyzeAndExtractOperationTests : IDisposable
             return null!;
         }
         public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();
+        public int RevealCalls { get; private set; }
+        public Result RevealForExplicitUserRequest()
+        {
+            RevealCalls++;
+            return Result.Ok();
+        }
         public ManagedEtabsShutdownResult Shutdown() => throw new NotSupportedException();
         public void Dispose() { }
     }

@@ -18,6 +18,37 @@ public static class EtabsLaunchErrorCodes
     public const string ProcessIdentityFailed = "ETABS_PROCESS_IDENTITY_FAILED";
     public const string ExternalOrAmbiguousInstance = "ETABS_EXTERNAL_OR_AMBIGUOUS_INSTANCE";
     public const string ModelInitializationFailed = "ETABS_MODEL_INITIALIZATION_FAILED";
+
+    /// <summary>
+    /// A cold ETABS start was requested without a declared visible-start intent, so no
+    /// process was created.
+    ///
+    /// <para>CLI #22 made startup visibility an explicit, consented state because it
+    /// cannot be prevented on this API path. The CLI cannot manufacture that consent after
+    /// the fact — by the time a window is on screen it is too late to ask — so a cold
+    /// start without it fails BEFORE cHelper.CreateObject rather than surprising the
+    /// engineer and apologising afterwards.</para>
+    /// </summary>
+    public const string VisibleStartConsentMissing = "ETABS_VISIBLE_START_CONSENT_MISSING";
+
+    /// <summary>
+    /// The exact-owned Windows census could not prove that no owned ETABS window is on
+    /// screen, so the session must not be handed to a background command at all.
+    ///
+    /// <para>Warning and continuing was the RC policy, and #20 measured a materially
+    /// visible ETABS window through it. The gate behind this code is now the Windows
+    /// census rather than <c>cOAPI.Visible()</c> — the same certification proved that flag
+    /// never clears on ETABS 23.3, so gating on it refused sessions whose windows were
+    /// actually suppressed.</para>
+    /// </summary>
+    public const string HiddenStateNotEstablished = "ETABS_HIDDEN_STATE_NOT_ESTABLISHED";
+
+    /// <summary>
+    /// The exact-process window subscription could not be installed, so background UI
+    /// suppression would have only the sampling backstop behind it — the mechanism #20
+    /// already measured visible flickers through. Activation fails rather than degrades.
+    /// </summary>
+    public const string WindowSuppressionUnavailable = "ETABS_WINDOW_SUPPRESSION_UNAVAILABLE";
     public const string RecoveryRecordWriteFailed = "ETABS_RECOVERY_RECORD_WRITE_FAILED";
 }
 
@@ -240,8 +271,14 @@ public interface IOwnedEtabsProcess : IDisposable
 /// returns zero on success, <c>cSapModel.InitializeNewModel()</c> returns zero on
 /// success, and <c>cOAPI.ApplicationExit(false)</c> returns zero on success with the
 /// <c>cSapModel</c> reference dropped afterwards.</para>
+///
+/// <para>It also carries the three <c>cOAPI</c> visibility calls through
+/// <see cref="IEtabsVisibilityApi"/>. They belong here rather than on the EtabSharp
+/// wrapper because the managed session must be hidden BEFORE that wrap exists — the
+/// whole point of CLI #22 is that nothing reaches the screen between
+/// <c>ApplicationStart</c> and the requested model being open.</para>
 /// </summary>
-public interface IEtabsRawApi
+public interface IEtabsRawApi : IEtabsVisibilityApi
 {
     /// <summary>Raw <c>cOAPI.ApplicationStart()</c>. Zero means started.</summary>
     int ApplicationStart();
@@ -333,6 +370,26 @@ public sealed class EtabsRawApi(cOAPI api, cHelper helper) : IEtabsRawApi
 
     public int ApplicationStart() => api.ApplicationStart();
 
+    /// <summary>
+    /// Raw <c>cOAPI.Visible()</c> — the CSI read, not a cached flag of our own. Cardex:
+    /// "Returns True if the application is visible on the screen, otherwise it returns
+    /// False."
+    /// </summary>
+    public bool Visible() => api.Visible();
+
+    /// <summary>
+    /// Raw <c>cOAPI.Hide()</c>. Cardex: zero when the application is successfully
+    /// hidden; an already-hidden application returns an error, which is why
+    /// <see cref="ManagedEtabsVisibility"/> reads the state before calling this.
+    /// </summary>
+    public int Hide() => api.Hide();
+
+    /// <summary>
+    /// Raw <c>cOAPI.Unhide()</c>. Cardex: zero when the application is successfully
+    /// unhidden; an already-visible application returns an error.
+    /// </summary>
+    public int Unhide() => api.Unhide();
+
     public double GetOapiVersionNumber() => helper.GetOAPIVersionNumber();
 
     public bool HasSapModel => api.SapModel is not null;
@@ -363,6 +420,87 @@ public interface IManagedEtabsApplication
     int InitializeNewModel();
     int ExitWithoutSaving();
     void CompleteApiReadiness();
+
+    /// <summary>
+    /// Asks CSI to take this application off screen, unconditionally. Called once, after
+    /// <c>ApplicationStart()</c> has returned and before any command can have run against
+    /// it. CSI owns the mutation; the Windows census owns the verdict.
+    /// </summary>
+    ManagedEtabsVisibilityOutcome ApplyCsiHideForBackgroundWork();
+
+    /// <summary>
+    /// Asks CSI to put this application back on screen, unconditionally, because the
+    /// engineer explicitly asked for it. Called only after the requested model has been
+    /// confirmed open.
+    /// </summary>
+    ManagedEtabsVisibilityOutcome ApplyCsiUnhideForExplicitUserAction();
+
+    /// <summary>Where this session sits in the Closed-Alpha visibility contract.</summary>
+    ManagedEtabsVisibilityState VisibilityState { get; }
+
+    /// <summary>
+    /// CLI #24's accumulated evidence: whether an owned window was ever materially on
+    /// screen after the session was confirmed hidden. Sticky.
+    /// </summary>
+    ManagedEtabsExposureEvidence Exposure { get; }
+
+    /// <summary>
+    /// Forces one synchronous exact-owned census and reads the sticky evidence as a single
+    /// step. This - not <see cref="Exposure"/> - is what a completion certification must
+    /// use, because a plain read cannot see a window whose event callback has not been
+    /// delivered yet.
+    /// </summary>
+    ManagedEtabsExposureEvidence CertifyExposure();
+
+    /// <summary>Marks an explicit reveal as in flight, before the CSI call is issued.</summary>
+    void BeginExplicitReveal();
+
+    /// <summary>Records that the engineer has been shown ETABS deliberately.</summary>
+    void EnterUserVisible();
+
+    /// <summary>Labels what the session is doing, for CLI #24's exposure evidence.</summary>
+    void MarkVisibilityStage(string stage);
+
+    /// <summary>
+    /// The FIRST background-readiness gate: proves from the exact-owned Windows census
+    /// that no owned top-level window is materially on screen, and closes the
+    /// startup-consent interval in the same instant.
+    /// </summary>
+    ManagedEtabsWindowConfirmation ConfirmWindowsSuppressedAndCloseConsentInterval();
+
+    /// <summary>
+    /// The RE-check, after the consent interval has already closed. Changes no state.
+    ///
+    /// <para>This replaced <c>cOAPI.Visible()</c> as the acceptance authority after #20
+    /// measured that flag staying true through 94 reads while the real windows were
+    /// suppressed. <see cref="EnsureHiddenForBackgroundWork"/> is still called, but its
+    /// answer is telemetry; this one decides.</para>
+    /// </summary>
+    ManagedEtabsWindowConfirmation ConfirmWindowsSuppressed();
+
+    /// <summary>
+    /// THE explicit-reveal gate: proves from the same census that an owned top-level window
+    /// IS on screen. Called only after suppression has been permanently retired and the CSI
+    /// hint has been given its chance.
+    /// </summary>
+    ManagedEtabsWindowConfirmation ConfirmWindowsRevealed();
+
+    /// <summary>
+    /// Permanently ends the Windows startup window suppression for this session and puts
+    /// back exactly the windows it hid, because the USER asked to see ETABS.
+    ///
+    /// <para>Called once, from the explicit reveal, and only after the requested model is
+    /// confirmed open. There is no counterpart: the guard cannot be re-armed, which is
+    /// what makes a later background command reusing this session safe.</para>
+    /// </summary>
+    void ReleaseWindowGuardForExplicitUserAction();
+
+    /// <summary>
+    /// Deterministic teardown of the window guard on the shutdown path. Restores nothing —
+    /// a session being torn down must not flash a window on its way out.
+    /// </summary>
+    void DisposeWindowGuard();
+
     bool HasExited { get; }
     bool WaitForExit(TimeSpan timeout);
     void Kill();
@@ -381,6 +519,7 @@ public sealed class ManagedEtabsApplication(
     ManagedProcessIdentity identity,
     Guid launchRecordId,
     IOwnedEtabsProcess ownedProcess,
+    IManagedEtabsWindowGuard windowGuard,
     ManagedEtabsApiVersion version) : IManagedEtabsApplication
 {
     public ETABSApplication Application => rawApi.Application;
@@ -391,6 +530,51 @@ public sealed class ManagedEtabsApplication(
     public int InitializeNewModel() => rawApi.InitializeNewModel();
 
     public int ExitWithoutSaving() => rawApi.ApplicationExit(false);
+
+    /// <inheritdoc />
+    public ManagedEtabsVisibilityOutcome ApplyCsiHideForBackgroundWork() =>
+        ManagedEtabsVisibility.ApplyHidden(rawApi);
+
+    /// <inheritdoc />
+    public ManagedEtabsVisibilityOutcome ApplyCsiUnhideForExplicitUserAction() =>
+        ManagedEtabsVisibility.ApplyVisible(rawApi);
+
+    /// <inheritdoc />
+    public ManagedEtabsVisibilityState VisibilityState => windowGuard.State;
+
+    /// <inheritdoc />
+    public ManagedEtabsExposureEvidence Exposure => windowGuard.Exposure;
+
+    /// <inheritdoc />
+    public ManagedEtabsExposureEvidence CertifyExposure() => windowGuard.CertifyExposure();
+
+    /// <inheritdoc />
+    public void BeginExplicitReveal() => windowGuard.BeginExplicitReveal();
+
+    /// <inheritdoc />
+    public void EnterUserVisible() => windowGuard.EnterUserVisible();
+
+    /// <inheritdoc />
+    public void MarkVisibilityStage(string stage) => windowGuard.MarkStage(stage);
+
+    /// <inheritdoc />
+    public ManagedEtabsWindowConfirmation ConfirmWindowsSuppressed() =>
+        windowGuard.ConfirmSuppressed();
+
+    /// <inheritdoc />
+    public ManagedEtabsWindowConfirmation ConfirmWindowsSuppressedAndCloseConsentInterval() =>
+        windowGuard.ConfirmSuppressedAndCloseConsentInterval();
+
+    /// <inheritdoc />
+    public ManagedEtabsWindowConfirmation ConfirmWindowsRevealed() =>
+        windowGuard.ConfirmRevealed();
+
+    /// <inheritdoc />
+    public void ReleaseWindowGuardForExplicitUserAction() =>
+        windowGuard.BeginExplicitReveal();
+
+    /// <inheritdoc />
+    public void DisposeWindowGuard() => windowGuard.Dispose();
 
     /// <summary>Wraps the same started object once initialization has returned zero.</summary>
     public void CompleteApiReadiness() => rawApi.CompleteApiReadiness(
