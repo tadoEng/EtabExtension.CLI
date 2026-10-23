@@ -10,6 +10,7 @@ using EtabExtension.CLI.Features.OpenModel;
 using EtabExtension.CLI.Features.RunAnalysis;
 using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Features.SnapshotExport;
+using EtabExtension.CLI.Features.SaveModel;
 using EtabExtension.CLI.Features.UnlockModel;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using Microsoft.Extensions.Hosting;
@@ -26,6 +27,7 @@ builder.Services
     .AddOpenModelFeature()
     .AddCloseModelFeature()
     .AddUnlockModelFeature()
+    .AddSaveModelFeature()
     .AddGenerateE2KFeature()
     .AddGenerateE2KCorpusFeature()
     .AddExtractMaterialsFeature()
@@ -46,6 +48,7 @@ rootCommand.Subcommands.Add(GetStatusCommand.Create(app.Services));
 rootCommand.Subcommands.Add(OpenModelCommand.Create(app.Services));
 rootCommand.Subcommands.Add(CloseModelCommand.Create(app.Services));
 rootCommand.Subcommands.Add(UnlockModelCommand.Create(app.Services));
+rootCommand.Subcommands.Add(SaveModelCommand.Create(app.Services));
 rootCommand.Subcommands.Add(GenerateE2KCommand.Create(app.Services));
 rootCommand.Subcommands.Add(GenerateE2KCorpusCommand.Create(app.Services));
 rootCommand.Subcommands.Add(ExtractMaterialsCommand.Create(app.Services));

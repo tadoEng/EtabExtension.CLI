@@ -26,6 +26,7 @@ etab-cli <command> [flags]
 | `open-model` | A (attach) | Yes | No |
 | `close-model` | A (attach) | Yes | No |
 | `unlock-model` | A (attach) | Yes | No |
+| `save-model` | A (attach) | Yes | Yes (the named `.edb`) |
 | `generate-e2k` | B (hidden) | No | Yes (`.e2k`) |
 | `extract-materials` | B (hidden) | No | Yes (`.parquet`) |
 | `run-analysis` | B (hidden) | No | Yes (ETABS sidecars) |
