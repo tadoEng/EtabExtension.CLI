@@ -136,6 +136,16 @@ Unlock an ETABS model file.
 etab-cli unlock-model --file D:\Models\tower.edb
 ```
 
+### `save-model`
+
+Save the open model to an explicit `.edb` path (EtabExtension #443). Refuses
+unless that path is the model ETABS has open (its `.$et` sibling counts); never
+saves under ETABS's current name, which can be an exported `.e2k` or a `.$et`.
+
+```powershell
+etab-cli save-model --file D:\Models\tower.edb
+```
+
 ### `generate-e2k`
 
 Open a hidden ETABS session, export `.edb` to `.e2k`, then exit.

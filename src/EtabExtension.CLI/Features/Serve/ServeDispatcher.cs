@@ -17,6 +17,8 @@ using EtabExtension.CLI.Features.Serve.Inspection;
 using EtabExtension.CLI.Features.Serve.Operations;
 using EtabExtension.CLI.Features.SnapshotExport;
 using EtabExtension.CLI.Features.SnapshotExport.Models;
+using EtabExtension.CLI.Features.SaveModel;
+using EtabExtension.CLI.Features.SaveModel.Models;
 using EtabExtension.CLI.Features.UnlockModel;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
@@ -37,6 +39,7 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly ISnapshotExportService _snapshot;
     private readonly ICloseModelService _close;
     private readonly IUnlockModelService _unlock;
+    private readonly ISaveModelService _save;
     private readonly IExtractResultsService _extractResults;
     private readonly IExtractMaterialsService _extractMaterials;
     private readonly IGenerateE2KService _generateE2K;
@@ -62,6 +65,7 @@ public sealed class ServeDispatcher : IServeDispatcher
         ISnapshotExportService snapshot,
         ICloseModelService close,
         IUnlockModelService unlock,
+        ISaveModelService save,
         IExtractResultsService extractResults,
         IExtractMaterialsService extractMaterials,
         IGenerateE2KService generateE2K,
@@ -81,6 +85,7 @@ public sealed class ServeDispatcher : IServeDispatcher
         _snapshot = snapshot;
         _close = close;
         _unlock = unlock;
+        _save = save;
         _extractResults = extractResults;
         _extractMaterials = extractMaterials;
         _generateE2K = generateE2K;
@@ -114,6 +119,7 @@ public sealed class ServeDispatcher : IServeDispatcher
             ["read-model-metadata"] = DispatchReadModelMetadataAsync,
             ["resolve-area-targets"] = DispatchResolveAreaTargetsAsync,
             ["run-analysis"] = DispatchRunAnalysisAsync,
+            ["save-model"] = DispatchSaveModelAsync,
             ["snapshot-export"] = DispatchSnapshotExportAsync,
             ["start-operation"] = DispatchStartOperationAsync,
             ["unlock-model"] = DispatchUnlockModelAsync
@@ -319,6 +325,29 @@ public sealed class ServeDispatcher : IServeDispatcher
         var req = Deserialize<ServeCloseModelRequest>(request);
         return await ExecuteComAsync(async () => await _close.CloseModelOnAppAsync(
             _session.GetOrStart(), req.Save));
+    }
+
+    /// <summary>
+    /// Saves the session's open model to the requested path (EtabExtension #443).
+    ///
+    /// <para>Never starts ETABS: with no session there is no model to save, and a cold
+    /// start would only open an empty one. That refusal is a plain failure, not a consent
+    /// request.</para>
+    /// </summary>
+    private async Task<object> DispatchSaveModelAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<ServeFileRequest>(request);
+        if (!_session.IsStarted)
+        {
+            return Result.Fail<SaveModelData>(
+                "No managed ETABS session is running, so there is no open model to save.");
+        }
+
+        return await ExecuteComAsync(async () => await _save.SaveModelOnAppAsync(
+            _session.GetOrStart(), req.FilePath));
     }
 
     private async Task<object> DispatchUnlockModelAsync(

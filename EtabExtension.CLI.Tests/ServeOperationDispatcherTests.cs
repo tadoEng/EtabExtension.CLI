@@ -8,6 +8,8 @@ using EtabExtension.CLI.Features.OpenModel;
 using EtabExtension.CLI.Features.OpenModel.Models;
 using EtabExtension.CLI.Features.RunAnalysis;
 using EtabExtension.CLI.Features.RunAnalysis.Models;
+using EtabExtension.CLI.Features.SaveModel;
+using EtabExtension.CLI.Features.SaveModel.Models;
 using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Features.Serve.Operations;
 using EtabExtension.CLI.Features.SnapshotExport;
@@ -39,6 +41,7 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         "read-model-metadata",
         "resolve-area-targets",
         "run-analysis",
+        "save-model",
         "snapshot-export",
         "start-operation",
         "unlock-model"
@@ -1175,6 +1178,48 @@ esults"
         WorkEnvelopeFixtures.Consented(session ?? new FakeSession()),
         [definition]);
 
+    /// <summary>
+    /// EtabExtension #443: with no session there is no open model, so save-model fails
+    /// plainly instead of cold-starting an empty ETABS (or asking for consent to).
+    /// </summary>
+    [Fact]
+    public async Task Save_model_never_starts_etabs()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) =>
+            Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession(isStarted: false);
+        var save = new RecordingSaveModel();
+        var dispatcher = CreateDispatcher(_manager, session, save: save);
+
+        var result = Assert.IsType<Result<SaveModelData>>(await dispatcher.DispatchAsync(
+            "save-model",
+            Json("""{"filePath":"D:/Project/working/model.edb"}"""),
+            CancellationToken.None));
+
+        Assert.False(result.Success);
+        Assert.Contains("No managed ETABS session", result.Error, StringComparison.Ordinal);
+        Assert.Equal(0, session.GetOrStartCalls);
+        Assert.Empty(save.Requested);
+    }
+
+    [Fact]
+    public async Task Save_model_saves_the_requested_path_in_the_running_session()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) =>
+            Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var save = new RecordingSaveModel();
+        var dispatcher = CreateDispatcher(_manager, session, save: save);
+
+        var result = Assert.IsType<Result<SaveModelData>>(await dispatcher.DispatchAsync(
+            "save-model",
+            Json("""{"filePath":"D:/Project/working/model.edb"}"""),
+            CancellationToken.None));
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(["D:/Project/working/model.edb"], save.Requested);
+    }
+
     [Fact]
     public async Task Capabilities_are_the_registered_dispatch_handlers()
     {
@@ -1199,13 +1244,15 @@ esults"
         IRunAnalysisService? runAnalysis = null,
         ICachedSessionStatus? cachedStatus = null,
         ISnapshotExportService? snapshot = null,
-        IOpenModelService? open = null) => new(
+        IOpenModelService? open = null,
+        ISaveModelService? save = null) => new(
             session ?? null!,
             null!,
             open ?? null!,
             snapshot ?? null!,
             null!,
             null!,
+            save ?? null!,
             null!,
             null!,
             null!,
@@ -1241,6 +1288,20 @@ esults"
         pid,
         new DateTimeOffset(2026, 8, 9, 1, 2, pid % 60, TimeSpan.Zero),
         $@"C:\ETABS-{pid}\ETABS.exe");
+
+    private sealed class RecordingSaveModel : ISaveModelService
+    {
+        public List<string> Requested { get; } = [];
+
+        public Task<Result<SaveModelData>> SaveModelAsync(string filePath) =>
+            throw new InvalidOperationException("serve mode must use the session's app");
+
+        public Task<Result<SaveModelData>> SaveModelOnAppAsync(ETABSApplication app, string filePath)
+        {
+            Requested.Add(filePath);
+            return Task.FromResult(Result.Ok(new SaveModelData { FilePath = filePath }));
+        }
+    }
 
     private sealed class FakeSession(bool isStarted = true, int? processId = 42) : IEtabsSession
     {

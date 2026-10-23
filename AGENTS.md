@@ -24,6 +24,7 @@ Mode A commands attach to a user-visible ETABS instance:
 - `open-model`
 - `close-model`
 - `unlock-model`
+- `save-model` (saves to an explicit path only, EtabExtension #443)
 
 Mode B commands create their own hidden ETABS session:
 

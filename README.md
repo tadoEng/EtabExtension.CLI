@@ -123,6 +123,7 @@ dotnet run --project src\EtabExtension.CLI\EtabExtension.CLI.csproj -- `
 | `open-model` | attach or visible new instance | Open an `.edb` for user interaction |
 | `close-model` | attach | Close the current visible model |
 | `unlock-model` | attach | Clear model lock state |
+| `save-model` | attach | Save the open model to an explicit `.edb` path |
 | `generate-e2k` | hidden | Export `.edb` to `.e2k` |
 | `run-analysis` | hidden | Run ETABS analysis |
 | `extract-results` | hidden | Extract configured tables to Parquet |
