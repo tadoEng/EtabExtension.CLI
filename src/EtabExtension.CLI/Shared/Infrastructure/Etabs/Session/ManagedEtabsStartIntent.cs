@@ -28,9 +28,17 @@ public enum ManagedEtabsStartIntent
 
     /// <summary>
     /// The caller told the engineer that ETABS will appear on screen while it starts, and
-    /// the engineer agreed to continue. Only this value permits process creation.
+    /// the engineer agreed to continue.
     /// </summary>
-    VisibleByConsent
+    VisibleByConsent,
+
+    /// <summary>
+    /// The engineer agreed to a second, HIDDEN ETABS doing background work (the analysis
+    /// daemon, core-loop §2.4). The start runs the same hidden-start path and readiness
+    /// gate; nothing in this daemon ever reveals it (<c>open-model</c> with
+    /// <c>background:true</c> never reveals).
+    /// </summary>
+    BackgroundByConsent
 }
 
 /// <summary>
@@ -44,6 +52,14 @@ public static class ManagedEtabsStartIntents
     /// </summary>
     public const string VisibleByConsent = "visible-start-consented";
 
+    /// <summary>The wire value for <see cref="ManagedEtabsStartIntent.BackgroundByConsent"/>.</summary>
+    public const string BackgroundByConsent = "background-consented";
+
+    /// <summary>True for either declared consent; only these permit process creation.</summary>
+    public static bool PermitsStart(ManagedEtabsStartIntent intent) =>
+        intent is ManagedEtabsStartIntent.VisibleByConsent
+            or ManagedEtabsStartIntent.BackgroundByConsent;
+
     /// <summary>
     /// Parses a wire value. Anything unrecognised — absent, empty, misspelled, or a value
     /// from a future protocol this build does not understand — is
@@ -51,10 +67,12 @@ public static class ManagedEtabsStartIntents
     /// closed on an unknown value is the point: a newer desktop must not be able to
     /// cold-start an older sidecar by sending a token it has never heard of.
     /// </summary>
-    public static ManagedEtabsStartIntent Parse(string? wireValue) =>
-        string.Equals(wireValue, VisibleByConsent, StringComparison.Ordinal)
-            ? ManagedEtabsStartIntent.VisibleByConsent
-            : ManagedEtabsStartIntent.Unspecified;
+    public static ManagedEtabsStartIntent Parse(string? wireValue) => wireValue switch
+    {
+        VisibleByConsent => ManagedEtabsStartIntent.VisibleByConsent,
+        BackgroundByConsent => ManagedEtabsStartIntent.BackgroundByConsent,
+        _ => ManagedEtabsStartIntent.Unspecified
+    };
 }
 
 /// <summary>

@@ -133,8 +133,8 @@ public sealed class EtabsSession : IEtabsSession
                 RequireVisibleStartConsent();
 
                 _diagnostics.WriteLine(
-                    "ℹ Starting ETABS (shared serve session; the engineer consented to a " +
-                    "visible start)...");
+                    "ℹ Starting ETABS (shared serve session; declared start intent: " +
+                    $"{_work.Current.StartIntent})...");
                 var launched = Launch();
                 _owned = launched;
                 try
@@ -278,7 +278,7 @@ public sealed class EtabsSession : IEtabsSession
         // whatever the ambient field had decayed to - or worse, whatever a later polling
         // request had just published into it.
         var intent = _work.Current.StartIntent;
-        if (intent == ManagedEtabsStartIntent.VisibleByConsent)
+        if (ManagedEtabsStartIntents.PermitsStart(intent))
         {
             return;
         }

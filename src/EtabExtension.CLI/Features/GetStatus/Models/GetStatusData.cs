@@ -27,6 +27,13 @@ public record GetStatusData
     [JsonPropertyName("observedPids")]
     public IReadOnlyList<int> ObservedPids { get; init; } = [];
 
+    /// <summary>
+    /// The observed pids that exactly match the sibling daemon's record
+    /// (<c>serve --sibling-record</c>). Never classified Managed or External.
+    /// </summary>
+    [JsonPropertyName("siblingPids")]
+    public IReadOnlyList<int> SiblingPids { get; init; } = [];
+
     [JsonPropertyName("etabsVersion")]
     public string? EtabsVersion { get; init; }
 

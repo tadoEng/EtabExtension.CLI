@@ -1622,6 +1622,8 @@ public sealed class ManagedSessionTests
     [InlineData("yes")]
     [InlineData("visible-start-consented-v2")]
     [InlineData("VISIBLE-START-CONSENTED")]
+    [InlineData("background-consented-v2")]
+    [InlineData("BACKGROUND-CONSENTED")]
     public void AnUnrecognisedIntentIsRefusedExactlyLikeAMissingOne(string wireValue)
     {
         var events = new List<string>();
@@ -1642,16 +1644,21 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, launcher.LaunchCount);
     }
 
-    /// <summary>The declared value does start a session, so the gate is not simply refusing everything.</summary>
-    [Fact]
-    public void AColdStartWithDeclaredConsentProceeds()
+    /// <summary>
+    /// Either declared value starts a session, so the gate is not simply refusing everything.
+    /// <c>background-consented</c> is the analysis daemon's hidden start (core-loop §2.4).
+    /// </summary>
+    [Theory]
+    [InlineData(ManagedEtabsStartIntents.VisibleByConsent)]
+    [InlineData(ManagedEtabsStartIntents.BackgroundByConsent)]
+    public void AColdStartWithDeclaredConsentProceeds(string wireValue)
     {
         var events = new List<string>();
         var managed = Managed(events);
         var launcher = new FakeLauncher(managed, events);
         var scope = new EtabsWorkScope();
         _ = scope.Enter(new EtabsWorkContext(
-            ManagedEtabsStartIntents.Parse(ManagedEtabsStartIntents.VisibleByConsent),
+            ManagedEtabsStartIntents.Parse(wireValue),
             "cold-start"));
         var session = new EtabsSession(
             launcher,

@@ -14,32 +14,45 @@ public sealed record ManagedProcessIdentity(
 
 public sealed record EtabsProcessObservation(
     IReadOnlyList<ManagedProcessIdentity> Identified,
-    int UnidentifiedCount);
+    int UnidentifiedCount)
+{
+    /// <summary>
+    /// The identified processes that exactly match the sibling daemon's record
+    /// (<see cref="EtabsSiblingCensus.Classify"/>). A subset of <see cref="Identified"/>.
+    /// </summary>
+    public IReadOnlyList<ManagedProcessIdentity> Siblings { get; init; } = [];
+
+    /// <summary><see cref="Identified"/> without the sibling's process.</summary>
+    public IReadOnlyList<ManagedProcessIdentity> NonSibling =>
+        Identified.Where(identity => !Siblings.Contains(identity)).ToList();
+}
 
 public static class EtabsOwnershipResolver
 {
+    /// <summary>
+    /// Managed iff identified ∖ (own ∪ siblings) = ∅ and our own process was seen;
+    /// External when an identified pid is neither ours nor the sibling's; Ambiguous
+    /// whenever an ETABS could not be identified at all. A sibling is never Managed or
+    /// External.
+    /// </summary>
     public static EtabsInstanceOwnership Resolve(
         EtabsProcessObservation observation,
         int? managedPid)
     {
-        if (observation.UnidentifiedCount > 0 || observation.Identified.Count > 1)
+        if (observation.UnidentifiedCount > 0)
         {
             return EtabsInstanceOwnership.Ambiguous;
         }
 
-        if (observation.Identified.Count == 0)
+        var nonSibling = observation.NonSibling;
+        if (nonSibling.Count == 0)
         {
             return EtabsInstanceOwnership.None;
         }
 
-        if (!managedPid.HasValue)
-        {
-            return EtabsInstanceOwnership.External;
-        }
-
-        return observation.Identified[0].Pid == managedPid.Value
+        return nonSibling.All(identity => identity.Pid == managedPid)
             ? EtabsInstanceOwnership.Managed
-            : EtabsInstanceOwnership.Ambiguous;
+            : EtabsInstanceOwnership.External;
     }
 }
 
@@ -781,9 +794,11 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 ex);
         }
 
-        if (observation.Identified.Count > 0 || observation.UnidentifiedCount > 0)
+        // The sibling daemon's own ETABS (exact record match) is expected, not external.
+        var nonSibling = observation.NonSibling;
+        if (nonSibling.Count > 0 || observation.UnidentifiedCount > 0)
         {
-            var pids = observation.Identified
+            var pids = nonSibling
                 .Select(identity => identity.Pid)
                 .Distinct()
                 .Order()
@@ -827,14 +842,15 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                     ex);
             }
 
-            if (observation.UnidentifiedCount == 0 && observation.Identified.Count == 1)
+            var nonSibling = observation.NonSibling;
+            if (observation.UnidentifiedCount == 0 && nonSibling.Count == 1)
             {
-                return observation.Identified[0];
+                return nonSibling[0];
             }
 
             if (_clock.ElapsedSince(started) >= OwnershipCensusDeadline)
             {
-                var pids = observation.Identified
+                var pids = nonSibling
                     .Select(identity => identity.Pid)
                     .Distinct()
                     .Order()
@@ -976,25 +992,27 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 applicationExitReturnCode);
         }
 
-        if (observation.Identified.Count == 0 && observation.UnidentifiedCount == 0)
+        // Never the sibling's ETABS: it is excluded before anything may be terminated.
+        var nonSibling = observation.NonSibling;
+        if (nonSibling.Count == 0 && observation.UnidentifiedCount == 0)
         {
             return Resolved(ownedPid: null, forced: false, applicationExitReturnCode);
         }
 
-        if (observation.UnidentifiedCount > 0 || observation.Identified.Count != 1)
+        if (observation.UnidentifiedCount > 0 || nonSibling.Count != 1)
         {
             return Unresolved(
                 ManagedEtabsShutdownState.IdentityMismatch,
                 ManagedEtabsShutdownErrorCodes.IdentityMismatch,
                 "Managed ETABS start failed and ownership of the surviving ETABS process could not be proven; " +
-                $"nothing was terminated. identifiedCount={observation.Identified.Count}; " +
+                $"nothing was terminated. identifiedCount={nonSibling.Count}; " +
                 $"unidentifiedCount={observation.UnidentifiedCount}",
                 ownedPid: null,
                 forced: false,
                 applicationExitReturnCode);
         }
 
-        var survivor = observation.Identified[0];
+        var survivor = nonSibling[0];
         var termination = _processes.TerminateExact(survivor, ForcedExitTimeout);
         return termination.State switch
         {

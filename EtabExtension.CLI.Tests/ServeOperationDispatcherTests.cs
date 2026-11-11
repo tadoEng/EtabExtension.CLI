@@ -168,7 +168,11 @@ public sealed class ServeOperationDispatcherTests : IDisposable
                 "get-status", null, TestContext.Current.CancellationToken));
 
             Assert.True(response.Success);
-            Assert.Equal(EtabsInstanceOwnership.Ambiguous, response.Data!.Ownership);
+            // Core-loop §2.3: an unidentified ETABS is Ambiguous; an identified one that is
+            // neither ours nor the sibling's is External.
+            Assert.Equal(
+                unidentified ? EtabsInstanceOwnership.Ambiguous : EtabsInstanceOwnership.External,
+                response.Data!.Ownership);
             Assert.Equal(
                 unidentified ? [42] : [42, 99],
                 response.Data.ObservedPids);
@@ -454,7 +458,26 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.Equal(@"C:\v1\sample_v2.edb", open.FilePath);
     }
 
-    // ── WP-C0: version pre-check, modal-dialog watchdog ─────────────────────────
+    // ── WP-C0: background open, version pre-check, modal-dialog watchdog ────────
+
+    /// <summary>The analysis daemon's open (core-loop §2.4) never reveals ETABS.</summary>
+    [Fact]
+    public async Task ABackgroundOpenNeverRevealsEtabs()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var open = new FakeOpenModelService(session.Events);
+        var dispatcher = CreateDispatcher(_manager, session, open: open);
+
+        var response = Assert.IsType<Result<OpenModelData>>(await dispatcher.DispatchAsync(
+            "open-model",
+            Json("""{"filePath":"C:/scratch/main-v3.edb","background":true}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.True(response.Success);
+        Assert.Equal(0, session.RevealCalls);
+        Assert.Equal(["get-or-start", "open"], session.Events);
+    }
 
     /// <summary>DD-5: a 23.3 model on 23.2 ETABS is refused typed, before OpenFile.</summary>
     [Fact]

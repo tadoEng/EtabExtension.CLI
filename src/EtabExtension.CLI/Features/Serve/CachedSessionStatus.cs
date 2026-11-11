@@ -74,20 +74,33 @@ internal static class EtabsStatusOwnership
             .Distinct()
             .Order()
             .ToList();
+        var siblingPids = observation.Siblings
+            .Select(identity => identity.Pid)
+            .Distinct()
+            .Order()
+            .ToList();
+        var foreignPids = observation.NonSibling
+            .Select(identity => identity.Pid)
+            .Where(observed => observed != managedPid)
+            .Distinct()
+            .ToList();
         var pid = ownership switch
         {
             EtabsInstanceOwnership.Managed => managedPid,
-            EtabsInstanceOwnership.External => observedPids.SingleOrDefault(),
+            EtabsInstanceOwnership.External => foreignPids.Count == 1 ? foreignPids[0] : null,
             EtabsInstanceOwnership.Ambiguous => managedPid,
             _ => null
         };
 
+        // observedPids stays the whole census (siblings included): the Rust pool verifies
+        // that the union of observed pids equals the managed pids of its started roles.
         return Result.Ok(status.Data with
         {
             IsRunning = ownership != EtabsInstanceOwnership.None,
             Pid = pid,
             Ownership = ownership,
-            ObservedPids = observedPids
+            ObservedPids = observedPids,
+            SiblingPids = siblingPids
         });
     }
 }

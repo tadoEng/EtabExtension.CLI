@@ -87,6 +87,14 @@ public sealed record ServeHandshake(
     [JsonPropertyName("startup")]
     public string Startup { get; init; } = ServeStartupOutcomes.Ready;
 
+    /// <summary>
+    /// Where THIS daemon keeps its managed-session record (<c>serve --session-record</c>,
+    /// default <see cref="JsonSessionRecordStore.DefaultPath"/>). With two daemons each
+    /// has its own record, and each passes the other's as <c>--sibling-record</c>.
+    /// </summary>
+    [JsonPropertyName("recordPath")]
+    public string? RecordPath { get; init; }
+
     internal static Assembly MetadataAssembly => typeof(ServeHandshake).Assembly;
 
     public static ServeHandshake Current(IReadOnlyList<string> capabilities)

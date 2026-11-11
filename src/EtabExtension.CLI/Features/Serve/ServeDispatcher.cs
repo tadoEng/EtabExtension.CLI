@@ -254,8 +254,11 @@ public sealed class ServeDispatcher : IServeDispatcher
                 return Result.Fail<OpenModelData>(refused);
             }
 
-            return RevealAfterConfirmedOpen(
-                await _open.OpenModelOnAppAsync(app, req.FilePath, req.SaveOnClose));
+            var opened = await _open.OpenModelOnAppAsync(app, req.FilePath, req.SaveOnClose);
+
+            // The analysis daemon's open (core-loop §2.4): the model is opened and ETABS
+            // stays hidden. Only the explicit user-visible open ever reveals.
+            return req.Background ? opened : (object)RevealAfterConfirmedOpen(opened);
         });
     }
 
