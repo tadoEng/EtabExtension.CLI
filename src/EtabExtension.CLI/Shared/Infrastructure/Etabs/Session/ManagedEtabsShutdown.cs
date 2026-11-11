@@ -132,16 +132,26 @@ public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
         {
             var started = System.Diagnostics.Stopwatch.StartNew();
             var attempt = AttemptExitOnDedicatedSta(owned, _gracefulExitTimeout);
-            if (attempt.Returned)
+            if (attempt.Returned && attempt.Failure is null)
             {
                 applicationExitReturnCode = attempt.ReturnCode;
-                applicationExitError = attempt.Failure is not null
-                    ? EtabsApiDiagnosticFormatter.Exception("cOAPI.ApplicationExit(false)", attempt.Failure)
-                    : applicationExitReturnCode is { } code and not 0
-                        ? EtabsApiDiagnosticFormatter.ApiReturn("cOAPI.ApplicationExit(false)", code)
-                        : null;
+                applicationExitError = applicationExitReturnCode is { } code and not 0
+                    ? EtabsApiDiagnosticFormatter.ApiReturn("cOAPI.ApplicationExit(false)", code)
+                    : null;
                 var remaining = _gracefulExitTimeout - started.Elapsed;
                 gracefulWait = remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+            }
+            else if (attempt.Failure is not null)
+            {
+                // Also expected here: the RCW belongs to the stuck worker's apartment, so a
+                // call from this thread typically throws (RPC_E_WRONG_THREAD) without ever
+                // reaching ETABS. No exit was requested, so there is nothing to wait for and
+                // nothing to report as an exit failure - straight to the kill.
+                Console.Error.WriteLine(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    EtabsApiDiagnosticFormatter.Exception("cOAPI.ApplicationExit(false)", attempt.Failure),
+                    "session blocked; exit not deliverable from the shutdown thread; " +
+                    $"killing the exact owned ETABS (PID {owned.Identity.Pid})"));
+                gracefulWait = null;
             }
             else
             {

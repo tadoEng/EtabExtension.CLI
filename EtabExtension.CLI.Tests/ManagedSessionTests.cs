@@ -761,6 +761,54 @@ public sealed class ManagedSessionTests
     }
 
     /// <summary>
+    /// r2 P3-A: on the blocked path a THROWING exit is the expected cross-apartment outcome
+    /// (RPC_E_WRONG_THREAD) - the request never reached ETABS. It goes straight to the kill,
+    /// with no graceful wait, and a confirmed kill is a success, not ApplicationExitFailed.
+    /// </summary>
+    [Fact]
+    public void BlockedShutdownWithAThrowingExitKillsWithoutAGracefulWaitAndSucceeds()
+    {
+        var fixture = ShutdownFixture.Create(
+            exitException: new TestException(
+                "The application called an interface that was marshalled for a different thread.",
+                unchecked((int)0x8001010E)),
+            waitResults: [true]);
+        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromSeconds(5));
+
+        var result = machine.ShutdownWhileWorkerBlocked(fixture.Managed);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Null(result.ErrorCode);
+        Assert.Equal(ManagedEtabsShutdownState.Succeeded, result.Data.State);
+        Assert.True(result.Data.ProcessExitConfirmed);
+        Assert.True(result.Data.Forced);
+        Assert.Null(result.Data.ApplicationExitReturnCode);
+        Assert.Equal(1, fixture.Managed.ExitCount);
+        Assert.Equal(1, fixture.Managed.KillCount);
+        Assert.Equal([ManagedEtabsShutdownMachine.ForcedExitTimeout], fixture.Managed.WaitTimeouts);
+        Assert.Null(fixture.Store.Record);
+    }
+
+    /// <summary>
+    /// Mutation guard for the test above: on the blocked path a non-zero RETURN is still an
+    /// answered exit and keeps its ApplicationExitFailed classification.
+    /// </summary>
+    [Fact]
+    public void BlockedShutdownWithANonzeroExitReturnStaysApplicationExitFailed()
+    {
+        var fixture = ShutdownFixture.Create(exitReturnCode: 7, waitResults: [false, true]);
+        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromMilliseconds(200));
+
+        var result = machine.ShutdownWhileWorkerBlocked(fixture.Managed);
+
+        Assert.False(result.Success);
+        Assert.Equal(ManagedEtabsShutdownErrorCodes.ApplicationExitFailed, result.ErrorCode);
+        Assert.True(result.Data.ProcessExitConfirmed);
+        Assert.Equal(7, result.Data.ApplicationExitReturnCode);
+        Assert.Equal(1, fixture.Managed.KillCount);
+    }
+
+    /// <summary>
     /// The session wiring: the blocked shutdown goes through the same terminal state as
     /// the normal one, so a later Shutdown() (the DI scope's disposal) is the cached result.
     /// </summary>
