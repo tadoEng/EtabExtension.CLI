@@ -29,6 +29,14 @@ public sealed class ServeOpenModelRequest
 {
     [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
     [JsonPropertyName("saveOnClose")] public bool SaveOnClose { get; init; }
+
+
+    /// <summary>
+    /// The ETABS version that saved the model (x.y.z). When present and newer (major.minor)
+    /// than the running ETABS, the open is refused with ETABS_VERSION_MISMATCH before
+    /// OpenFile. Absent means no pre-check; the modal-dialog watchdog still protects.
+    /// </summary>
+    [JsonPropertyName("expectedModelVersion")] public string? ExpectedModelVersion { get; init; }
 }
 
 public sealed class ServeCloseModelRequest
@@ -46,6 +54,9 @@ public sealed class ServeGenerateE2KRequest
     [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
     [JsonPropertyName("outputFile")] public string OutputFile { get; init; } = string.Empty;
     [JsonPropertyName("overwrite")] public bool Overwrite { get; init; }
+
+    /// <summary>Same pre-check as <see cref="ServeOpenModelRequest.ExpectedModelVersion"/>.</summary>
+    [JsonPropertyName("expectedModelVersion")] public string? ExpectedModelVersion { get; init; }
 }
 
 public sealed class ServeRunAnalysisRequest

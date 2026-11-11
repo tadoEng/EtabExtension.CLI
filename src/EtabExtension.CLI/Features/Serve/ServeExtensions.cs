@@ -16,6 +16,10 @@ public static class ServeExtensions
         services.AddScoped<ISessionRecordStore, JsonSessionRecordStore>();
         services.AddScoped<IProcessInspector, WindowsProcessInspector>();
         services.AddScoped<IManagedEtabsLauncher, ManagedEtabsLauncher>();
+        services.AddScoped<IEtabsModalDialogWatchdog, EtabsModalDialogWatchdog>();
+        services.AddScoped<IEtabsInstalledVersion>(provider => new SessionEtabsInstalledVersion(
+            provider.GetRequiredService<IEtabsSession>(),
+            new FileEtabsVersionProbe()));
         services.AddScoped<IOrphanSessionCleaner, OrphanSessionCleaner>();
         services.AddScoped<IManagedEtabsStartIntentScope, ManagedEtabsStartIntentScope>();
         services.AddScoped<IEtabsWorkScope, EtabsWorkScope>();
