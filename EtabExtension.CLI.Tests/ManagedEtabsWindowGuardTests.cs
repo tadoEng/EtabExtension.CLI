@@ -1065,23 +1065,56 @@ public sealed class ManagedEtabsWindowGuardTests
     /// </summary>
     [Fact]
     [SupportedOSPlatform("windows")]
-    public void AnInstallThatMissesTheDeadlineFailsActivationAndLeavesNothingBehind()
+    public async Task AnInstallThatMissesTheDeadlineFailsActivationAndLeavesNothingBehind()
     {
-        var hook = new ControlledHook { InstallDelay = TimeSpan.FromMilliseconds(400) };
-        hook.Release.Set();
+        // Ordered by signals, not by a sleep racing the deadline. The install is held until
+        // the monitor has RETIRED, so the acknowledgement can never beat the deadline. (The
+        // old 400 ms install delay against a 50 ms deadline failed whenever the test thread
+        // was descheduled for longer than that gap before it began waiting.) The deadline is
+        // wide enough that the pump is inside the install call when it expires, and the join
+        // bound wide enough that the released pump is always joined, so the teardown is the
+        // Resolved one asserted below.
+        var hook = new ControlledHook();
         var monitor = new Win32OwnedWindowSurfaceMonitor(
             TimeSpan.FromMilliseconds(50),
             hook.Install,
             hook.Remove,
-            TimeSpan.FromMilliseconds(50));
+            installTimeout: TimeSpan.FromSeconds(2),
+            joinTimeout: TimeSpan.FromSeconds(30));
+        using var stopReleasing = new CancellationTokenSource();
+        var releaseAfterRetirement = Task.Run(
+            async () =>
+            {
+                while (!monitor.IsRetired)
+                {
+                    await Task.Delay(1, stopReleasing.Token);
+                }
 
-        var error = Assert.Throws<InvalidOperationException>(
-            () => monitor.Start(Owned.Pid, () => { }, () => { }));
+                hook.Release.Set();
+            },
+            stopReleasing.Token);
 
-        Assert.Contains("did not report installation", error.Message, StringComparison.Ordinal);
-        Assert.False(monitor.Subscribed);
-        Assert.False(monitor.PumpAlive);
-        Assert.Equal([hook.Result], hook.Removed);
+        try
+        {
+            var error = Assert.Throws<InvalidOperationException>(
+                () => monitor.Start(Owned.Pid, () => { }, () => { }));
+
+            Assert.Contains("did not report installation", error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("UNRESOLVED", error.Message, StringComparison.Ordinal);
+            Assert.False(monitor.Subscribed);
+            Assert.False(monitor.PumpAlive);
+            Assert.Equal(1, hook.Installs);
+            Assert.Equal([hook.Result], hook.Removed);
+            await releaseAfterRetirement.WaitAsync(
+                TimeSpan.FromSeconds(5),
+                TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            // Never leave the pump parked in the fake install if an assertion failed early.
+            hook.Release.Set();
+            await stopReleasing.CancelAsync();
+        }
     }
 
     /// <summary>
