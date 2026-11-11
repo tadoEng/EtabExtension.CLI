@@ -702,6 +702,97 @@ public sealed class ManagedSessionTests
             fixture.Events);
     }
 
+    // ── P2-1: the blocked-session shutdown ──────────────────────────────────────
+
+    /// <summary>
+    /// An ETABS held by a modal box never answers ApplicationExit. The blocked-session
+    /// shutdown abandons the request after the graceful bound and kills the exact owned
+    /// process through its authoritative handle - no graceful wait on top, no hang.
+    /// </summary>
+    [Fact]
+    public void BlockedShutdownKillsTheOwnedProcessWhenApplicationExitNeverReturns()
+    {
+        var fixture = ShutdownFixture.Create(waitResults: [true]);
+        using var unanswered = new ManualResetEventSlim();
+        fixture.Managed.ExitGate = unanswered;
+        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromMilliseconds(200));
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        try
+        {
+            var result = machine.ShutdownWhileWorkerBlocked(fixture.Managed);
+
+            Assert.True(clock.Elapsed < TimeSpan.FromSeconds(5));
+            Assert.True(result.Success, result.Error);
+            Assert.Equal(ManagedEtabsShutdownState.Succeeded, result.Data.State);
+            Assert.True(result.Data.ProcessExitConfirmed);
+            Assert.True(result.Data.Forced);
+            Assert.False(result.Data.RecordRetained);
+            Assert.Null(result.Data.ApplicationExitReturnCode);
+            Assert.Equal(1, fixture.Managed.ExitCount);
+            Assert.Equal(1, fixture.Managed.KillCount);
+            Assert.Equal([ManagedEtabsShutdownMachine.ForcedExitTimeout], fixture.Managed.WaitTimeouts);
+            Assert.Equal(ApartmentState.STA, fixture.Managed.ExitApartment);
+            Assert.NotEqual(Environment.CurrentManagedThreadId, fixture.Managed.ExitThreadId);
+            Assert.Null(fixture.Store.Record);
+        }
+        finally
+        {
+            unanswered.Set();
+        }
+    }
+
+    /// <summary>An answered exit on the blocked path is the normal sequence: no kill.</summary>
+    [Fact]
+    public void BlockedShutdownWithAnAnsweredExitNeedsNoKill()
+    {
+        var fixture = ShutdownFixture.Create(waitResults: [true]);
+        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromSeconds(5));
+
+        var result = machine.ShutdownWhileWorkerBlocked(fixture.Managed);
+
+        Assert.True(result.Success, result.Error);
+        Assert.False(result.Data.Forced);
+        Assert.Equal(0, result.Data.ApplicationExitReturnCode);
+        Assert.Equal(0, fixture.Managed.KillCount);
+        Assert.Equal(ApartmentState.STA, fixture.Managed.ExitApartment);
+        var wait = Assert.Single(fixture.Managed.WaitTimeouts);
+        Assert.True(wait <= TimeSpan.FromSeconds(5));
+    }
+
+    /// <summary>
+    /// The session wiring: the blocked shutdown goes through the same terminal state as
+    /// the normal one, so a later Shutdown() (the DI scope's disposal) is the cached result.
+    /// </summary>
+    [Fact]
+    public void SessionBlockedShutdownIsTerminalAndCached()
+    {
+        var fixture = VisibilityFixture.Create(
+            waitResults: [true],
+            gracefulExitTimeout: TimeSpan.FromMilliseconds(200));
+        _ = fixture.Session.GetOrStartOwned();
+        using var unanswered = new ManualResetEventSlim();
+        fixture.Managed.ExitGate = unanswered;
+
+        try
+        {
+            var result = fixture.Session.ShutdownWhileWorkerBlocked();
+
+            Assert.True(result.Success, result.Error);
+            Assert.True(result.Data.ProcessExitConfirmed);
+            Assert.True(result.Data.Forced);
+            Assert.Equal(1, fixture.Managed.KillCount);
+            Assert.Null(fixture.Session.ProcessId);
+            Assert.False(fixture.Session.IsStarted);
+            Assert.Same(result, fixture.Session.Shutdown());
+            Assert.Equal(1, fixture.Managed.ExitCount);
+        }
+        finally
+        {
+            unanswered.Set();
+        }
+    }
+
     [Fact]
     public void ShutdownNonzeroExitRemainsFailureAfterForcedConfirmedCleanup()
     {
@@ -1038,7 +1129,9 @@ public sealed class ManagedSessionTests
         /// <summary>What the session actually printed, so success lines are assertable.</summary>
         public StringWriter Diagnostics { get; } = diagnostics;
 
-        public static VisibilityFixture Create(IEnumerable<bool>? waitResults = null)
+        public static VisibilityFixture Create(
+            IEnumerable<bool>? waitResults = null,
+            TimeSpan? gracefulExitTimeout = null)
         {
             var events = new List<string>();
             var launchId = Guid.NewGuid();
@@ -1056,7 +1149,9 @@ public sealed class ManagedSessionTests
                 new FakeLauncher(managed, events),
                 new FakeProcesses { Live = Identity },
                 store,
-                new ManagedEtabsShutdownMachine(store),
+                new ManagedEtabsShutdownMachine(
+                    store,
+                    gracefulExitTimeout ?? ManagedEtabsShutdownMachine.GracefulExitTimeout),
                 Consented(),
                 diagnostics);
             return new(session, managed, events, diagnostics);
@@ -2150,10 +2245,19 @@ public sealed class ManagedSessionTests
             return _initializeReturnCode;
         }
 
+        /// <summary>Holds ApplicationExit unanswered, as an ETABS in a modal loop does.</summary>
+        public ManualResetEventSlim? ExitGate { get; set; }
+
+        public ApartmentState? ExitApartment { get; private set; }
+        public int? ExitThreadId { get; private set; }
+
         public int ExitWithoutSaving()
         {
             _events.Add("application-exit");
             ExitCount++;
+            ExitApartment = Thread.CurrentThread.GetApartmentState();
+            ExitThreadId = Environment.CurrentManagedThreadId;
+            ExitGate?.Wait();
             if (_exitException is not null)
             {
                 throw _exitException;

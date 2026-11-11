@@ -246,6 +246,13 @@ public sealed class ServeDispatcher : IServeDispatcher
     {
         _ = ct;
         var req = Deserialize<ServeOpenModelRequest>(request);
+
+        // Read on the protocol thread, while this request's frozen context is current.
+        // Either signal keeps ETABS hidden: the request flag, or a request that declared the
+        // background-consented intent. The engineer agreed to a HIDDEN second ETABS, so an
+        // open that merely omits "background" must not put it on screen.
+        var reveal = !req.Background
+            && _pendingWork.StartIntent != ManagedEtabsStartIntent.BackgroundByConsent;
         return await ExecuteWatchedComAsync(async () =>
         {
             var app = _session.GetOrStart();
@@ -258,7 +265,7 @@ public sealed class ServeDispatcher : IServeDispatcher
 
             // The analysis daemon's open (core-loop §2.4): the model is opened and ETABS
             // stays hidden. Only the explicit user-visible open ever reveals.
-            return req.Background ? opened : (object)RevealAfterConfirmedOpen(opened);
+            return reveal ? RevealAfterConfirmedOpen(opened) : (object)opened;
         });
     }
 
@@ -437,6 +444,14 @@ public sealed class ServeDispatcher : IServeDispatcher
     {
         _ = ct;
         var req = Deserialize<ServeRunAnalysisRequest>(request);
+
+        // Deliberately NOT under the modal-dialog watchdog in C0. A running analysis shows
+        // the ETABS analysis monitor over a disabled main window, and the watchdog's current
+        // modal test (visible, or owner disabled) may not tell it apart from a blocking box.
+        // Watching run-analysis waits on the stricter modal test and its live probe (C0
+        // follow-up, review finding P2-3). The commands that hit the DD-5 "older version"
+        // box - open-model, save-model, generate-e2k - are watched, and so is the legacy
+        // analyze-and-extract lane.
         return await ExecuteComAsync(async () => await _runAnalysis.RunAnalysisOnAppAsync(
             _session.GetOrStart(), req.FilePath, req.Cases, req.Units));
     }

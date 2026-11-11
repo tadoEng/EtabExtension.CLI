@@ -479,6 +479,33 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.Equal(["get-or-start", "open"], session.Events);
     }
 
+    /// <summary>
+    /// P2-4: the engineer agreed to a HIDDEN second ETABS. An open on a request that
+    /// declared background-consented must not reveal it just because the payload omitted
+    /// <c>background</c>.
+    /// </summary>
+    [Fact]
+    public async Task ABackgroundConsentedOpenWithoutTheBackgroundFieldNeverRevealsEtabs()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var open = new FakeOpenModelService(session.Events);
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            open: open,
+            declaredIntent: ManagedEtabsStartIntent.BackgroundByConsent);
+
+        var response = Assert.IsType<Result<OpenModelData>>(await dispatcher.DispatchAsync(
+            "open-model",
+            Json("""{"filePath":"C:/scratch/main-v3.edb"}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.True(response.Success);
+        Assert.Equal(0, session.RevealCalls);
+        Assert.Equal(["get-or-start", "open"], session.Events);
+    }
+
     /// <summary>DD-5: a 23.3 model on 23.2 ETABS is refused typed, before OpenFile.</summary>
     [Fact]
     public async Task ANewerModelVersionIsRefusedBeforeOpenFile()
@@ -551,6 +578,52 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             Assert.False(saved.Success);
             Assert.StartsWith("[ETABS_MODAL_DIALOG] ", saved.Error, StringComparison.Ordinal);
             Assert.Equal(0, session.RevealCalls);
+        }
+        finally
+        {
+            release.SetResult();
+        }
+    }
+
+    /// <summary>
+    /// P3-4(c): while a command is stuck behind an unanswered dialog, neither operation lane
+    /// may accept work - it would only queue behind the stuck STA worker. Both refuse with
+    /// the same typed code, and no operation is started.
+    /// </summary>
+    [Theory]
+    [InlineData("start-operation", """{"kind":"analyze-and-extract","payload":{}}""")]
+    [InlineData("analyze-and-extract", """{"filePath":"C:/v1/sample_v2.edb","outputDir":"C:/v1/out","tables":{}}""")]
+    public async Task OperationLanesAreRefusedTypedWhileACommandIsBlockedOnADialog(
+        string command,
+        string payload)
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var session = new FakeSession();
+        var open = new FakeOpenModelService(session.Events) { Gate = release.Task };
+        var watchdog = new EtabsModalDialogWatchdog(
+            new OneDialog(new(7, "ETABS", ["Unexpected dialog"])),
+            TimeSpan.FromMilliseconds(5),
+            TimeSpan.FromSeconds(1));
+        var dispatcher = CreateDispatcher(_manager, session, open: open, watchdog: watchdog);
+
+        try
+        {
+            _ = await dispatcher.DispatchAsync(
+                "open-model",
+                Json("""{"filePath":"C:/v1/sample_v2.edb"}"""),
+                TestContext.Current.CancellationToken);
+            Assert.True(watchdog.IsBlocked);
+
+            var refused = Assert.IsAssignableFrom<Result>(await dispatcher.DispatchAsync(
+                command,
+                Json(payload),
+                TestContext.Current.CancellationToken));
+
+            Assert.False(refused.Success);
+            Assert.StartsWith("[ETABS_MODAL_DIALOG] ", refused.Error, StringComparison.Ordinal);
+            Assert.False(_manager.HasActiveOperation);
+            Assert.False(Directory.Exists(_directory) && Directory.EnumerateDirectories(_directory).Any());
         }
         finally
         {
@@ -1357,7 +1430,8 @@ esults"
         IOpenModelService? open = null,
         ISaveModelService? save = null,
         IEtabsModalDialogWatchdog? watchdog = null,
-        IEtabsInstalledVersion? installedVersion = null) => new(
+        IEtabsInstalledVersion? installedVersion = null,
+        ManagedEtabsStartIntent declaredIntent = ManagedEtabsStartIntent.VisibleByConsent) => new(
             session ?? null!,
             null!,
             open ?? null!,
@@ -1376,10 +1450,18 @@ esults"
             cachedStatus ?? new CachedSessionStatus(),
             processes ?? new FakeProcesses(new EtabsProcessObservation([], 0)),
             runAnalysis ?? null!,
-            WorkEnvelopeFixtures.Consented(session ?? new FakeSession()),
+            Declared(session ?? new FakeSession(), declaredIntent),
             watchdog ?? new EtabsModalDialogWatchdog(
                 new NoDialogs(), TimeSpan.FromMilliseconds(5), TimeSpan.FromSeconds(1)),
             installedVersion ?? new FixedInstalledVersion("23.2.0"));
+
+    /// <summary>An envelope whose request declared <paramref name="intent"/>.</summary>
+    private static EtabsWorkEnvelope Declared(IEtabsSession session, ManagedEtabsStartIntent intent)
+    {
+        var declared = new ManagedEtabsStartIntentScope();
+        _ = declared.Publish(intent);
+        return new EtabsWorkEnvelope(declared, new EtabsWorkScope(), session);
+    }
 
     private sealed class FixedInstalledVersion(string version) : IEtabsInstalledVersion
     {
@@ -1480,6 +1562,7 @@ esults"
                 : Result.Fail("ETABS_VISIBILITY_NOT_CONFIRMED; operation=cOAPI.Unhide");
         }
         public ManagedEtabsShutdownResult Shutdown() => throw new NotSupportedException();
+        public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked() => throw new NotSupportedException();
         public void Dispose() { }
     }
 

@@ -147,6 +147,139 @@ public sealed class ModalDialogAndVersionTests
         Assert.Empty(windows.ScannedPids);
     }
 
+    /// <summary>
+    /// P3-4(a): a fault in the window source itself must never fault the watch or fail the
+    /// command it guards. The work's own result passes through untouched.
+    /// </summary>
+    [Fact]
+    public async Task AThrowingWindowSourceLetsTheWorkResultPassThrough()
+    {
+        var windows = new FakeDialogs { ThrowOnFind = true };
+        var expected = Result.Ok();
+
+        var result = await Watchdog(windows).GuardAsync(
+            () => 4242,
+            async () =>
+            {
+                await Task.Delay(30);
+                return expected;
+            },
+            TestContext.Current.CancellationToken);
+
+        Assert.Same(expected, result);
+        Assert.NotEmpty(windows.ScannedPids);
+    }
+
+    /// <summary>
+    /// P3-4(a): a dismiss that throws on a dialog that IS there neither faults the watch nor
+    /// hides the dialog: the command still fails typed, with the box reported as left open.
+    /// </summary>
+    [Fact]
+    public async Task AThrowingDismissStillFailsTypedWithTheDialogLeftOpen()
+    {
+        var release = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var windows = new FakeDialogs
+        {
+            Dialog = new(1, "ETABS", [OlderVersionText]),
+            ThrowOnDismiss = true
+        };
+        var watchdog = Watchdog(windows);
+
+        try
+        {
+            var result = Assert.IsType<Result>(await watchdog.GuardAsync(
+                () => 4242, () => release.Task, TestContext.Current.CancellationToken));
+
+            Assert.False(result.Success);
+            Assert.StartsWith("[ETABS_MODAL_DIALOG] ", result.Error, StringComparison.Ordinal);
+            Assert.False(DetailOf(result.Error!).GetProperty("dismissed").GetBoolean());
+            Assert.Equal(1, windows.DismissCalls);
+            Assert.True(watchdog.IsBlocked);
+        }
+        finally
+        {
+            release.SetResult(Result.Ok());
+        }
+    }
+
+    /// <summary>
+    /// P3-4(b): the known box whose dismiss did not take (the window survived) is still a
+    /// typed failure, reported dismissed:false, and the session stays blocked.
+    /// </summary>
+    [Fact]
+    public async Task AKnownBoxThatCouldNotBeDismissedFailsTypedAsLeftOpen()
+    {
+        var release = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var windows = new FakeDialogs
+        {
+            Dialog = new(1, "ETABS", [OlderVersionText]),
+            DismissResult = false
+        };
+        var watchdog = Watchdog(windows);
+
+        try
+        {
+            var result = Assert.IsType<Result>(await watchdog.GuardAsync(
+                () => 4242, () => release.Task, TestContext.Current.CancellationToken));
+
+            Assert.False(result.Success);
+            Assert.StartsWith("[ETABS_MODAL_DIALOG] ", result.Error, StringComparison.Ordinal);
+            Assert.Contains("it was left open", result.Error, StringComparison.Ordinal);
+            Assert.False(DetailOf(result.Error!).GetProperty("dismissed").GetBoolean());
+            Assert.Equal(1, windows.DismissCalls);
+            Assert.True(watchdog.IsBlocked);
+            Assert.Equal(result.Error, watchdog.BlockedFailure().Error);
+        }
+        finally
+        {
+            release.SetResult(Result.Ok());
+        }
+    }
+
+    // ── P3-5: cross-repo parity with docs/contracts/sidecar-v1/failures.jsonl ──
+    //
+    // These literals are copied from the EtabExtension repo's failures.jsonl (ids 21-23),
+    // which the Rust decoder is tested against. If the C# prose or detail shape drifts, this
+    // fails here instead of in the desktop's decoder.
+
+    private const string Fixture21 =
+        "[ETABS_MODAL_DIALOG] ETABS is waiting on a modal dialog; it was left open and the command failed. " +
+        "The ETABS session is busy until the dialog is answered. " +
+        "detail={\"title\":\"ETABS\",\"text\":\"Unexpected error in the model file.\",\"dismissed\":false}";
+
+    private const string Fixture22 =
+        "Operation failed: [ETABS_MODAL_DIALOG] ETABS showed a modal dialog it cannot continue past; " +
+        "the dialog was closed and the command failed. " +
+        "detail={\"title\":\"ETABS\",\"text\":\"This file cannot be opened in an older version of ETABS.\",\"dismissed\":true}";
+
+    private const string Fixture23 =
+        "[ETABS_VERSION_MISMATCH] The model was saved by ETABS 23.3.0, which is newer than the running " +
+        "ETABS 23.2.0; it was not opened. detail={\"model\":\"23.3.0\",\"installed\":\"23.2.0\"}";
+
+    [Fact]
+    public void TheDetailMarkerMatchesTheContract() =>
+        Assert.Equal(" detail=", EtabsTypedFailureCodes.DetailMarker);
+
+    [Fact]
+    public void ALeftOpenDialogFailureMatchesContractFixture21() =>
+        Assert.Equal(
+            Fixture21,
+            new EtabsModalDialogObservation("ETABS", "Unexpected error in the model file.", false).ToFailure());
+
+    /// <summary>Fixture 22 is the operation lane's form: its prefix, then the typed failure.</summary>
+    [Fact]
+    public void ADismissedDialogFailureMatchesContractFixture22() =>
+        Assert.Equal(
+            Fixture22,
+            "Operation failed: " + new EtabsModalDialogObservation(
+                "ETABS",
+                "This file cannot be opened in an older version of ETABS.",
+                true).ToFailure());
+
+    [Fact]
+    public void AVersionMismatchFailureMatchesContractFixture23() =>
+        Assert.Equal(Fixture23, EtabsModelVersionCheck.Check("23.3.0", "23.2.0"));
+
     /// <summary>The real ETABS 23.2 box (live, 2026-11-11): #32770, title "ETABS", one OK.</summary>
     [Fact]
     public void TheRealEtabs232OlderVersionBoxIsKnown() =>
@@ -186,6 +319,12 @@ public sealed class ModalDialogAndVersionTests
 
         public EtabsDialogWindow? Dialog { get; init; }
         public Action? OnDismiss { get; init; }
+        public bool ThrowOnFind { get; init; }
+        public bool ThrowOnDismiss { get; init; }
+
+        /// <summary>False models a dismiss that did not take: the window is still there.</summary>
+        public bool DismissResult { get; init; } = true;
+
         public int DismissCalls { get; private set; }
 
         public IReadOnlyList<int> ScannedPids
@@ -204,6 +343,11 @@ public sealed class ModalDialogAndVersionTests
             lock (_gate)
             {
                 _scanned.Add(pid);
+                if (ThrowOnFind)
+                {
+                    throw new InvalidOperationException("window walk failed");
+                }
+
                 return Dialog is null || _dismissed ? [] : [Dialog];
             }
         }
@@ -213,11 +357,16 @@ public sealed class ModalDialogAndVersionTests
             lock (_gate)
             {
                 DismissCalls++;
-                _dismissed = true;
+                if (ThrowOnDismiss)
+                {
+                    throw new InvalidOperationException("PostMessage failed");
+                }
+
+                _dismissed = DismissResult;
             }
 
             OnDismiss?.Invoke();
-            return true;
+            return DismissResult;
         }
     }
 }

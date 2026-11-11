@@ -111,8 +111,15 @@ public sealed class EtabsModalDialogWatchdog(
     public static readonly TimeSpan DefaultPollInterval = TimeSpan.FromMilliseconds(200);
     public static readonly TimeSpan DefaultDismissedSettle = TimeSpan.FromSeconds(30);
 
-    private Task? _blocked;
-    private EtabsModalDialogObservation? _blockedBy;
+    /// <summary>
+    /// The abandoned work and the dialog that abandoned it, published together. Readers on
+    /// the protocol thread (<see cref="IsBlocked"/>, <see cref="BlockedFailure"/>) must never
+    /// see the task of one block paired with the observation of another, so the pair is one
+    /// immutable object behind one volatile reference rather than two separate fields.
+    /// </summary>
+    private sealed record BlockedState(Task Work, EtabsModalDialogObservation By);
+
+    private BlockedState? _blocked;
 
     public EtabsModalDialogWatchdog()
         : this(PlatformWindows(), DefaultPollInterval, DefaultDismissedSettle)
@@ -123,10 +130,11 @@ public sealed class EtabsModalDialogWatchdog(
         ? new Win32EtabsDialogWindowSource()
         : throw new PlatformNotSupportedException("The ETABS dialog watchdog requires Windows.");
 
-    public bool IsBlocked => _blocked is { IsCompleted: false };
+    public bool IsBlocked => Volatile.Read(ref _blocked) is { Work.IsCompleted: false };
 
     public Result BlockedFailure() => Result.Fail(
-        (_blockedBy ?? new EtabsModalDialogObservation("unknown", string.Empty, false)).ToFailure());
+        (Volatile.Read(ref _blocked)?.By
+            ?? new EtabsModalDialogObservation("unknown", string.Empty, false)).ToFailure());
 
     public async Task<object> GuardAsync(
         Func<int?> ownedPid,
@@ -175,8 +183,7 @@ public sealed class EtabsModalDialogWatchdog(
 
         if (!workTask.IsCompleted)
         {
-            _blocked = workTask;
-            _blockedBy = seen;
+            Volatile.Write(ref _blocked, new BlockedState(workTask, seen));
             _ = workTask.ContinueWith(
                 static task => _ = task.Exception,
                 CancellationToken.None,
@@ -227,35 +234,48 @@ public sealed class EtabsModalDialogWatchdog(
 
     private EtabsModalDialogObservation? Scan(Func<int?> ownedPid)
     {
-        // A fault in the watchdog itself (the pid read, the window walk) must never fail
-        // the command it watches: it is reported and that poll is skipped.
-        int? pid;
-        IReadOnlyList<EtabsDialogWindow> dialogs;
+        // A fault in the watchdog itself (the pid read, the window walk, the dismiss) must
+        // never fault the watch or fail the command it watches. A fault before a dialog is
+        // found skips that poll; a fault while dismissing a dialog that WAS found still
+        // reports the dialog, as left open (dismissed:false) - the box is real, and the
+        // command behind it is blocked whether or not the dismiss could be attempted.
+        int owned;
+        EtabsDialogWindow dialog;
+#pragma warning disable CA1031 // see above: no watchdog fault may surface as a command failure
         try
         {
-            pid = ownedPid();
-            dialogs = pid is { } candidate ? windows.FindModalDialogs(candidate) : [];
+            if (ownedPid() is not { } pid)
+            {
+                return null;
+            }
+
+            var dialogs = windows.FindModalDialogs(pid);
+            if (dialogs.Count == 0)
+            {
+                return null;
+            }
+
+            owned = pid;
+            dialog = dialogs[0];
         }
-#pragma warning disable CA1031 // see above: no watchdog fault may surface as a command failure
         catch (Exception ex)
-#pragma warning restore CA1031
         {
             Console.Error.WriteLine($"⚠ ETABS dialog scan failed: {ex.Message}");
             return null;
         }
 
-        if (pid is not { } owned)
+        bool dismissed;
+        try
         {
-            return null;
+            dismissed = KnownEtabsDialogs.IsOlderVersionBox(dialog) && windows.TryDismiss(dialog);
         }
-
-        if (dialogs.Count == 0)
+        catch (Exception ex)
         {
-            return null;
+            Console.Error.WriteLine($"⚠ ETABS dialog dismiss failed: {ex.Message}");
+            dismissed = false;
         }
+#pragma warning restore CA1031
 
-        var dialog = dialogs[0];
-        var dismissed = KnownEtabsDialogs.IsOlderVersionBox(dialog) && windows.TryDismiss(dialog);
         Console.Error.WriteLine(
             $"⚠ ETABS modal dialog (PID {owned}): title='{dialog.Title}', dismissed={dismissed}");
         return new(

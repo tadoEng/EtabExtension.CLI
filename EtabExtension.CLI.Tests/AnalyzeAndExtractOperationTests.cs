@@ -128,6 +128,7 @@ public sealed class AnalyzeAndExtractOperationTests : IDisposable
             return Result.Ok();
         }
         public ManagedEtabsShutdownResult Shutdown() => throw new NotSupportedException();
+        public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked() => throw new NotSupportedException();
         public void Dispose() { }
     }
 }

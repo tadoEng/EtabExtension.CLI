@@ -17,7 +17,7 @@ public sealed class ServeShutdownCoordinatorTests
         var terminal = Success(forced: true);
         var session = new FakeSession(terminal, events);
         var worker = new ControlledWorker(events);
-        var coordinator = new ServeShutdownCoordinator(worker, session);
+        var coordinator = new ServeShutdownCoordinator(worker, session, NotBlocked);
 
         var first = coordinator.ShutdownAsync();
         var concurrent = coordinator.ShutdownAsync();
@@ -74,7 +74,8 @@ public sealed class ServeShutdownCoordinatorTests
         var worker = new ControlledWorker([]);
         var coordinator = new ServeShutdownCoordinator(
             worker,
-            new FakeSession(terminal, []));
+            new FakeSession(terminal, []),
+            NotBlocked);
 
         var shutdown = coordinator.ShutdownAsync();
         await worker.RunQueuedAsync();
@@ -97,7 +98,7 @@ public sealed class ServeShutdownCoordinatorTests
         var terminal = Success(forced: false);
         var session = new FakeSession(terminal, []);
         var worker = new ControlledWorker([]);
-        var coordinator = new ServeShutdownCoordinator(worker, session);
+        var coordinator = new ServeShutdownCoordinator(worker, session, NotBlocked);
         var shutdown = coordinator.ShutdownAsync();
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
@@ -121,7 +122,7 @@ public sealed class ServeShutdownCoordinatorTests
     {
         var session = new FakeSession(Success(forced: false), []);
         var worker = new ControlledWorker([]);
-        var coordinator = new ServeShutdownCoordinator(worker, session);
+        var coordinator = new ServeShutdownCoordinator(worker, session, NotBlocked);
 
         var disposal = coordinator.DisposeAsync().AsTask();
 
@@ -137,6 +138,154 @@ public sealed class ServeShutdownCoordinatorTests
         Assert.Equal(1, worker.ExecuteCount);
         Assert.Equal(1, session.ShutdownCount);
         Assert.Equal(1, worker.DisposeCount);
+    }
+
+    // ── P2-1: shutdown while a command is blocked on an ETABS dialog ────────────
+
+    /// <summary>
+    /// The DD-5 hang at shutdown, reproduced without ETABS: a REAL STA worker is stuck
+    /// inside a call (as it is inside a cFile.OpenFile a modal box holds), and the REAL
+    /// watchdog has abandoned that command. Shutdown must not queue behind the stuck call: it
+    /// runs the bounded session shutdown on a fresh STA thread and answers within the
+    /// envelope with the exit confirmed, while the worker is still stuck.
+    /// </summary>
+    [Fact]
+    public async Task ShutdownWhileACommandIsBlockedOnADialogDoesNotQueueBehindTheStuckWorker()
+    {
+        using var release = new ManualResetEventSlim();
+        var worker = new StaExecutionWorker(TimeSpan.FromMilliseconds(200));
+        try
+        {
+            var stuck = worker.ExecuteAsync<object>(() =>
+            {
+                release.Wait();
+                return Task.FromResult<object>(Result.Ok());
+            });
+            var watchdog = new EtabsModalDialogWatchdog(
+                new AlwaysOneDialog(),
+                TimeSpan.FromMilliseconds(5),
+                TimeSpan.FromSeconds(1));
+            var opened = Assert.IsType<Result>(await watchdog.GuardAsync(
+                () => 42, () => stuck, TestContext.Current.CancellationToken));
+            Assert.StartsWith("[ETABS_MODAL_DIALOG] ", opened.Error, StringComparison.Ordinal);
+            Assert.True(watchdog.IsBlocked);
+
+            var session = new FakeSession(Success(forced: true), []);
+            var coordinator = new ServeShutdownCoordinator(worker, session, watchdog);
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+
+            var result = await coordinator.ShutdownAsync()
+                .WaitAsync(ServeShutdownCoordinator.BlockedShutdownEnvelope, TestContext.Current.CancellationToken);
+
+            Assert.True(clock.Elapsed < ServeShutdownCoordinator.BlockedShutdownEnvelope);
+            Assert.True(result.Success, result.Error);
+            Assert.True(result.Data!.ProcessExitConfirmed);
+            Assert.Equal(0, session.ShutdownCount);
+            Assert.Equal(1, session.BlockedShutdownCount);
+            Assert.Equal(ApartmentState.STA, session.BlockedShutdownApartment);
+            Assert.Equal("etab-cli-serve-blocked-shutdown", session.BlockedShutdownThreadName);
+
+            // The answer did not wait for the stuck call, and disposal did not either.
+            Assert.False(stuck.IsCompleted);
+            Assert.False(worker.HasStopped);
+        }
+        finally
+        {
+            release.Set();
+        }
+    }
+
+    /// <summary>
+    /// The envelope is the backstop: a blocked-session shutdown that itself hangs still
+    /// answers, as an unconfirmed exit, instead of hanging the daemon.
+    /// </summary>
+    [Fact]
+    public async Task ABlockedSessionShutdownThatHangsAnswersUnconfirmedWithinTheEnvelope()
+    {
+        using var hang = new ManualResetEventSlim();
+        var worker = new ControlledWorker([]);
+        var session = new FakeSession(Success(forced: false), []) { BlockedShutdownGate = hang };
+        var coordinator = new ServeShutdownCoordinator(
+            worker,
+            session,
+            new FixedWatchdog(blocked: true),
+            TimeSpan.FromMilliseconds(200));
+
+        try
+        {
+            var result = await coordinator.ShutdownAsync()
+                .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            Assert.False(result.Success);
+            Assert.False(result.Data!.ProcessExitConfirmed);
+            Assert.True(result.Data.RecordRetained);
+            Assert.Equal(ManagedEtabsShutdownState.ProcessExitUnconfirmed, result.Data.State);
+            Assert.Contains(
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                result.Error,
+                StringComparison.Ordinal);
+            Assert.Equal(0, worker.ExecuteCount);
+            Assert.Equal(1, worker.DisposeCount);
+        }
+        finally
+        {
+            hang.Set();
+        }
+    }
+
+    /// <summary>Mutation guard: an unblocked session keeps the normal STA-worker shutdown.</summary>
+    [Fact]
+    public async Task AnUnblockedSessionStillShutsDownOnTheStaWorker()
+    {
+        var session = new FakeSession(Success(forced: false), []);
+        var worker = new ControlledWorker([]);
+        var coordinator = new ServeShutdownCoordinator(worker, session, NotBlocked);
+
+        var shutdown = coordinator.ShutdownAsync();
+        await worker.RunQueuedAsync();
+        var result = await shutdown;
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(1, worker.ExecuteCount);
+        Assert.Equal(1, session.ShutdownCount);
+        Assert.Equal(0, session.BlockedShutdownCount);
+    }
+
+    /// <summary>Disposal of a worker stuck inside a call returns after its join timeout.</summary>
+    [Fact]
+    public async Task DisposingAWorkerStuckInACallReturnsAfterItsJoinTimeout()
+    {
+        using var release = new ManualResetEventSlim();
+        using var entered = new ManualResetEventSlim();
+        var worker = new StaExecutionWorker(TimeSpan.FromMilliseconds(100));
+        var stuck = worker.ExecuteAsync<object>(() =>
+        {
+            entered.Set();
+            release.Wait();
+            return Task.FromResult<object>(Result.Ok());
+        });
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+
+        try
+        {
+            var dispose = Task.Run(worker.Dispose, TestContext.Current.CancellationToken);
+            await dispose.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.False(worker.HasStopped);
+        }
+        finally
+        {
+            release.Set();
+        }
+
+        // Once the stuck call returns, the abandoned thread ends on its own.
+        await stuck.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!worker.HasStopped && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+
+        Assert.True(worker.HasStopped);
     }
 
     [Fact]
@@ -163,6 +312,26 @@ public sealed class ServeShutdownCoordinatorTests
             ApplicationExitReturnCode: 0,
             OwnedPid: 42);
         return new(true, null, null, data);
+    }
+
+    private static readonly IEtabsModalDialogWatchdog NotBlocked = new FixedWatchdog(blocked: false);
+
+    private sealed class FixedWatchdog(bool blocked) : IEtabsModalDialogWatchdog
+    {
+        public bool IsBlocked => blocked;
+
+        public Task<object> GuardAsync(Func<int?> ownedPid, Func<Task<object>> work, CancellationToken ct) =>
+            work();
+
+        public Result BlockedFailure() => Result.Fail("[ETABS_MODAL_DIALOG] blocked");
+    }
+
+    private sealed class AlwaysOneDialog : IEtabsDialogWindowSource
+    {
+        public IReadOnlyList<EtabsDialogWindow> FindModalDialogs(int pid) =>
+            [new(7, "ETABS", ["Unexpected error in the model file."])];
+
+        public bool TryDismiss(EtabsDialogWindow dialog) => false;
     }
 
     private sealed class ControlledWorker(List<string> events) : IStaExecutionWorker
@@ -245,6 +414,22 @@ public sealed class ServeShutdownCoordinatorTests
         {
             ShutdownCount++;
             events.Add("session-cleanup");
+            return terminal;
+        }
+
+        public int BlockedShutdownCount { get; private set; }
+        public ApartmentState? BlockedShutdownApartment { get; private set; }
+        public string? BlockedShutdownThreadName { get; private set; }
+
+        /// <summary>Holds the blocked-session shutdown, to exercise the envelope.</summary>
+        public ManualResetEventSlim? BlockedShutdownGate { get; init; }
+
+        public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked()
+        {
+            BlockedShutdownCount++;
+            BlockedShutdownApartment = Thread.CurrentThread.GetApartmentState();
+            BlockedShutdownThreadName = Thread.CurrentThread.Name;
+            BlockedShutdownGate?.Wait();
             return terminal;
         }
 

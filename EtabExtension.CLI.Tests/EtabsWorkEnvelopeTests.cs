@@ -256,6 +256,7 @@ public sealed class EtabsWorkEnvelopeTests
 
         public void MarkVisibilityStage(string stage) => Stages.Add(stage);
         public ManagedEtabsShutdownResult Shutdown() => throw new NotSupportedException();
+        public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked() => throw new NotSupportedException();
         public void Dispose() { }
     }
 }

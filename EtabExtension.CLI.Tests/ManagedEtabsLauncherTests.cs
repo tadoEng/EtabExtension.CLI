@@ -860,6 +860,39 @@ public sealed class ManagedEtabsLauncherTests
     }
 
     /// <summary>
+    /// P3-4(d): a failed start whose own process is already gone, beside the sibling
+    /// daemon's ETABS (exact record match). The survivor resolution sees only the sibling,
+    /// excludes it, resolves clean with no owned pid, and terminates nothing.
+    /// </summary>
+    [Fact]
+    public void AFailedStartWhoseProcessIsGoneNeverTerminatesTheSiblingsEtabs()
+    {
+        var processes = new FakeProcesses
+        {
+            Preflight = [SiblingEtabs],
+            AfterStart = [SiblingEtabs],
+            ExactTerminationResult = new(ExactProcessTerminationState.ConfirmedGone, SiblingEtabs)
+        };
+        var launcher = new ManagedEtabsLauncher(
+            new SiblingAwareProcessInspector(
+                processes,
+                new FixedSiblingRecord(SiblingRecord(SiblingEtabs.ProcessStartTimeUtc))),
+            new FakeResolver(Identity.ExecutablePath),
+            new NullReturningApiFactory(),
+            new FakeVersionProbe(),
+            TextWriter.Null);
+
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+
+        Assert.Equal(EtabsLaunchErrorCodes.ApiObjectCreationFailed, error.Code);
+        Assert.Equal(0, processes.TerminateExactCalls);
+        Assert.NotNull(error.Cleanup);
+        Assert.True(error.Cleanup!.Success);
+        Assert.True(error.Cleanup.Data.ProcessExitConfirmed);
+        Assert.Null(error.Cleanup.Data.OwnedPid);
+    }
+
+    /// <summary>
     /// §2.7 / DD-5: an API-started ETABS asks "started using the API… continue closing?" when
     /// its window is closed, so exit goes through cOAPI.ApplicationExit(false) - never a
     /// window close, never a save.

@@ -9,12 +9,26 @@ public interface IStaExecutionWorker : IDisposable
 
 public sealed class StaExecutionWorker : IStaExecutionWorker
 {
+    /// <summary>
+    /// How long disposal waits for the STA thread. A work item stuck inside a CSI call that
+    /// a modal ETABS dialog holds never returns on its own (review finding P2-1); disposal
+    /// must not hang the daemon's exit on it.
+    /// </summary>
+    public static readonly TimeSpan DefaultDisposeJoinTimeout = TimeSpan.FromSeconds(5);
+
     private readonly BlockingCollection<IWorkItem> _work = new();
     private readonly Thread _thread;
+    private readonly TimeSpan _disposeJoinTimeout;
     private bool _disposed;
 
     public StaExecutionWorker()
+        : this(DefaultDisposeJoinTimeout)
     {
+    }
+
+    internal StaExecutionWorker(TimeSpan disposeJoinTimeout)
+    {
+        _disposeJoinTimeout = disposeJoinTimeout;
         if (!OperatingSystem.IsWindows())
         {
             throw new PlatformNotSupportedException("The ETABS STA worker requires Windows");
@@ -56,12 +70,29 @@ public sealed class StaExecutionWorker : IStaExecutionWorker
         }
         _disposed = true;
         _work.CompleteAdding();
-        if (Thread.CurrentThread != _thread)
+        if (Thread.CurrentThread == _thread)
         {
-            _thread.Join();
+            _work.Dispose();
+            return;
         }
-        _work.Dispose();
+
+        if (_thread.Join(_disposeJoinTimeout))
+        {
+            _work.Dispose();
+            return;
+        }
+
+        // Still inside a work item. The thread is a background thread and goes with the
+        // process; the queue is left undisposed so that, if the stuck call does return
+        // later, its consuming loop ends on CompleteAdding instead of throwing
+        // ObjectDisposedException on a thread nobody is watching.
+        Console.Error.WriteLine(
+            "⚠ The ETABS STA worker did not stop within " +
+            $"{_disposeJoinTimeout.TotalSeconds:0.###}s (a call is still blocked); abandoning it.");
     }
+
+    /// <summary>True once the STA thread has finished. For tests and diagnostics.</summary>
+    internal bool HasStopped => !_thread.IsAlive;
 
     private interface IWorkItem
     {
