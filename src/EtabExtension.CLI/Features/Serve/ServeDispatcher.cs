@@ -548,7 +548,8 @@ public sealed class ServeDispatcher : IServeDispatcher
                     Path.GetFullPath(saved.Data.FilePath),
                     StringComparison.OrdinalIgnoreCase))
             {
-                var refreshed = _session.RecordOpenedDocument(recorded with { FileId = fileId });
+                // PASSIVE: after the save a failed verification must never be able to end ETABS.
+                var refreshed = _session.RefreshRecordedDocument(recorded with { FileId = fileId });
                 if (!refreshed.Success)
                 {
                     Console.Error.WriteLine($"⚠ The saved document's file id could not be re-recorded: {refreshed.Error}");

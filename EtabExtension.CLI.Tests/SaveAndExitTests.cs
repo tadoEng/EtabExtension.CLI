@@ -1974,3 +1974,55 @@ public sealed class SaveAndExitFixRound2Tests
         rig.AssertNeverExited();
     }
 }
+
+/// <summary>Fix round 2b: the save-model record refresh is passive too.</summary>
+public sealed class SaveAndExitFixRound2bTests
+{
+    private const string NewId = "00020000-0000000000003500";
+
+    private sealed class InspectionBreaksAfterSave(Action afterSave) : ISaveModelService
+    {
+        private Result<SaveModelData> Answer() 
+        {
+            afterSave();
+            return Result.Ok(new SaveModelData
+            {
+                FilePath = SaveAndExitRig.Edb,
+                SavedStamp = new SavedStamp(NewId, 1, SaveAndExitRig.Saved, "unsupported", false)
+            });
+        }
+
+        public Task<Result<SaveModelData>> SaveModelAsync(string filePath) => Task.FromResult(Answer());
+
+        public Task<Result<SaveModelData>> SaveModelOnAppAsync(ETABSApplication app, string filePath) =>
+            Task.FromResult(Answer());
+    }
+
+    // Real session: save-model succeeds, process inspection then fails. The refresh adopts the id and
+    // ends nothing. Mutation: the refresh goes back through RecordOpenedDocument / GetOrStartOwned.
+    [Fact]
+    public void ASaveModelWhoseLaterProcessInspectionFailsEndsNothingAndStillRefreshesTheRecord()
+    {
+        var sessionRig = new SessionRig();
+        _ = sessionRig.Session.GetOrStartOwned();
+        Assert.True(sessionRig.Session.RecordOpenedDocument(
+            new EtabsDocumentRecord(Path.GetFullPath(SaveAndExitRig.Edb), SaveAndExitRig.FileId)).Success);
+        var dispatcher = DispatcherRig.Create(
+            sessionRig.Session,
+            new ProbeWatchdog(),
+            save: new InspectionBreaksAfterSave(() => sessionRig.L.Census.Live = null));
+
+        // The fake ETABS API cannot be exposed through GetOrStart, so the post-save step runs directly.
+        var saved = new InspectionBreaksAfterSave(() => sessionRig.L.Census.Live = null)
+            .SaveModelAsync(SaveAndExitRig.Edb).Within("the save");
+        _ = typeof(ServeDispatcher)
+            .GetMethod("RecordSavedDocument", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .Invoke(dispatcher, [saved]);
+
+        Assert.Equal(0, sessionRig.L.Api.ExitCount);
+        Assert.Equal(0, sessionRig.L.Process.KillCount);
+        Assert.True(sessionRig.Session.IsStarted);
+        Assert.Equal(NewId, sessionRig.Session.ReadRecordedDocument()!.FileId);
+    }
+}
+
