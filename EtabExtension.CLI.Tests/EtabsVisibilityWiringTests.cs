@@ -1,4 +1,4 @@
-﻿// Copyright (c) Thanh Tu. All rights reserved.
+// Copyright (c) Thanh Tu. All rights reserved.
 // Licensed under the MIT License.
 
 using System.Globalization;
@@ -474,31 +474,25 @@ public sealed class EtabsVisibilityWiringTests
         var ownership = IndexOfCall(
             launch,
             "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
-            ".CensusExactlyOneOwnedProcess");
-        var handle = IndexOfCall(
-            launch,
-            $"{typeof(IProcessInspector).FullName}.{nameof(IProcessInspector.OpenExact)}");
+            ".StartProcess");
         var arm = IndexOfCall(
             launch,
             "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
             ".ActivateWindowGuard");
-        var start = IndexOfCall(
+        var attach = IndexOfCall(
             launch,
             "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
-            ".StartApplication");
+            ".Attach");
 
         Assert.True(
-            ownership < handle,
-            "The ownership census must precede the authoritative handle it is opened from.");
+            ownership < arm,
+            "Window suppression may only be armed over a handle this launch created " +
+            "(Process.Start). Arming from anything less is the global-PID failure this repair " +
+            "must not have.");
         Assert.True(
-            handle < arm,
-            "Window suppression may only be armed over a handle whose identity is proven. " +
-            "Arming from anything less is the global-PID failure this repair must not have.");
-        Assert.True(
-            arm < start,
-            "Window suppression must be armed BEFORE ApplicationStart. #20 measured a real " +
-            "ETABS window on screen for 5.19 s inside that call, so a guard armed after it " +
-            "returns is a guard that was down for the entire defect.");
+            arm < attach,
+            "Window suppression must be armed BEFORE the attach and everything after it, so a " +
+            "guard armed after them is a guard that was down for the entire startup.");
     }
 
     /// <summary>
@@ -701,7 +695,7 @@ public sealed class EtabsVisibilityWiringTests
         Assert.Contains(
             "System.IDisposable.Dispose",
             Calls("EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
-                ".CleanUpFailedStart"),
+                ".Launch"),
             StringComparer.Ordinal);
     }
 
@@ -757,7 +751,7 @@ public sealed class EtabsVisibilityWiringTests
                 || method.Key == $"{typeof(ManagedEtabsVisibility).FullName}.Ensure"
                 || method.Key ==
                     "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
-                    ".CensusExactlyOneOwnedProcess")
+                    ".Attach")
             .Where(method => method.Value.Any(
                 call => WallClockReads.Contains(call, StringComparer.Ordinal)))
             .Select(method => method.Key)
@@ -776,8 +770,6 @@ public sealed class EtabsVisibilityWiringTests
     // wait at all. There is nothing to converge on when cOAPI.Visible() is not an oracle
     // in either direction, so it issues the transition and hands the question to the
     // Windows census rather than polling a flag that does not move.
-    [InlineData("EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
-        ".CensusExactlyOneOwnedProcess")]
     [InlineData("EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsWindowGuard" +
         ".Confirm")]
     public void EachBoundedWaitMeasuresItselfThroughTheMonotonicSeam(string site)
@@ -791,6 +783,26 @@ public sealed class EtabsVisibilityWiringTests
         Assert.Contains(
             $"{typeof(IManagedEtabsClock).FullName}.{nameof(IManagedEtabsClock.ElapsedSince)}",
             calls,
+            StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// The launcher's startup deadline is measured through the same seam: it takes its start
+    /// timestamp in <c>Launch</c> (before Process.Start) and the attach loop measures against it.
+    /// </summary>
+    [Fact]
+    public void TheStartupDeadlineIsMeasuredThroughTheMonotonicSeam()
+    {
+        const string launcher =
+            "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher";
+
+        Assert.Contains(
+            $"{typeof(IManagedEtabsClock).FullName}.get_{nameof(IManagedEtabsClock.Timestamp)}",
+            Calls($"{launcher}.Launch"),
+            StringComparer.Ordinal);
+        Assert.Contains(
+            $"{typeof(IManagedEtabsClock).FullName}.{nameof(IManagedEtabsClock.ElapsedSince)}",
+            Calls($"{launcher}.Attach"),
             StringComparer.Ordinal);
     }
 

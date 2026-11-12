@@ -45,11 +45,16 @@ public interface IEtabsSession : IDisposable
 
 public sealed class EtabsSession : IEtabsSession
 {
+    /// <summary>How long a blocked-worker shutdown waits for the session gate (card I6).</summary>
+    public static readonly TimeSpan BlockedShutdownGateWait = TimeSpan.FromSeconds(2);
+
     private readonly IManagedEtabsLauncher _launcher;
     private readonly IProcessInspector _processes;
     private readonly ISessionRecordStore _records;
     private readonly IManagedEtabsShutdownMachine _shutdownMachine;
     private readonly IEtabsWorkScope _work;
+    private readonly LaunchPublicationCell _cell;
+    private readonly TimeSpan _gateWait;
     private string? _commandStage;
 
     // Borrowed, never owned: this is Console.Error in production and a test's buffer under
@@ -59,11 +64,16 @@ public sealed class EtabsSession : IEtabsSession
         "CA2213:Disposable fields should be disposed",
         Justification = "The diagnostics writer is owned by the caller, not by the session.")]
     private readonly TextWriter _diagnostics;
+
+    // Guards the fields below, and ONLY them. Nothing that must stay observable while a
+    // launch or a stuck command holds it (the pid, readiness, the lifecycle) lives behind it.
     private readonly object _gate = new();
     private IManagedEtabsApplication? _owned;
-    private bool _ready;
     private EtabsLaunchException? _launchFailure;
     private ManagedEtabsShutdownResult? _shutdownResult;
+
+    // The current attempt's shared state. Written under the gate, read lock-free.
+    private EtabsLaunchState? _launch;
 
     public EtabsSession(
         IManagedEtabsLauncher launcher,
@@ -71,6 +81,24 @@ public sealed class EtabsSession : IEtabsSession
         ISessionRecordStore records,
         IEtabsWorkScope work)
         : this(launcher, processes, records, new ManagedEtabsShutdownMachine(records), work)
+    {
+    }
+
+    public EtabsSession(
+        IManagedEtabsLauncher launcher,
+        IProcessInspector processes,
+        ISessionRecordStore records,
+        IEtabsWorkScope work,
+        LaunchPublicationCell cell)
+        : this(
+            launcher,
+            processes,
+            records,
+            new ManagedEtabsShutdownMachine(records),
+            work,
+            Console.Error,
+            cell,
+            BlockedShutdownGateWait)
     {
     }
 
@@ -91,6 +119,27 @@ public sealed class EtabsSession : IEtabsSession
         IManagedEtabsShutdownMachine shutdownMachine,
         IEtabsWorkScope work,
         TextWriter diagnostics)
+        : this(
+            launcher,
+            processes,
+            records,
+            shutdownMachine,
+            work,
+            diagnostics,
+            new LaunchPublicationCell(),
+            BlockedShutdownGateWait)
+    {
+    }
+
+    internal EtabsSession(
+        IManagedEtabsLauncher launcher,
+        IProcessInspector processes,
+        ISessionRecordStore records,
+        IManagedEtabsShutdownMachine shutdownMachine,
+        IEtabsWorkScope work,
+        TextWriter diagnostics,
+        LaunchPublicationCell cell,
+        TimeSpan gateWait)
     {
         _launcher = launcher;
         _processes = processes;
@@ -98,19 +147,24 @@ public sealed class EtabsSession : IEtabsSession
         _shutdownMachine = shutdownMachine;
         _work = work;
         _diagnostics = diagnostics;
+        _cell = cell;
+        _gateWait = gateWait;
     }
 
-    public bool IsStarted
-    {
-        get
-        {
-            lock (_gate)
-            {
-                return _owned is not null && _ready;
-            }
-        }
-    }
-    public int? ProcessId { get { lock (_gate) return _owned?.Identity.Pid; } }
+    /// <summary>
+    /// Owned and committed. Lock-free (card I3): a launch holds the gate for its whole
+    /// duration, and a reader of this must never wait for it.
+    /// </summary>
+    public bool IsStarted =>
+        Volatile.Read(ref _launch) is { IsReady: true } launch
+        && launch.Publication.Identity is not null;
+
+    /// <summary>
+    /// The pid of the launching or running ETABS, published the moment its identity is
+    /// known and cleared only after a confirmed exit. Lock-free: the watchdog reads it while
+    /// the launch still holds the gate.
+    /// </summary>
+    public int? ProcessId => _cell.Identity?.Pid;
 
     public ETABSApplication GetOrStart() => GetOrStartOwned().Application;
 
@@ -131,11 +185,11 @@ public sealed class EtabsSession : IEtabsSession
 
             if (_owned is null)
             {
-                // THE consent gate. Before CreateObject, before anything is started, and
-                // before any diagnostic claims a start is under way.
+                // THE consent gate. Before anything is started, and before any diagnostic
+                // claims a start is under way.
                 //
-                // It guards a COLD start only. A session that already exists — hidden, or
-                // deliberately shown to the engineer — serves later background work without
+                // It guards a COLD start only. A session that already exists - hidden, or
+                // deliberately shown to the engineer - serves later background work without
                 // asking again, because nothing about reusing it puts a new window on
                 // screen. It is process CREATION that the engineer had to agree to.
                 RequireVisibleStartConsent();
@@ -143,57 +197,42 @@ public sealed class EtabsSession : IEtabsSession
                 _diagnostics.WriteLine(
                     "ℹ Starting ETABS (shared serve session; declared start intent: " +
                     $"{_work.Current.StartIntent})...");
-                var launched = Launch();
+                var state = new EtabsLaunchState(_records, _cell);
+                Volatile.Write(ref _launch, state);
+                state.MarkBegun();
+                var launched = Launch(state);
                 _owned = launched;
+
+                // A launcher that did not publish (a test double) is published here, so the
+                // pid is observable from this point on.
+                state.PublishIfAbsent(launched.Identity);
+                state.AdoptRecordId(launched.ManagedLaunchRecordId);
                 try
                 {
-                    _records.Write(ToRecord(launched));
+                    state.EnsureProvisionalRecord(launched.Identity);
                 }
                 catch (Exception recordWriteException)
                 {
-                    var cleanup = _shutdownMachine
-                        .ShutdownAfterRecoveryRecordWriteFailure(launched);
-                    _shutdownResult = cleanup;
-                    if (cleanup.Data.ProcessExitConfirmed)
-                    {
-                        _owned = null;
-                    }
-                    _ready = false;
-                    _launchFailure = new EtabsLaunchException(
-                        EtabsLaunchErrorCodes.RecoveryRecordWriteFailed,
-                        WithTerminalFacts(
-                            EtabsApiDiagnosticFormatter.InfrastructureException(
-                                "ManagedEtabsSessionRecord.Write",
-                                recordWriteException),
-                            cleanup),
-                        recordWriteException);
-                    throw _launchFailure;
+                    throw FailRecordWrite(state, launched, recordWriteException);
                 }
 
-                // Readiness and hidden state are one gate, not two. The candidate #20
-                // rejected treated the hide as advisory and printed a "started hidden"
-                // success line straight after failing to confirm it; here an unconfirmed
-                // hidden state ends the session on the same path a failed
-                // InitializeNewModel does, so that line can only ever follow a proof.
-                //
-                // What is proven changed after #20: the gate is the exact-owned Windows
-                // census, not cOAPI.Visible(). InitializeNewModel is precisely when ETABS
-                // builds the (Untitled) model behind its frame, so this second census is
-                // where a window that surfaced during initialization has to be accounted
-                // for — the guard will already have taken it down on the window event.
+                if (state.Lifecycle != LaunchLifecycle.Launching)
+                {
+                    throw AbortedWhileLaunching(state);
+                }
+
+                // Readiness and hidden state are one gate, not two (CLI #20/#24): an
+                // unconfirmed hidden state ends the session on the same path a failed
+                // InitializeNewModel does, so "started hidden" can only follow a proof.
                 launched.MarkVisibilityStage("cSapModel.InitializeNewModel");
                 var creationFailure = Initialize(launched)
                     ?? CompleteReadiness(launched)
                     ?? ConfirmHiddenForBackgroundWork(launched);
                 if (creationFailure is not null)
                 {
+                    _ = state.TryTransition(LaunchLifecycle.Launching, LaunchLifecycle.Terminating);
                     var cleanup = _shutdownMachine.Shutdown(launched);
-                    _shutdownResult = cleanup;
-                    if (cleanup.Data.ProcessExitConfirmed)
-                    {
-                        _owned = null;
-                    }
-                    _ready = false;
+                    AfterShutdown(state, cleanup);
                     _launchFailure = new EtabsLaunchException(
                         creationFailure.Value.Code,
                         WithTerminalFacts(
@@ -203,7 +242,7 @@ public sealed class EtabsSession : IEtabsSession
                     throw _launchFailure;
                 }
 
-                _ready = true;
+                Commit(state, launched);
                 _diagnostics.WriteLine($"✓ ETABS started hidden (PID {_owned.Identity.Pid})");
 
                 // The launch owned the stage until now. Hand it back to whatever command
@@ -215,9 +254,10 @@ public sealed class EtabsSession : IEtabsSession
                 }
             }
 
+            var current = Volatile.Read(ref _launch);
             try
             {
-                if (!_ready)
+                if (current is not { IsReady: true })
                 {
                     throw new InvalidOperationException(
                         "Managed ETABS session is owned but not API-ready.");
@@ -227,14 +267,105 @@ public sealed class EtabsSession : IEtabsSession
             }
             catch
             {
-                _shutdownResult = _shutdownMachine.Shutdown(_owned);
-                if (_shutdownResult.Data.ProcessExitConfirmed)
+                _ = current?.TryBeginReadyTermination();
+                var cleanup = _shutdownMachine.Shutdown(_owned);
+                _shutdownResult = cleanup;
+                if (current is not null)
                 {
-                    _owned = null;
+                    AfterShutdown(current, cleanup);
                 }
-                _ready = false;
                 throw;
             }
+        }
+    }
+
+    /// <summary>
+    /// The one commit point (card W1, X1): the launch wins <c>Launching → Committing</c> or
+    /// loses to a shutdown that already won Terminating. The final record is written inside
+    /// the short Committing window and Ready is reached only by the final compare-exchange,
+    /// so a shutdown that timed out waiting (X1) can never be followed by a Ready.
+    /// </summary>
+    private void Commit(EtabsLaunchState state, IManagedEtabsApplication launched)
+    {
+        if (!state.TryTransition(LaunchLifecycle.Launching, LaunchLifecycle.Committing))
+        {
+            throw AbortedWhileLaunching(state);
+        }
+
+        try
+        {
+            state.WriteFinalRecord(launched.Identity);
+        }
+        catch (Exception recordWriteException)
+        {
+            _ = state.TryTransition(LaunchLifecycle.Committing, LaunchLifecycle.Terminating);
+            throw FailRecordWrite(state, launched, recordWriteException);
+        }
+
+        if (!state.TryTransition(LaunchLifecycle.Committing, LaunchLifecycle.Ready))
+        {
+            // The shutdown took Terminating from the stalled commit. It kills through the
+            // lease and answers; this side never reports Ready, and clears the record it
+            // wrote only if that exit is confirmed (card Y1).
+            _ = state.ClearRecordAfterConfirmedExit(() => launched.HasExited);
+            throw AbortedWhileLaunching(state);
+        }
+    }
+
+    private EtabsLaunchException FailRecordWrite(
+        EtabsLaunchState state,
+        IManagedEtabsApplication launched,
+        Exception recordWriteException)
+    {
+        _ = state.TryTransition(LaunchLifecycle.Launching, LaunchLifecycle.Terminating);
+        var cleanup = _shutdownMachine.ShutdownAfterRecoveryRecordWriteFailure(launched);
+        AfterShutdown(state, cleanup);
+        _launchFailure = new EtabsLaunchException(
+            EtabsLaunchErrorCodes.RecoveryRecordWriteFailed,
+            WithTerminalFacts(
+                EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "ManagedEtabsSessionRecord.Write",
+                    recordWriteException),
+                cleanup),
+            recordWriteException);
+        return _launchFailure;
+    }
+
+    /// <summary>
+    /// A shutdown or the startup supervisor took the launch while this thread was still
+    /// inside it. The terminator answered for the process; this side records that answer as
+    /// the session's terminal state and fails the request.
+    /// </summary>
+    private EtabsLaunchException AbortedWhileLaunching(EtabsLaunchState state)
+    {
+        var result = state.TerminationResult
+            ?? state.TerminateLaunch(ManagedEtabsLauncher.ForcedExitTimeout)
+            ?? EtabsLaunchState.Failed(
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                "The launch was ended before it committed.",
+                state.Publication.Identity?.Pid,
+                forced: false,
+                recordRetained: true);
+        _shutdownResult ??= result;
+        if (result.Data.ProcessExitConfirmed)
+        {
+            _owned = null;
+        }
+
+        return new EtabsLaunchException(
+            state.TimedOut ? EtabsLaunchErrorCodes.StartTimeout : EtabsLaunchErrorCodes.LaunchAborted,
+            WithTerminalFacts("The managed ETABS launch was ended before it committed.", result));
+    }
+
+    /// <summary>Settles the lifecycle and the publication after a shutdown answered.</summary>
+    private void AfterShutdown(EtabsLaunchState state, ManagedEtabsShutdownResult cleanup)
+    {
+        _shutdownResult = cleanup;
+        if (cleanup.Data.ProcessExitConfirmed)
+        {
+            _owned = null;
+            state.ClearPublication();
+            state.MarkEnded();
         }
     }
 
@@ -255,14 +386,15 @@ public sealed class EtabsSession : IEtabsSession
     /// </summary>
     private Result EndUncertainSession(IManagedEtabsApplication owned, string diagnostic)
     {
+        var current = Volatile.Read(ref _launch);
+        _ = current?.TryBeginReadyTermination();
         var cleanup = _shutdownMachine.Shutdown(owned);
         _shutdownResult = cleanup;
-        if (cleanup.Data.ProcessExitConfirmed)
+        if (current is not null)
         {
-            _owned = null;
+            AfterShutdown(current, cleanup);
         }
 
-        _ready = false;
         return Result.Fail(WithTerminalFacts(diagnostic, cleanup));
     }
 
@@ -319,17 +451,23 @@ public sealed class EtabsSession : IEtabsSession
     /// success with <c>processExitConfirmed=true</c> — a clean answer about a process
     /// nobody resolved.</para>
     /// </summary>
-    private IManagedEtabsApplication Launch()
+    private IManagedEtabsApplication Launch(EtabsLaunchState state)
     {
         try
         {
-            return _launcher.Launch();
+            return _launcher.Launch(state);
         }
         catch (EtabsLaunchException failure) when (failure.Cleanup is { Success: false })
         {
+            _ = state.TryTransition(LaunchLifecycle.Launching, LaunchLifecycle.Terminating);
             _shutdownResult = failure.Cleanup;
             _launchFailure = failure;
-            _ready = false;
+            throw;
+        }
+        catch
+        {
+            // A failed attempt is over, whatever the reason: it can no longer commit.
+            _ = state.TryTransition(LaunchLifecycle.Launching, LaunchLifecycle.Terminating);
             throw;
         }
     }
@@ -479,7 +617,7 @@ public sealed class EtabsSession : IEtabsSession
             // memory, nobody reapplied the command's label afterwards and an exposure
             // during the actual work was filed under a stage that had already finished.
             _commandStage = stage;
-            if (_owned is not null && _ready)
+            if (_owned is not null && IsStarted)
             {
                 _owned.MarkVisibilityStage(stage);
             }
@@ -506,7 +644,7 @@ public sealed class EtabsSession : IEtabsSession
     {
         lock (_gate)
         {
-            if (_owned is null || !_ready)
+            if (_owned is null || !IsStarted)
             {
                 return Result.Ok();
             }
@@ -629,39 +767,184 @@ public sealed class EtabsSession : IEtabsSession
         }
     }
 
-    public ManagedEtabsShutdownResult Shutdown() => ShutdownWith(_shutdownMachine.Shutdown);
+    public ManagedEtabsShutdownResult Shutdown() =>
+        ShutdownWith(_shutdownMachine.Shutdown, workerBlocked: false);
 
     /// <inheritdoc />
     public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked() =>
-        ShutdownWith(_shutdownMachine.ShutdownWhileWorkerBlocked);
+        ShutdownWith(_shutdownMachine.ShutdownWhileWorkerBlocked, workerBlocked: true);
 
     private ManagedEtabsShutdownResult ShutdownWith(
-        Func<IManagedEtabsApplication, ManagedEtabsShutdownResult> shutdown)
+        Func<IManagedEtabsApplication, ManagedEtabsShutdownResult> shutdown,
+        bool workerBlocked)
     {
+        var launch = Volatile.Read(ref _launch);
+
+        // 1. A launch that has not reached Ready is arbitrated by the lifecycle alone, with
+        //    no gate: the launching thread holds the gate for its whole duration (card W1).
+        if (launch is { Began: true })
+        {
+            if (launch.Lifecycle == LaunchLifecycle.Committing)
+            {
+                // The commit is short: give it the bounded window (card X1). If it is
+                // stalled, TerminateLaunch wins Committing -> Terminating below.
+                _ = launch.WaitForCommitOrRelease(EtabsLaunchState.CommitWait);
+            }
+
+            if (launch.Lifecycle is LaunchLifecycle.Launching or LaunchLifecycle.Committing)
+            {
+                var early = launch.TerminateLaunch(ManagedEtabsLauncher.ForcedExitTimeout);
+                if (early is not null)
+                {
+                    _diagnostics.WriteLine("ℹ Shared ETABS session shut down during its launch.");
+                    return early;
+                }
+            }
+        }
+
+        // 2. Ready, or nothing started: the gate guards the session's own fields.
+        if (workerBlocked)
+        {
+            // Never wait on a gate a stuck command may hold for ever (card I6).
+            if (!Monitor.TryEnter(_gate, _gateWait))
+            {
+                return ShutdownThroughTheHandle(launch);
+            }
+
+            try
+            {
+                return ShutdownLocked(shutdown, launch);
+            }
+            finally
+            {
+                Monitor.Exit(_gate);
+            }
+        }
+
         lock (_gate)
         {
-            if (_shutdownResult is not null)
-            {
-                return _shutdownResult;
-            }
+            return ShutdownLocked(shutdown, launch);
+        }
+    }
 
-            if (_owned is null)
-            {
-                var record = _records.Read();
-                _shutdownResult = record is null
-                    ? NoOwnedProcessSuccess()
-                    : NoOwnedProcessFailure(record);
-                return _shutdownResult;
-            }
-
-            _shutdownResult = shutdown(_owned);
-            if (_shutdownResult.Data.ProcessExitConfirmed)
-            {
-                _owned = null;
-            }
-            _ready = false;
-            _diagnostics.WriteLine("ℹ Shared ETABS session shut down.");
+    private ManagedEtabsShutdownResult ShutdownLocked(
+        Func<IManagedEtabsApplication, ManagedEtabsShutdownResult> shutdown,
+        EtabsLaunchState? launch)
+    {
+        if (_shutdownResult is not null)
+        {
             return _shutdownResult;
+        }
+
+        if (launch is { Lifecycle: LaunchLifecycle.Ended, TerminationResult: { } prior })
+        {
+            // A handle-only terminator already ended this session and answered; the normal
+            // path has nothing left to do and must not judge the (cleared) record.
+            _shutdownResult = prior;
+            _owned = null;
+            return prior;
+        }
+
+        if (_owned is null)
+        {
+            var record = _records.Read();
+            _shutdownResult = record is null
+                ? NoOwnedProcessSuccess()
+                : NoOwnedProcessFailure(record);
+            return _shutdownResult;
+        }
+
+        // The terminal fence goes up BEFORE the shutdown acts (card W1).
+        _ = launch?.TryBeginReadyTermination();
+        _shutdownResult = shutdown(_owned);
+        if (launch is not null)
+        {
+            AfterShutdown(launch, _shutdownResult);
+        }
+        else if (_shutdownResult.Data.ProcessExitConfirmed)
+        {
+            _owned = null;
+        }
+
+        _diagnostics.WriteLine("ℹ Shared ETABS session shut down.");
+        return _shutdownResult;
+    }
+
+    /// <summary>
+    /// The gate is unavailable: act ONLY through the authoritative handle, and mutate none
+    /// of the gate-guarded fields (card I6, A4). The exit is bounded, the record is cleared
+    /// only after a confirmed exit, and the publication likewise.
+    /// </summary>
+    private ManagedEtabsShutdownResult ShutdownThroughTheHandle(EtabsLaunchState? launch)
+    {
+        _ = launch?.TryBeginReadyTermination();
+        var owned = Volatile.Read(ref _owned);
+        var pid = _cell.Identity?.Pid;
+        if (owned is null || launch is null)
+        {
+            return EtabsLaunchState.Failed(
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                "The session gate is held and no authoritative process handle is available.",
+                pid,
+                forced: false,
+                recordRetained: true);
+        }
+
+        Console.Error.WriteLine(
+            "⚠ The session gate is held by a stuck command; ending the exact owned ETABS " +
+            $"(PID {pid}) through its authoritative handle.");
+        var forced = false;
+        bool confirmed;
+        string? error = null;
+        try
+        {
+            if (!owned.HasExited)
+            {
+                forced = true;
+                owned.Kill();
+            }
+
+            confirmed = owned.HasExited || owned.WaitForExit(ManagedEtabsShutdownMachine.ForcedExitTimeout);
+        }
+#pragma warning disable CA1031 // an unconfirmed exit is reported, never thrown
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            error = EtabsApiDiagnosticFormatter.InfrastructureException(
+                "Process.Kill(authoritative-owned-handle)",
+                exception);
+            confirmed = SafeHasExited(owned);
+        }
+
+        if (!confirmed)
+        {
+            return EtabsLaunchState.Failed(
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                error ?? "The exact owned ETABS process did not confirm exit after forced termination.",
+                pid,
+                forced: true,
+                recordRetained: _records.Read() is not null);
+        }
+
+        var retained = launch.ClearRecordAfterConfirmedExit(() => owned.HasExited);
+        launch.ClearPublication();
+        launch.MarkEnded();
+        var answer = EtabsLaunchState.Succeeded(pid, forced, retained);
+        launch.RecordTerminationResult(answer);
+        return answer;
+    }
+
+    private static bool SafeHasExited(IManagedEtabsApplication owned)
+    {
+        try
+        {
+            return owned.HasExited;
+        }
+#pragma warning disable CA1031 // unknown means unconfirmed
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            return false;
         }
     }
 
@@ -694,12 +977,4 @@ public sealed class EtabsSession : IEtabsSession
             RecordRetained: true,
             ApplicationExitReturnCode: null,
             OwnedPid: record.Pid));
-
-    private static ManagedEtabsSessionRecord ToRecord(IManagedEtabsApplication owned) => new(
-        1,
-        owned.Identity.Pid,
-        owned.Identity.ProcessStartTimeUtc,
-        Path.GetFullPath(owned.Identity.ExecutablePath),
-        owned.ManagedLaunchRecordId,
-        DateTimeOffset.UtcNow);
 }

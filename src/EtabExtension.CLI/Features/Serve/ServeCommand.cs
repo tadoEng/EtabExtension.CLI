@@ -60,7 +60,10 @@ public static class ServeCommand
                     paths.SessionRecordPath ?? JsonSessionRecordStore.DefaultPath,
                     StringComparison.OrdinalIgnoreCase))
             {
-                // Our own process would otherwise be classified as the sibling's.
+                // Early warning only (card I4). The authority is the published own identity,
+                // which the census removes from the sibling set, so an alias this string
+                // comparison cannot see (a junction, a hard link, a copied record) still
+                // cannot make our own ETABS look like the sibling's.
                 Console.Error.WriteLine("⚠ --sibling-record names this daemon's own record; ignored.");
                 paths.SiblingRecordPath = null;
             }

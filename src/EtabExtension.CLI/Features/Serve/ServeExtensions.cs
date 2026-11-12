@@ -14,13 +14,15 @@ public static class ServeExtensions
         // so the shared ETABS session is a single instance for that run and the
         // dispatcher can depend on the scoped feature services.
         services.AddScoped<ServeSessionPaths>();
+        services.AddScoped<LaunchPublicationCell>();
         services.AddScoped<ISessionRecordStore>(provider => new JsonSessionRecordStore(
             provider.GetRequiredService<ServeSessionPaths>().SessionRecordPath));
         services.AddScoped<IProcessInspector>(provider => new SiblingAwareProcessInspector(
             new WindowsProcessInspector(),
             provider.GetRequiredService<ServeSessionPaths>().SiblingRecordPath is { } sibling
                 ? new JsonSiblingRecordSource(sibling)
-                : new NoSiblingRecordSource()));
+                : new NoSiblingRecordSource(),
+            provider.GetRequiredService<LaunchPublicationCell>()));
         services.AddScoped<IEtabsModalDialogWatchdog, EtabsModalDialogWatchdog>();
         services.AddScoped<IEtabsInstalledVersion>(provider => new SessionEtabsInstalledVersion(
             provider.GetRequiredService<IEtabsSession>(),

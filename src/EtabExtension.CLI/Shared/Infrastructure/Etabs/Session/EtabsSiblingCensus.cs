@@ -33,9 +33,14 @@ public static class EtabsSiblingCensus
     /// pid, start time and executable path. A pid alone proves nothing: pids are reused, so a
     /// different start time or path is a foreign ETABS and stays in the census as one.
     /// </summary>
+    ///
+    /// <para>Our own identity is never a sibling (card I4): the published own identity is
+    /// authoritative, so a sibling record that aliases our own process - the same file, a
+    /// hard link, a copied record - cannot make our ETABS look like someone else's.</para>
     public static EtabsProcessObservation Classify(
         EtabsProcessObservation observation,
-        ManagedEtabsSessionRecord? sibling)
+        ManagedEtabsSessionRecord? sibling,
+        ManagedProcessIdentity? ownIdentity = null)
     {
         ArgumentNullException.ThrowIfNull(observation);
         if (sibling is null)
@@ -46,23 +51,33 @@ public static class EtabsSiblingCensus
         return observation with
         {
             Siblings = observation.Identified
-                .Where(identity => OrphanSessionCleaner.IdentityMatches(sibling, identity))
+                .Where(identity => OrphanSessionCleaner.IdentityMatches(sibling, identity)
+                    && !IsOwn(identity, ownIdentity))
                 .ToList()
         };
     }
+
+    private static bool IsOwn(ManagedProcessIdentity candidate, ManagedProcessIdentity? own) =>
+        own is not null
+        && candidate.Pid == own.Pid
+        && candidate.ProcessStartTimeUtc.ToUniversalTime() == own.ProcessStartTimeUtc.ToUniversalTime()
+        && string.Equals(
+            Path.GetFullPath(candidate.ExecutablePath),
+            Path.GetFullPath(own.ExecutablePath),
+            StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>
-/// Every census this daemon takes goes through here, so the launcher's preflight, its
-/// post-start ownership census and its failed-start survivor resolution all exclude the
-/// sibling's ETABS - and none of them can ever terminate it.
+/// Every census this daemon takes goes through here, so the launcher's preflight excludes
+/// the sibling's ETABS. The census only classifies and reports; it never decides a kill.
 /// </summary>
 public sealed class SiblingAwareProcessInspector(
     IProcessInspector inner,
-    ISiblingRecordSource siblings) : IProcessInspector
+    ISiblingRecordSource siblings,
+    LaunchPublicationCell? own = null) : IProcessInspector
 {
     public EtabsProcessObservation ObserveEtabs() =>
-        EtabsSiblingCensus.Classify(inner.ObserveEtabs(), siblings.Read());
+        EtabsSiblingCensus.Classify(inner.ObserveEtabs(), siblings.Read(), own?.Identity);
 
     public ManagedProcessIdentity? Find(int pid) => inner.Find(pid);
 

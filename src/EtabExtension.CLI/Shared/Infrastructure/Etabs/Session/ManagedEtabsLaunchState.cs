@@ -1,0 +1,586 @@
+using System.Diagnostics;
+
+namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
+
+/// <summary>
+/// The one-way lifecycle of a single managed launch attempt (card v3.1 W1). Every change is
+/// an <c>Interlocked.CompareExchange</c> in <see cref="EtabsLaunchState"/>, so commit and
+/// shutdown can never both win: exactly one of them owns the next step.
+/// </summary>
+public enum LaunchLifecycle
+{
+    Launching = 0,
+    Committing = 1,
+    Ready = 2,
+    Terminating = 3,
+    Ended = 4
+}
+
+/// <summary>
+/// What every observer of the launching process may know without taking any lock: the
+/// identity (once <c>Process.Start</c> produced it) and the authoritative handle lease.
+/// Readiness is not stored here - it is the lifecycle reaching
+/// <see cref="LaunchLifecycle.Ready"/>, so it can never disagree with the state machine.
+/// </summary>
+public sealed record LaunchPublication(ManagedProcessIdentity? Identity, HandleLease? Lease)
+{
+    public static readonly LaunchPublication None = new(null, null);
+}
+
+/// <summary>
+/// The lock-free cell the session writes and the inspector, the watchdog and the shutdown
+/// path read (card I3). A volatile reference to one immutable publication.
+/// </summary>
+public sealed class LaunchPublicationCell
+{
+    private LaunchPublication _current = LaunchPublication.None;
+
+    public LaunchPublication Current => Volatile.Read(ref _current);
+
+    public ManagedProcessIdentity? Identity => Current.Identity;
+
+    internal void Set(LaunchPublication publication) => Volatile.Write(ref _current, publication);
+
+    internal void Clear() => Volatile.Write(ref _current, LaunchPublication.None);
+}
+
+/// <summary>The cleanup-relevant surface of an authoritative process handle.</summary>
+public interface IProcessHandle : IDisposable
+{
+    bool HasExited { get; }
+    void Kill();
+    bool WaitForExit(TimeSpan timeout);
+}
+
+/// <summary>
+/// A ref-counted lease over the authoritative process handle (card V4). The fallback kill
+/// and the normal shutdown both take a lease and the handle is disposed only when the last
+/// reference goes, so neither can ever use a disposed handle.
+/// </summary>
+public sealed class HandleLease
+{
+    private readonly IProcessHandle _process;
+    private int _refs = 1;
+    private int _ownerReleased;
+
+    public HandleLease(IProcessHandle process)
+    {
+        ArgumentNullException.ThrowIfNull(process);
+        _process = process;
+    }
+
+    /// <summary>True once every reference was released and the handle was disposed.</summary>
+    public bool IsDisposed => Volatile.Read(ref _refs) <= 0;
+
+    /// <summary>Takes a reference. False when the handle is already gone.</summary>
+    public bool TryAcquire()
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _refs);
+            if (current <= 0)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref _refs, current + 1, current) == current)
+            {
+                return true;
+            }
+        }
+    }
+
+    /// <summary>Drops a reference taken by <see cref="TryAcquire"/>.</summary>
+    public void Release()
+    {
+        if (Interlocked.Decrement(ref _refs) == 0)
+        {
+            _process.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Drops the one owner reference. Idempotent: the slot's taker, the managed application
+    /// and a failing worker may all believe they own the cleanup, and only the first counts.
+    /// </summary>
+    public void ReleaseOwner()
+    {
+        if (Interlocked.Exchange(ref _ownerReleased, 1) == 0)
+        {
+            Release();
+        }
+    }
+
+    /// <summary>A gone handle means the exit was confirmed before it was released.</summary>
+    public bool HasExited
+    {
+        get
+        {
+            if (!TryAcquire())
+            {
+                return true;
+            }
+
+            try
+            {
+                return _process.HasExited;
+            }
+            finally
+            {
+                Release();
+            }
+        }
+    }
+
+    public void Kill()
+    {
+        if (!TryAcquire())
+        {
+            return;
+        }
+
+        try
+        {
+            _process.Kill();
+        }
+        finally
+        {
+            Release();
+        }
+    }
+
+    public bool WaitForExit(TimeSpan timeout)
+    {
+        if (!TryAcquire())
+        {
+            return true;
+        }
+
+        try
+        {
+            return _process.WaitForExit(timeout);
+        }
+        finally
+        {
+            Release();
+        }
+    }
+}
+
+/// <summary>
+/// The owned-process view the window guard needs, over a lease. Disposing it releases
+/// nothing: the guard only reads, and the owner reference belongs to the application.
+/// </summary>
+internal sealed class LeasedOwnedProcess(HandleLease lease, ManagedProcessIdentity identity)
+    : IOwnedEtabsProcess
+{
+    public ManagedProcessIdentity Identity { get; } = identity;
+
+    public bool HasExited => lease.HasExited;
+
+    public void Kill() => lease.Kill();
+
+    public bool WaitForExit(TimeSpan timeout) => lease.WaitForExit(timeout);
+
+    public void Dispose()
+    {
+    }
+}
+
+/// <summary>
+/// Everything one launch attempt shares between the launching thread, the startup
+/// supervisor and any shutdown path (card W1, W2, X1, X2, Y1, Y2).
+///
+/// <para><b>Rules.</b> The lifecycle changes only by compare-exchange. The handle slot is
+/// Empty, a lease, or CLOSED, and every handle has exactly one cleanup owner: whoever closes
+/// a slot that holds a lease kills it; a worker whose store finds the slot CLOSED kills its
+/// own handle. A record is cleared only after the exit of the process it describes was
+/// confirmed, and only when it is still this attempt's record.</para>
+/// </summary>
+public sealed class EtabsLaunchState
+{
+    /// <summary>How long a shutdown waits for a short commit to finish (card W1/X1).</summary>
+    public static readonly TimeSpan CommitWait = TimeSpan.FromSeconds(2);
+
+    private static readonly object Closed = new();
+
+    private readonly ISessionRecordStore _records;
+    private readonly LaunchPublicationCell _cell;
+    private readonly TaskCompletionSource<ManagedEtabsShutdownResult> _termination =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _lifecycle;
+    private int _launchPhaseTermination;
+    private int _timedOut;
+    private int _began;
+    private object? _slot;
+
+    public EtabsLaunchState(ISessionRecordStore records, LaunchPublicationCell cell)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        ArgumentNullException.ThrowIfNull(cell);
+        _records = records;
+        _cell = cell;
+    }
+
+    /// <summary>The generation of every record this attempt writes (card A4).</summary>
+    public Guid LaunchRecordId { get; private set; } = Guid.NewGuid();
+
+    /// <summary>
+    /// A launcher that is not ours (a test double) builds the application with its own
+    /// record id; the session adopts it so every record of the attempt carries one id. The
+    /// real launcher builds the application with this state's id, so this is a no-op there.
+    /// </summary>
+    public void AdoptRecordId(Guid id) => LaunchRecordId = id;
+
+    public LaunchLifecycle Lifecycle => (LaunchLifecycle)Volatile.Read(ref _lifecycle);
+
+    public bool IsReady => Lifecycle == LaunchLifecycle.Ready;
+
+    public LaunchPublication Publication => _cell.Current;
+
+    /// <summary>True when the startup supervisor (not a shutdown) ended this attempt.</summary>
+    public bool TimedOut => Volatile.Read(ref _timedOut) == 1;
+
+    public bool TryTransition(LaunchLifecycle from, LaunchLifecycle to) =>
+        Interlocked.CompareExchange(ref _lifecycle, (int)to, (int)from) == (int)from;
+
+    /// <summary>The atomic terminal fence for the Ready state (card W1).</summary>
+    public bool TryBeginReadyTermination() =>
+        TryTransition(LaunchLifecycle.Ready, LaunchLifecycle.Terminating);
+
+    /// <summary>Marks an attempt whose exit is confirmed as finished.</summary>
+    public void MarkEnded() => Volatile.Write(ref _lifecycle, (int)LaunchLifecycle.Ended);
+
+    // ── handle slot (card Y2) ──────────────────────────────────────────────
+
+    /// <summary>Worker side: false means the slot is CLOSED and the caller owns the cleanup.</summary>
+    public bool TryStoreHandle(HandleLease lease) =>
+        Interlocked.CompareExchange(ref _slot, lease, null) is null;
+
+    /// <summary>Taker side: closes the slot and returns the lease it held, if any.</summary>
+    public HandleLease? CloseSlot() => Interlocked.Exchange(ref _slot, Closed) as HandleLease;
+
+    /// <summary>The lease currently held by the slot, without closing it.</summary>
+    public HandleLease? SlotLease => Volatile.Read(ref _slot) as HandleLease;
+
+    // ── publication ─────────────────────────────────────────────────────────
+
+    public void Publish(ManagedProcessIdentity identity, HandleLease? lease) =>
+        _cell.Set(new LaunchPublication(identity, lease));
+
+    /// <summary>Publishes the identity when the launcher did not (a test double).</summary>
+    public void PublishIfAbsent(ManagedProcessIdentity identity)
+    {
+        if (_cell.Identity is null)
+        {
+            _cell.Set(new LaunchPublication(identity, null));
+        }
+    }
+
+    /// <summary>True once the session started the launch this state describes.</summary>
+    public bool Began => Volatile.Read(ref _began) == 1;
+
+    public void MarkBegun() => Volatile.Write(ref _began, 1);
+
+    /// <summary>Records the answer of a terminator that acted through the handle alone.</summary>
+    public void RecordTerminationResult(ManagedEtabsShutdownResult result) =>
+        _ = _termination.TrySetResult(result);
+
+    /// <summary>The answer of the terminator that won a launch-phase termination, once given.</summary>
+    public ManagedEtabsShutdownResult? TerminationResult =>
+        _termination.Task.IsCompletedSuccessfully ? _termination.Task.Result : null;
+
+    public void ClearPublication() => _cell.Clear();
+
+    // ── records ─────────────────────────────────────────────────────────────
+
+    public void WriteProvisionalRecord(ManagedProcessIdentity identity) =>
+        _records.Write(ToRecord(identity, ManagedEtabsRecordPhase.Provisional));
+
+    public void WriteFinalRecord(ManagedProcessIdentity identity) =>
+        _records.Write(ToRecord(identity, ManagedEtabsRecordPhase.Ready));
+
+    /// <summary>
+    /// Writes the provisional record only when the attempt's record is not already there, so
+    /// a launcher that wrote it at process start is not asked twice.
+    /// </summary>
+    public void EnsureProvisionalRecord(ManagedProcessIdentity identity)
+    {
+        var existing = _records.Read();
+        if (existing is not null && existing.ManagedLaunchRecordId == LaunchRecordId)
+        {
+            return;
+        }
+
+        WriteProvisionalRecord(identity);
+    }
+
+    /// <summary>
+    /// Clears this attempt's record, generation-matched, and only when the exit of the
+    /// process behind <paramref name="lease"/> is confirmed (card Y1). Returns whether a
+    /// record is still retained.
+    /// </summary>
+    public bool ClearRecordAfterConfirmedExit(HandleLease? lease) =>
+        ClearRecordAfterConfirmedExit(() => lease is not null && lease.HasExited);
+
+    /// <inheritdoc cref="ClearRecordAfterConfirmedExit(HandleLease?)" />
+    public bool ClearRecordAfterConfirmedExit(Func<bool> exitConfirmed)
+    {
+        ManagedEtabsSessionRecord? record;
+        try
+        {
+            record = _records.Read();
+        }
+#pragma warning disable CA1031 // an unreadable record is retained, never assumed clear
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            return true;
+        }
+
+        if (record is null)
+        {
+            return false;
+        }
+
+        if (record.ManagedLaunchRecordId != LaunchRecordId)
+        {
+            // Another generation's evidence: not ours to clear, and still retained.
+            return true;
+        }
+
+        if (!exitConfirmed())
+        {
+            return true;
+        }
+
+        _records.Clear();
+        return false;
+    }
+
+    private ManagedEtabsSessionRecord ToRecord(
+        ManagedProcessIdentity identity,
+        ManagedEtabsRecordPhase phase) => new(
+        1,
+        identity.Pid,
+        identity.ProcessStartTimeUtc,
+        Path.GetFullPath(identity.ExecutablePath),
+        LaunchRecordId,
+        DateTimeOffset.UtcNow)
+    {
+        Phase = phase
+    };
+
+    // ── launch-phase termination (card W1, X1, X2, Y1, Y2, Y3) ─────────────
+
+    /// <summary>
+    /// Ends a launch that is not Ready: wins <c>Terminating</c> from Launching or
+    /// Committing, closes the slot, and - when the slot held a lease - kills that handle and
+    /// clears the record after the confirmed exit. A caller that loses to another
+    /// terminator waits for that terminator's answer. Returns null when the attempt is
+    /// Ready (the normal shutdown owns it) or was terminated from Ready.
+    /// </summary>
+    public ManagedEtabsShutdownResult? TerminateLaunch(
+        TimeSpan killWait,
+        TimeSpan gracefulWait = default,
+        bool timedOut = false)
+    {
+        while (true)
+        {
+            var state = Lifecycle;
+            if (state == LaunchLifecycle.Ready)
+            {
+                return null;
+            }
+
+            if (state is LaunchLifecycle.Terminating or LaunchLifecycle.Ended)
+            {
+                return AwaitLaunchTermination(killWait);
+            }
+
+            if (TryTransition(state, LaunchLifecycle.Terminating))
+            {
+                if (timedOut)
+                {
+                    Volatile.Write(ref _timedOut, 1);
+                }
+
+                Volatile.Write(ref _launchPhaseTermination, 1);
+                break;
+            }
+        }
+
+        ManagedEtabsShutdownResult result;
+        try
+        {
+            result = KillSlotLease(killWait, gracefulWait);
+        }
+#pragma warning disable CA1031 // the answer must be produced whatever happened inside the kill
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            result = Failed(
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "EtabsLaunchState.TerminateLaunch",
+                    exception),
+                Publication.Identity?.Pid,
+                forced: true,
+                recordRetained: true);
+        }
+
+        _termination.TrySetResult(result);
+        return result;
+    }
+
+    /// <summary>
+    /// Shutdown from Committing: wait the bounded commit window for Ready, then take
+    /// Terminating if the commit is stalled (card X1).
+    /// </summary>
+    public bool WaitForCommitOrRelease(TimeSpan wait)
+    {
+        var deadline = Stopwatch.StartNew();
+        while (Lifecycle == LaunchLifecycle.Committing && deadline.Elapsed < wait)
+        {
+            Thread.Sleep(5);
+        }
+
+        return Lifecycle == LaunchLifecycle.Ready;
+    }
+
+    private ManagedEtabsShutdownResult? AwaitLaunchTermination(TimeSpan killWait)
+    {
+        if (Volatile.Read(ref _launchPhaseTermination) == 0)
+        {
+            return null;
+        }
+
+        return _termination.Task.Wait(killWait + killWait)
+            ? _termination.Task.Result
+            : Failed(
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                "Another terminator is still ending this launch; exit unconfirmed.",
+                Publication.Identity?.Pid,
+                forced: false,
+                recordRetained: true);
+    }
+
+    private ManagedEtabsShutdownResult KillSlotLease(TimeSpan killWait, TimeSpan gracefulWait)
+    {
+        var lease = CloseSlot();
+        if (lease is null)
+        {
+            // Nothing was handed over yet: a worker whose store sees CLOSED owns its own
+            // cleanup. Whatever record exists is retained, never assumed clear.
+            var retained = _records.Read() is not null;
+            return retained
+                ? Failed(
+                    ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                    "The launch ended before its process handle was handed over; the worker " +
+                    "owns that handle and any record is retained.",
+                    Publication.Identity?.Pid,
+                    forced: false,
+                    recordRetained: true)
+                : Succeeded(null, forced: false, recordRetained: false);
+        }
+
+        var pid = Publication.Identity?.Pid;
+        var forced = false;
+        var confirmed = false;
+        string? error = null;
+        if (lease.TryAcquire())
+        {
+            try
+            {
+                if (gracefulWait > TimeSpan.Zero && !lease.HasExited)
+                {
+                    _ = lease.WaitForExit(gracefulWait);
+                }
+
+                if (!lease.HasExited)
+                {
+                    forced = true;
+                    lease.Kill();
+                }
+
+                confirmed = lease.HasExited || lease.WaitForExit(killWait);
+            }
+#pragma warning disable CA1031 // an unconfirmed exit is reported, never thrown
+            catch (Exception exception)
+#pragma warning restore CA1031
+            {
+                error = EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "Process.Kill(authoritative-owned-handle)",
+                    exception);
+                confirmed = SafeHasExited(lease);
+            }
+            finally
+            {
+                lease.Release();
+            }
+        }
+        else
+        {
+            confirmed = true; // the handle was only released after a confirmed exit
+        }
+
+        if (!confirmed)
+        {
+            return Failed(
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                error ?? "The exact owned ETABS process did not confirm exit after forced termination.",
+                pid,
+                forced: true,
+                recordRetained: _records.Read() is not null);
+        }
+
+        var recordRetained = ClearRecordAfterConfirmedExit(lease);
+        ClearPublication();
+        lease.ReleaseOwner();
+        MarkEnded();
+        return Succeeded(pid, forced, recordRetained);
+    }
+
+    private static bool SafeHasExited(HandleLease lease)
+    {
+        try
+        {
+            return lease.HasExited;
+        }
+#pragma warning disable CA1031 // unknown means unconfirmed
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            return false;
+        }
+    }
+
+    internal static ManagedEtabsShutdownResult Succeeded(int? ownedPid, bool forced, bool recordRetained) => new(
+        true,
+        null,
+        null,
+        new(
+            ManagedEtabsShutdownState.Succeeded,
+            ProcessExitConfirmed: true,
+            Forced: forced,
+            RecordRetained: recordRetained,
+            ApplicationExitReturnCode: null,
+            OwnedPid: ownedPid));
+
+    internal static ManagedEtabsShutdownResult Failed(
+        string errorCode,
+        string error,
+        int? ownedPid,
+        bool forced,
+        bool recordRetained) => new(
+        false,
+        errorCode,
+        error,
+        new(
+            ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+            ProcessExitConfirmed: false,
+            Forced: forced,
+            RecordRetained: recordRetained,
+            ApplicationExitReturnCode: null,
+            OwnedPid: ownedPid));
+}

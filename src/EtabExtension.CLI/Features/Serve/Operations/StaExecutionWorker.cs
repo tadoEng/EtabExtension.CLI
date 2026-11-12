@@ -14,7 +14,7 @@ public sealed class StaExecutionWorker : IStaExecutionWorker
     /// a modal ETABS dialog holds never returns on its own (review finding P2-1); disposal
     /// must not hang the daemon's exit on it.
     /// </summary>
-    public static readonly TimeSpan DefaultDisposeJoinTimeout = TimeSpan.FromSeconds(5);
+    public static readonly TimeSpan DefaultDisposeJoinTimeout = TimeSpan.FromSeconds(2);
 
     private readonly BlockingCollection<IWorkItem> _work = new();
     private readonly Thread _thread;

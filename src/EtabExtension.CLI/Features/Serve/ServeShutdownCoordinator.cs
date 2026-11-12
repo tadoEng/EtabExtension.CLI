@@ -12,15 +12,55 @@ public interface IServeShutdownCoordinator : IAsyncDisposable
 
 public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
 {
+    /// <summary>Window-guard teardown joins its monitor for at most this long.</summary>
+    public static readonly TimeSpan GuardTeardownBudget = TimeSpan.FromSeconds(2);
+
+    /// <summary>Record operations and reference cleanup inside the blocked sequence.</summary>
+    public static readonly TimeSpan BlockedRecordOperationsMargin = TimeSpan.FromMilliseconds(500);
+
     /// <summary>
-    /// The most a shutdown of a blocked session may take: the bounded exit attempt, the
-    /// forced-exit wait, and a margin. Inside the Rust client's 30 s shutdown budget, so the
-    /// daemon answers <c>shutdown</c> itself instead of being killed with ETABS left behind.
+    /// The backstop on the session's own bounded blocked sequence: the gate wait, the
+    /// bounded graceful exit, the forced-exit wait, the guard teardown and record
+    /// operations (card I5, A7).
     /// </summary>
     public static readonly TimeSpan BlockedShutdownEnvelope =
-        ManagedEtabsShutdownMachine.GracefulExitTimeout
+        EtabsSession.BlockedShutdownGateWait
+        + ManagedEtabsShutdownMachine.BlockedGracefulExitTimeout
         + ManagedEtabsShutdownMachine.ForcedExitTimeout
-        + TimeSpan.FromSeconds(5);
+        + GuardTeardownBudget
+        + BlockedRecordOperationsMargin;
+
+    /// <summary>
+    /// The end-to-end worst case of a blocked shutdown RESPONSE: the envelope plus the
+    /// bounded join of the stuck STA worker, which runs inside the same budget and never on
+    /// top of it. Rust's 30 s response budget is this plus an 8 s margin (card V5).
+    /// </summary>
+    public static readonly TimeSpan BlockedShutdownWorstCase =
+        BlockedShutdownEnvelope + StaExecutionWorker.DefaultDisposeJoinTimeout;
+
+    /// <summary>
+    /// The contractual ceiling the blocked-shutdown response is held to (card I5, V5). The
+    /// configured worst case above stays under it with scheduling slack, and Rust's 30 s
+    /// response budget is this plus an 8 s margin.
+    /// </summary>
+    public static readonly TimeSpan BlockedShutdownCeiling = TimeSpan.FromSeconds(22);
+
+    /// <summary>
+    /// The shared contract constants line (<c>docs/contracts/sidecar-v1/shutdown-timing.txt</c>
+    /// in the Rust repository). Rust parses the worst case from it and asserts its response
+    /// budget exceeds it by the margin; a C# test pins this string to the literal there.
+    /// </summary>
+    public static string ContractConstantsLine =>
+        $"etab-cli-blocked-shutdown gate-wait-ms={Ms(EtabsSession.BlockedShutdownGateWait)} " +
+        $"graceful-ms={Ms(ManagedEtabsShutdownMachine.BlockedGracefulExitTimeout)} " +
+        $"forced-ms={Ms(ManagedEtabsShutdownMachine.ForcedExitTimeout)} " +
+        $"guard-teardown-ms={Ms(GuardTeardownBudget)} " +
+        $"record-ops-ms={Ms(BlockedRecordOperationsMargin)} " +
+        $"worker-join-ms={Ms(StaExecutionWorker.DefaultDisposeJoinTimeout)} " +
+        $"worst-case-ms={Ms(BlockedShutdownWorstCase)} " +
+        $"ceiling-ms={Ms(BlockedShutdownCeiling)}";
+
+    private static long Ms(TimeSpan value) => (long)value.TotalMilliseconds;
 
     private readonly IStaExecutionWorker _worker;
     private readonly IEtabsSession _session;
@@ -170,15 +210,14 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
         OwnedPid: SafeProcessId());
 
     /// <summary>
-    /// The session's pid, without risking the hang this path exists to avoid: the read takes
-    /// the session lock, which a stuck shutdown thread may still hold.
+    /// The session's pid. The read is the lock-free publication (card I3, I5): it cannot
+    /// block on a gate a stuck command holds, so no pool thread is spent waiting on it.
     /// </summary>
     private int? SafeProcessId()
     {
         try
         {
-            var read = Task.Run(() => _session.ProcessId);
-            return read.Wait(TimeSpan.FromMilliseconds(250)) ? read.Result : null;
+            return _session.ProcessId;
         }
 #pragma warning disable CA1031 // a pid for the diagnostic only; unknown is an honest answer
         catch (Exception)

@@ -20,6 +20,12 @@ public static class EtabsTypedFailureCodes
     /// <summary>ETABS put up a modal dialog while a command was waiting on it.</summary>
     public const string ModalDialog = "ETABS_MODAL_DIALOG";
 
+    /// <summary>
+    /// The dialog scan threw or timed out, so the command cannot be certified free of a
+    /// modal dialog. Retryable; never answered as success (card W3).
+    /// </summary>
+    public const string DialogScanInconclusive = "ETABS_DIALOG_SCAN_INCONCLUSIVE";
+
     /// <summary>The model was saved by a newer ETABS than the one running.</summary>
     public const string VersionMismatch = "ETABS_VERSION_MISMATCH";
 
@@ -57,14 +63,50 @@ public sealed record EtabsModalDialogObservation(
 }
 
 /// <summary>
+/// The facts about one top-level window the modal rule is a pure function of. Gathering
+/// them is the only part that touches user32.
+/// </summary>
+public sealed record EtabsWindowFacts(
+    nint Handle,
+    string ClassName,
+    nint Owner,
+    bool OwnerEnabled);
+
+/// <summary>
+/// The modal rule (card V2, W3), pure over <see cref="EtabsWindowFacts"/>.
+///
+/// <para>A <c>#32770</c> window of the watched pid is a modal CANDIDATE when it is owned and
+/// its owner is disabled, or when it is ownerless. Visibility is NOT a criterion - the window
+/// guard may have hidden a real modal box. There is no class or title allowlist: an ownerless
+/// dialog is a candidate unless runtime evidence says otherwise, and a modeless dialog on an
+/// ENABLED owner is not.</para>
+/// </summary>
+public static class EtabsModalDialogRule
+{
+    public const string DialogClass = "#32770";
+
+    public static bool IsModalCandidate(EtabsWindowFacts window)
+    {
+        ArgumentNullException.ThrowIfNull(window);
+        if (window.ClassName != DialogClass)
+        {
+            return false;
+        }
+
+        return window.Owner == nint.Zero || !window.OwnerEnabled;
+    }
+}
+
+/// <summary>
 /// The window-station boundary for the watchdog, so the decision logic is testable without
 /// ETABS or a desktop.
 /// </summary>
 public interface IEtabsDialogWindowSource
 {
     /// <summary>
-    /// Dialog-class top-level windows of <paramref name="pid"/> that are modal right now:
-    /// visible, or blocking a disabled owner (the window guard may have hidden the box).
+    /// Dialog-class top-level windows of <paramref name="pid"/> that are modal CANDIDATES
+    /// under <see cref="EtabsModalDialogRule"/>. Throws when the window station could not be
+    /// read: the watchdog reports that as inconclusive, never as "nothing found".
     /// </summary>
     IReadOnlyList<EtabsDialogWindow> FindModalDialogs(int pid);
 
@@ -106,10 +148,32 @@ public interface IEtabsModalDialogWatchdog
 public sealed class EtabsModalDialogWatchdog(
     IEtabsDialogWindowSource windows,
     TimeSpan pollInterval,
-    TimeSpan dismissedSettle) : IEtabsModalDialogWatchdog
+    TimeSpan dismissedSettle,
+    TimeSpan? scanTimeout = null) : IEtabsModalDialogWatchdog
 {
     public static readonly TimeSpan DefaultPollInterval = TimeSpan.FromMilliseconds(200);
     public static readonly TimeSpan DefaultDismissedSettle = TimeSpan.FromSeconds(30);
+    public static readonly TimeSpan DefaultScanTimeout = TimeSpan.FromSeconds(5);
+
+    private readonly TimeSpan _scanTimeout = scanTimeout ?? DefaultScanTimeout;
+
+    /// <summary>What one window scan concluded.</summary>
+    private sealed record ScanOutcome(EtabsModalDialogObservation? Found, string? Inconclusive)
+    {
+        public static readonly ScanOutcome Clean = new(null, null);
+    }
+
+    /// <summary>The most recent scan verdict of one guarded command's watch.</summary>
+    private sealed class ScanTrace
+    {
+        private string? _inconclusive;
+
+        public string? Inconclusive
+        {
+            get => Volatile.Read(ref _inconclusive);
+            set => Volatile.Write(ref _inconclusive, value);
+        }
+    }
 
     /// <summary>
     /// The abandoned work and the dialog that abandoned it, published together. Readers on
@@ -145,23 +209,32 @@ public sealed class EtabsModalDialogWatchdog(
         ArgumentNullException.ThrowIfNull(work);
 
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var trace = new ScanTrace();
         var workTask = work();
         // Off the caller's thread: the caller may be the protocol reader, which must never
         // wait on a window scan or on the session lock behind ownedPid.
-        var watchTask = Task.Run(() => WatchAsync(ownedPid, stop.Token), CancellationToken.None);
+        var watchTask = Task.Run(() => WatchAsync(ownedPid, trace, stop.Token), CancellationToken.None);
         var first = await Task.WhenAny(workTask, watchTask).ConfigureAwait(false);
 
         EtabsModalDialogObservation? seen;
         if (first == workTask)
         {
             await stop.CancelAsync().ConfigureAwait(false);
-            seen = await SettleWatchAsync(watchTask).ConfigureAwait(false)
-                // The work finished: one last look, so a box that appeared in the final
-                // poll interval can never be answered with success.
-                ?? Scan(ownedPid);
+            seen = await SettleWatchAsync(watchTask).ConfigureAwait(false);
             if (seen is null)
             {
-                return await workTask.ConfigureAwait(false);
+                // The work finished: one last look, so a box that appeared in the final
+                // poll interval can never be answered with success - and a look that could
+                // not be taken is never answered with success either (card W3).
+                var last = Scan(ownedPid);
+                if (last.Found is null)
+                {
+                    return last.Inconclusive is null
+                        ? await workTask.ConfigureAwait(false)
+                        : Result.Fail(InconclusiveFailure(last.Inconclusive));
+                }
+
+                seen = last.Found;
             }
         }
         else
@@ -194,17 +267,26 @@ public sealed class EtabsModalDialogWatchdog(
         return Result.Fail(seen.ToFailure());
     }
 
+    private static string InconclusiveFailure(string reason) => EtabsTypedFailureCodes.Format(
+        EtabsTypedFailureCodes.DialogScanInconclusive,
+        "ETABS could not be checked for a modal dialog, so the command cannot be certified " +
+        "complete. Retry.",
+        new { reason });
+
     private async Task<EtabsModalDialogObservation?> WatchAsync(
         Func<int?> ownedPid,
+        ScanTrace trace,
         CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
-            var seen = Scan(ownedPid);
-            if (seen is not null)
+            var outcome = Scan(ownedPid);
+            if (outcome.Found is not null)
             {
-                return seen;
+                return outcome.Found;
             }
+
+            trace.Inconclusive = outcome.Inconclusive;
 
             try
             {
@@ -232,13 +314,12 @@ public sealed class EtabsModalDialogWatchdog(
         }
     }
 
-    private EtabsModalDialogObservation? Scan(Func<int?> ownedPid)
+    private ScanOutcome Scan(Func<int?> ownedPid)
     {
-        // A fault in the watchdog itself (the pid read, the window walk, the dismiss) must
-        // never fault the watch or fail the command it watches. A fault before a dialog is
-        // found skips that poll; a fault while dismissing a dialog that WAS found still
-        // reports the dialog, as left open (dismissed:false) - the box is real, and the
-        // command behind it is blocked whether or not the dismiss could be attempted.
+        // A fault in the watchdog itself must never fault the watch or the command it
+        // watches - but it is not "nothing found" either: it is INCONCLUSIVE, and a command
+        // may not answer success over it (card W3). A fault while dismissing a dialog that
+        // WAS found still reports the dialog, as left open (dismissed:false).
         int owned;
         EtabsDialogWindow dialog;
 #pragma warning disable CA1031 // see above: no watchdog fault may surface as a command failure
@@ -246,13 +327,26 @@ public sealed class EtabsModalDialogWatchdog(
         {
             if (ownedPid() is not { } pid)
             {
-                return null;
+                return ScanOutcome.Clean;
             }
 
-            var dialogs = windows.FindModalDialogs(pid);
+            var scan = Task.Run(() => windows.FindModalDialogs(pid));
+            if (!scan.Wait(_scanTimeout))
+            {
+                Console.Error.WriteLine(
+                    $"⚠ ETABS dialog scan did not finish within {_scanTimeout.TotalSeconds:0.###}s.");
+                _ = scan.ContinueWith(
+                    static task => _ = task.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted,
+                    TaskScheduler.Default);
+                return new(null, $"the dialog scan did not finish within {_scanTimeout.TotalSeconds:0.###}s");
+            }
+
+            var dialogs = scan.GetAwaiter().GetResult();
             if (dialogs.Count == 0)
             {
-                return null;
+                return ScanOutcome.Clean;
             }
 
             owned = pid;
@@ -260,8 +354,9 @@ public sealed class EtabsModalDialogWatchdog(
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"⚠ ETABS dialog scan failed: {ex.Message}");
-            return null;
+            var cause = ex is AggregateException { InnerException: { } inner } ? inner : ex;
+            Console.Error.WriteLine($"⚠ ETABS dialog scan failed: {cause.Message}");
+            return new(null, $"the dialog scan failed: {EtabsApiDiagnosticFormatter.Bounded(cause.Message)}");
         }
 
         bool dismissed;
@@ -279,9 +374,11 @@ public sealed class EtabsModalDialogWatchdog(
         Console.Error.WriteLine(
             $"⚠ ETABS modal dialog (PID {owned}): title='{dialog.Title}', dismissed={dismissed}");
         return new(
-            EtabsApiDiagnosticFormatter.Bounded(dialog.Title),
-            EtabsApiDiagnosticFormatter.Bounded(dialog.Text),
-            dismissed);
+            new EtabsModalDialogObservation(
+                EtabsApiDiagnosticFormatter.Bounded(dialog.Title),
+                EtabsApiDiagnosticFormatter.Bounded(dialog.Text),
+                dismissed),
+            null);
     }
 }
 
@@ -292,9 +389,8 @@ public sealed class EtabsModalDialogWatchdog(
 /// watchdog.
 /// </summary>
 [SupportedOSPlatform("windows")]
-public sealed class Win32EtabsDialogWindowSource : IEtabsDialogWindowSource
+public sealed class Win32EtabsDialogWindowSource : IEtabsDialogWindowSource, IEtabsStartupWindowSource
 {
-    private const string DialogClass = "#32770";
     private const uint GwHwndNext = 2;
     private const uint GwOwner = 4;
     private const uint GwChild = 5;
@@ -313,8 +409,7 @@ public sealed class Win32EtabsDialogWindowSource : IEtabsDialogWindowSource
         {
             _ = GetWindowThreadProcessId(handle, out var processId);
             if (unchecked((int)processId) == pid
-                && ClassOf(handle) == DialogClass
-                && IsModal(handle))
+                && EtabsModalDialogRule.IsModalCandidate(FactsOf(handle)))
             {
                 found.Add(new(handle, TextOf(handle), ChildTexts(handle, "Static")));
             }
@@ -351,15 +446,33 @@ public sealed class Win32EtabsDialogWindowSource : IEtabsDialogWindowSource
         return !IsWindow(dialog.Handle);
     }
 
-    private static bool IsModal(nint handle)
+    /// <summary>Visible top-level windows of <paramref name="pid"/>, for the startup-blocker rule.</summary>
+    public IReadOnlyList<StartupWindow> VisibleTopLevelWindows(int pid)
     {
-        if (IsWindowVisible(handle))
+        var found = new List<StartupWindow>();
+        var handle = GetTopWindow(nint.Zero);
+        for (var scanned = 0; handle != nint.Zero && scanned < WindowScanLimit; scanned++)
         {
-            return true;
+            _ = GetWindowThreadProcessId(handle, out var processId);
+            if (unchecked((int)processId) == pid && IsWindowVisible(handle))
+            {
+                found.Add(new(handle, TextOf(handle), ClassOf(handle)));
+            }
+
+            handle = GetWindow(handle, GwHwndNext);
         }
 
+        return found;
+    }
+
+    private static EtabsWindowFacts FactsOf(nint handle)
+    {
         var owner = GetWindow(handle, GwOwner);
-        return owner != nint.Zero && !IsWindowEnabled(owner);
+        return new(
+            handle,
+            ClassOf(handle),
+            owner,
+            owner == nint.Zero || IsWindowEnabled(owner));
     }
 
     private static IEnumerable<nint> Children(nint parent)
