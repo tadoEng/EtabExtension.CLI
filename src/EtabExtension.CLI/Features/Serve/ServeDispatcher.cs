@@ -505,7 +505,7 @@ public sealed class ServeDispatcher : IServeDispatcher
         return await _shutdownIfUnchanged.RunAsync(
             req,
             requestId,
-            check => RunSynchronousAsync(() => _envelope.RunAsync(work, check)));
+            check => RunSynchronousAsync(() => _envelope.RunUncertifiedAsync(work, check)));
     }
 
     private async Task<object> DispatchUnlockModelAsync(

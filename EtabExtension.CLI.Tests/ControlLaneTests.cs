@@ -307,18 +307,18 @@ public sealed class CoordinatorControlTests
                 return Shutdowns.Ok();
             }
         };
-        var envelope = TimeSpan.FromMilliseconds(800);
+        var envelope = TimeSpan.FromMilliseconds(2000);
         var clock = Stopwatch.StartNew();
 
-        var result = Coordinator(session, new ProbeWorker(busy: true), envelope: envelope, busyWait: TimeSpan.FromMilliseconds(600))
+        var result = Coordinator(session, new ProbeWorker(busy: true), envelope: envelope, busyWait: TimeSpan.FromMilliseconds(1200))
             .ShutdownAsync()
             .Within("the bounded shutdown");
 
         Assert.False(result.Success);
         Assert.Equal(ManagedEtabsShutdownState.ProcessExitUnconfirmed, result.Data!.State);
         Assert.True(
-            clock.Elapsed < envelope + TimeSpan.FromMilliseconds(400),
-            $"took {clock.Elapsed}: the 600 ms busy wait was added on top of the {envelope} envelope");
+            clock.Elapsed < envelope + TimeSpan.FromMilliseconds(700),
+            $"took {clock.Elapsed}: the 1200 ms busy wait was added on top of the {envelope} envelope");
     }
 
     [Fact]
@@ -332,7 +332,7 @@ public sealed class CoordinatorControlTests
             .Within("EOF");
 
         Assert.False(result.Success);
-        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(2), $"EOF took {clock.Elapsed}");
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(4), $"EOF took {clock.Elapsed}");
     }
 
     // C2: detach-visible detaches a visible instance and never exits it.

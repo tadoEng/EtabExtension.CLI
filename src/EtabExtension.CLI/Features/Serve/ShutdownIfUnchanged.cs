@@ -63,14 +63,27 @@ public enum ShutdownIfUnchangedState
 public sealed class ShutdownIfUnchangedOperation(long requestId)
 {
     private int _state;
+    private readonly TaskCompletionSource _abandoned = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public long RequestId { get; } = requestId;
+
+    /// <summary>Completes the moment a cancel, a detach, a shutdown or a timeout abandons the command.</summary>
+    public Task Abandoned => _abandoned.Task;
 
     public ShutdownIfUnchangedState State => (ShutdownIfUnchangedState)Volatile.Read(ref _state);
 
     public bool TryEnterExiting() => Move(ShutdownIfUnchangedState.Checking, ShutdownIfUnchangedState.Exiting);
 
-    public bool TryAbandon() => Move(ShutdownIfUnchangedState.Checking, ShutdownIfUnchangedState.Abandoned);
+    public bool TryAbandon()
+    {
+        var won = Move(ShutdownIfUnchangedState.Checking, ShutdownIfUnchangedState.Abandoned);
+        if (won)
+        {
+            _ = _abandoned.TrySetResult();
+        }
+
+        return won;
+    }
 
     public bool TryRefuse() => Move(ShutdownIfUnchangedState.Checking, ShutdownIfUnchangedState.Refused);
 
@@ -175,8 +188,23 @@ public interface IShutdownIfUnchangedApiFactory
 /// </summary>
 public sealed class ShutdownIfUnchangedService
 {
-    /// <summary>The Checking phase's own bound (scan, document, signal). Not the exit's.</summary>
-    public static readonly TimeSpan DefaultCheckBudget = TimeSpan.FromSeconds(15);
+    /// <summary>
+    /// The Checking phase's own bound (scan, document, signal), counted from INTAKE. Timing
+    /// arithmetic (review P2-7): the inherited response allowance is 30 s, and a won exit takes
+    /// up to <see cref="DefaultExitBudget"/> (21 s), so Checking is 8 s: 8 + 21 = 29 s.
+    /// </summary>
+    public static readonly TimeSpan DefaultCheckBudget = TimeSpan.FromSeconds(8);
+
+    /// <summary>
+    /// The bound on a won exit: the ordinary graceful 10 s plus forced 10 s plus 1 s, matching the
+    /// started-exit deadline of the shutdown coordinator. Past it the answer is "unconfirmed" and
+    /// the host sends an explicit shutdown (the blocked/kill sequence is then permitted).
+    /// </summary>
+    public static readonly TimeSpan DefaultExitBudget =
+        ManagedEtabsShutdownMachine.GracefulExitTimeout + ManagedEtabsShutdownMachine.ForcedExitTimeout + TimeSpan.FromSeconds(1);
+
+    /// <summary>The exit could not be confirmed within its budget; the host must observe.</summary>
+    public const string ExitUnconfirmedCode = "ETABS_C10_EXIT_UNCONFIRMED";
 
     private readonly IEtabsSession _session;
     private readonly IEtabsModalDialogWatchdog _watchdog;
@@ -184,6 +212,7 @@ public sealed class ShutdownIfUnchangedService
     private readonly ShutdownIfUnchangedRegistry _registry;
     private readonly ISavedFileStampReader _stamps;
     private readonly TimeSpan _checkBudget;
+    private readonly TimeSpan _exitBudget;
     private readonly Func<string, string, FileIdentityResult> _compareIdentity;
 
     public ShutdownIfUnchangedService(
@@ -203,8 +232,10 @@ public sealed class ShutdownIfUnchangedService
         ShutdownIfUnchangedRegistry registry,
         ISavedFileStampReader? stamps,
         TimeSpan? checkBudget,
-        Func<string, string, FileIdentityResult>? compareIdentity)
+        Func<string, string, FileIdentityResult>? compareIdentity,
+        TimeSpan? exitBudget = null)
     {
+        _exitBudget = exitBudget ?? DefaultExitBudget;
         _session = session;
         _watchdog = watchdog;
         _apis = apis;
@@ -241,7 +272,7 @@ public sealed class ShutdownIfUnchangedService
         }
 
         var body = onSta(() => Task.FromResult(Check(operation, request)));
-        var first = await Task.WhenAny(body, Task.Delay(_checkBudget)).ConfigureAwait(false);
+        var first = await Task.WhenAny(body, Task.Delay(_checkBudget), operation.Abandoned).ConfigureAwait(false);
         if (first == body)
         {
             return await body.ConfigureAwait(false);
@@ -257,7 +288,25 @@ public sealed class ShutdownIfUnchangedService
                 "and was not killed. The late check can never exit it.");
         }
 
-        return await body.ConfigureAwait(false);
+        // Already abandoned by a cancel, a detach or a shutdown while the body is still queued or
+        // blocked: answered at once with the typed abandonment (review P2-7). The late body
+        // finds the arbiter taken and can never exit.
+        if (operation.State == ShutdownIfUnchangedState.Abandoned)
+        {
+            return Abandoned();
+        }
+
+        // Exiting was won (or the body is finishing a refusal): wait for it, but only within the
+        // exit's own bound, never for ever.
+        if (await Task.WhenAny(body, Task.Delay(_exitBudget)).ConfigureAwait(false) == body)
+        {
+            return await body.ConfigureAwait(false);
+        }
+
+        return Fail(
+            ExitUnconfirmedCode,
+            $"The exit did not return within {_exitBudget.TotalSeconds:0.###}s; its outcome is unconfirmed. " +
+            "Observe the instance; an explicit shutdown may now end it.");
     }
 
     private object Check(ShutdownIfUnchangedOperation operation, ShutdownIfUnchangedRequest request)
@@ -289,40 +338,40 @@ public sealed class ShutdownIfUnchangedService
         }
 
         var stamp = request.SavedStamp;
-        if (stamp is not { Verified: true })
+        var verified = stamp is { Verified: true };
+        if (!verified && !request.DiscardConfirmed)
         {
             // Fallback = explicit discard mode (card v2.4 §3): no "unchanged" assurance exists,
             // so the exit needs the caller's explicit confirmation of the discard.
-            if (!request.DiscardConfirmed)
-            {
-                return Refuse(
-                    operation,
-                    ShutdownIfUnchangedCodes.DiscardNotConfirmed,
-                    "The save stamp is unverified, so no unchanged assurance exists and the discard was not " +
-                    "confirmed; ETABS was not exited.",
-                    new { exited = false, stampVerified = false });
-            }
+            return Refuse(
+                operation,
+                ShutdownIfUnchangedCodes.DiscardNotConfirmed,
+                "The save stamp is unverified, so no unchanged assurance exists and the discard was not " +
+                "confirmed; ETABS was not exited.",
+                new { exited = false, stampVerified = false });
         }
-        else
-        {
-            var changed = FindChange(request, stamp, out var inconclusive);
-            if (inconclusive is not null)
-            {
-                return Refuse(
-                    operation,
-                    ShutdownIfUnchangedCodes.CheckInconclusive,
-                    "The document and its change signal could not be re-read; ETABS was not exited.",
-                    new { reason = inconclusive, exited = false });
-            }
 
-            if (changed is not null)
-            {
-                return Refuse(
-                    operation,
-                    ShutdownIfUnchangedCodes.ChangedSinceSave,
-                    "The model changed since the reported save; ETABS was not exited. Save again.",
-                    new { reason = changed, exited = false });
-            }
+        // Discard consent waives CHANGE DETECTION, never document identity (review P1-2): in
+        // both modes the open model must still be the requested file and the expected document,
+        // or the engineer switched models after the prompt and the exit is refused.
+        var changed = FindChange(request, verified ? stamp : null, out var inconclusive);
+        if (inconclusive is not null)
+        {
+            return Refuse(
+                operation,
+                ShutdownIfUnchangedCodes.CheckInconclusive,
+                "The document and its change signal could not be re-read; ETABS was not exited.",
+                new { reason = inconclusive, exited = false });
+        }
+
+        if (changed is not null)
+        {
+            return Refuse(
+                operation,
+                ShutdownIfUnchangedCodes.ChangedSinceSave,
+                "The open model is not the one the close was decided for, or it changed since the " +
+                "reported save; ETABS was not exited. Save again.",
+                new { reason = changed, exited = false });
         }
 
         AfterCheckBeforeExitCas?.Invoke();
@@ -349,16 +398,20 @@ public sealed class ShutdownIfUnchangedService
     /// <paramref name="inconclusive"/> is set when the evidence could not be read, which is never
     /// the same as "unchanged".
     /// </summary>
-    private string? FindChange(ShutdownIfUnchangedRequest request, SavedStamp stamp, out string? inconclusive)
+    private string? FindChange(ShutdownIfUnchangedRequest request, SavedStamp? stamp, out string? inconclusive)
     {
         inconclusive = null;
         IEtabsModelFileApi api;
-        ChangeSignalReading reading;
+        ChangeSignalReading reading = ChangeSignalReading.Unsupported;
         string? reported;
         try
         {
             api = _apis.Create(_session);
-            reading = api.ReadChangeSignal();
+            if (stamp is not null)
+            {
+                reading = api.ReadChangeSignal();
+            }
+
             reported = api.GetModelFilename();
         }
 #pragma warning disable CA1031 // any read failure is inconclusive, never "unchanged"
@@ -369,15 +422,18 @@ public sealed class ShutdownIfUnchangedService
             return null;
         }
 
-        if (reading.State is ChangeSignalState.Unsupported or ChangeSignalState.Incomplete)
+        if (stamp is not null)
         {
-            inconclusive = $"the change signal is {SaveModelService.ChangeSignalName(reading.State)}";
-            return null;
-        }
+            if (reading.State is ChangeSignalState.Unsupported or ChangeSignalState.Incomplete)
+            {
+                inconclusive = $"the change signal is {SaveModelService.ChangeSignalName(reading.State)}";
+                return null;
+            }
 
-        if (reading.State == ChangeSignalState.Dirty)
-        {
-            return "ETABS reports unsaved changes";
+            if (reading.State == ChangeSignalState.Dirty)
+            {
+                return "ETABS reports unsaved changes";
+            }
         }
 
         string requestedFull;
@@ -399,23 +455,28 @@ public sealed class ShutdownIfUnchangedService
         }
 
         var now = _stamps.Read(requestedFull);
-        if (now is null)
+        if (now is null && (stamp is not null || request.ExpectedDocument?.FileId is not null))
         {
             return "the saved file is gone";
         }
 
-        if (stamp.FileId is not null && !string.Equals(now.FileId, stamp.FileId, StringComparison.Ordinal))
-        {
-            return "the saved file was replaced";
-        }
-
         if (request.ExpectedDocument?.FileId is { } expected
-            && !string.Equals(now.FileId, expected, StringComparison.Ordinal))
+            && !string.Equals(now?.FileId, expected, StringComparison.Ordinal))
         {
             return "the saved file is not the expected document";
         }
 
-        if (now.Size != stamp.Size || now.MtimeUtc != stamp.Mtime)
+        if (stamp is null)
+        {
+            return null;
+        }
+
+        if (stamp.FileId is not null && !string.Equals(now!.FileId, stamp.FileId, StringComparison.Ordinal))
+        {
+            return "the saved file was replaced";
+        }
+
+        if (now!.Size != stamp.Size || now.MtimeUtc != stamp.Mtime)
         {
             return "the saved file changed on disk since the reported save";
         }

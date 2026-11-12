@@ -75,6 +75,20 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
     public static readonly TimeSpan StaBusyWait = EtabsSession.BlockedShutdownGateWait;
 
     /// <summary>
+    /// How long a shutdown whose exit the STA STARTED waits for it to finish before it takes the
+    /// bounded cleanup (review P2-6): the graceful interval the Rust 20 s envelope assumes.
+    /// </summary>
+    public static readonly TimeSpan StartedExitGrace = ManagedEtabsShutdownMachine.GracefulExitTimeout;
+
+    /// <summary>
+    /// The overall deadline of a shutdown whose exit started (review P2-6): the graceful and the
+    /// forced interval of the ordinary exit, which is what Rust's 20 s envelope covers. After it
+    /// the answer is "unconfirmed" and the host observes.
+    /// </summary>
+    public static readonly TimeSpan StartedExitDeadline =
+        ManagedEtabsShutdownMachine.GracefulExitTimeout + ManagedEtabsShutdownMachine.ForcedExitTimeout;
+
+    /// <summary>
     /// The end-to-end worst case of a blocked shutdown RESPONSE: the envelope plus the
     /// bounded join of the stuck STA worker, which runs inside the same budget and never on
     /// top of it. Rust's 30 s response budget is this plus an 8 s margin (card V5).
@@ -112,6 +126,8 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
     private readonly ShutdownIfUnchangedRegistry? _c10;
     private readonly TimeSpan _blockedEnvelope;
     private readonly TimeSpan _staBusyWait;
+    private readonly TimeSpan _startedGrace;
+    private readonly TimeSpan _startedDeadline;
     private readonly object _gate = new();
     private Task<Result<ManagedEtabsShutdownData>>? _shutdown;
     private Task<Result<DetachData>>? _detach;
@@ -132,8 +148,12 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
         IEtabsModalDialogWatchdog watchdog,
         TimeSpan blockedEnvelope,
         TimeSpan? staBusyWait = null,
-        ShutdownIfUnchangedRegistry? c10 = null)
+        ShutdownIfUnchangedRegistry? c10 = null,
+        TimeSpan? startedGrace = null,
+        TimeSpan? startedDeadline = null)
     {
+        _startedGrace = startedGrace ?? StartedExitGrace;
+        _startedDeadline = startedDeadline ?? StartedExitDeadline;
         _worker = worker;
         _session = session;
         _watchdog = watchdog;
@@ -260,8 +280,16 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
         if (policy == ServeEofPolicy.DetachVisible && _session.IsUserVisible)
         {
             // A failed detach ends the daemon with the userVisible record intact and exits
-            // NOTHING: the next recovery detaches it (card C2, C3).
-            return DetachAnswer(await DetachAsync().ConfigureAwait(false));
+            // NOTHING: the next recovery detaches it (card C2, C3). The session is told, so the
+            // disposal of the DI scope that follows cannot exit what this path left running
+            // (review P1-1).
+            var detached = await DetachAsync().ConfigureAwait(false);
+            if (!detached.Success)
+            {
+                _session.SuppressFurtherExit();
+            }
+
+            return DetachAnswer(detached);
         }
 
         return await RunShutdownAsync().ConfigureAwait(false);
@@ -362,10 +390,32 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
             started.Task,
             queued,
             Task.Delay(_staBusyWait, giveUp.Token)).ConfigureAwait(false);
-        if (first == started.Task || first == queued)
+        if (first == queued)
         {
             await giveUp.CancelAsync().ConfigureAwait(false);
             return await queued.ConfigureAwait(false);
+        }
+
+        if (first == started.Task)
+        {
+            // The exit STARTED. It keeps its graceful interval, but it stays supervised (review
+            // P2-6): ExitWithoutSaving is a synchronous COM call that a hung exit or a modal
+            // that appears now would never return from. Past the grace, the bounded cleanup
+            // takes over, and the whole shutdown is answered by the started-exit deadline.
+            await giveUp.CancelAsync().ConfigureAwait(false);
+            if (await Task.WhenAny(queued, Task.Delay(_startedGrace)).ConfigureAwait(false) == queued)
+            {
+                return await queued.ConfigureAwait(false);
+            }
+
+            _ = queued.ContinueWith(
+                static task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+            Console.Error.WriteLine(
+                "⚠ The ordinary ETABS exit did not return within its grace; taking the bounded cleanup.");
+            return await ShutdownBlockedSessionAsync(TimeSpan.Zero, clock, _startedDeadline).ConfigureAwait(false);
         }
 
         // The STA is busy. The queued exit is left in place: if it ever runs, the session
@@ -389,8 +439,10 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
     /// </summary>
     private async Task<ManagedEtabsShutdownResult> ShutdownBlockedSessionAsync(
         TimeSpan? gateWaitSpent,
-        Stopwatch clock)
+        Stopwatch clock,
+        TimeSpan? limit = null)
     {
+        var overall = limit ?? _blockedEnvelope;
         Console.Error.WriteLine(
             "⚠ Shutdown while a command is blocked on an ETABS dialog; " +
             "shutting the session down from a dedicated thread.");
@@ -421,7 +473,7 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
         }
 
         thread.Start();
-        var remaining = _blockedEnvelope - clock.Elapsed;
+        var remaining = overall - clock.Elapsed;
         try
         {
             return await completion.Task
@@ -434,7 +486,7 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
                 false,
                 ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
                 "Shutdown of the blocked ETABS session did not finish within " +
-                $"{_blockedEnvelope.TotalSeconds:0.###}s; the exact owned process exit is unconfirmed.",
+                $"{overall.TotalSeconds:0.###}s; the exact owned process exit is unconfirmed.",
                 Unconfirmed());
         }
     }

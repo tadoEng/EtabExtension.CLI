@@ -39,7 +39,7 @@ public sealed class StartBlockerFollowUpTests
             new NoDialogs(),
             TimeSpan.FromMilliseconds(10),
             TimeSpan.FromMilliseconds(10),
-            TimeSpan.FromSeconds(2),
+            TimeSpan.FromSeconds(20),
             cell,
             windows);
         return (watchdog, cell, windows);

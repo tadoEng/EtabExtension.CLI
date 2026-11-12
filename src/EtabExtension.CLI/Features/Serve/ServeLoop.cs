@@ -35,7 +35,13 @@ public sealed class ServeLoop
         "cancel-operation",
         "get-operation-events",
         "get-operation-status",
-        "get-status"
+        "get-status",
+
+        // Registered and timed at INTAKE (review P1-3). Its body queues on the STA like any
+        // synchronous command, but its cancellation entry and its Checking deadline exist from
+        // the moment it is read, so a request stuck behind a blocked command can still be
+        // cancelled or expire, and can never later exit on an old decision.
+        "shutdown-if-unchanged"
     };
 
     private readonly IServeDispatcher _dispatcher;

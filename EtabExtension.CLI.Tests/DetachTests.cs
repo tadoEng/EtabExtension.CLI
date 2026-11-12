@@ -168,7 +168,7 @@ public sealed class DetachTests
     [Fact]
     public void ADetachTimeoutDuringTheWriteIsUncertainAndNeverRolledBack()
     {
-        var rig = Ready(budget: TimeSpan.FromMilliseconds(150));
+        var rig = Ready(budget: TimeSpan.FromMilliseconds(1500));
         using var writing = new ManualResetEventSlim(false);
         using var release = new ManualResetEventSlim(false);
         rig.L.Records.OnWrite = record =>
@@ -192,7 +192,15 @@ public sealed class DetachTests
             () => rig.L.Records.Writes.ToArray().Any(r => r.Phase == ManagedEtabsRecordPhase.Detached),
             "the stalled write to land");
 
-        Assert.Equal(LaunchLifecycle.DetachUncertain, Launch(rig).Lifecycle);
+        // Review P2-8: the late successful write is committed handoff evidence, not a stranded
+        // "detaching" with the record already cleared.
+        WaitFor(() => Launch(rig).Lifecycle == LaunchLifecycle.Detached, "the late detach to publish its hand-off");
+
+        Assert.Equal(EtabsDisposition.Detached, rig.Session.Disposition);
+        Assert.Null(rig.Session.ProcessId);
+        var later = rig.Session.Shutdown();
+        Assert.True(later.Success);
+        Assert.Equal(EtabsDisposition.Detached, later.Data.Disposition);
         Assert.Equal(0, rig.L.Process.KillCount);
         Assert.Equal(0, rig.L.Api.ExitCount);
     }
@@ -201,7 +209,7 @@ public sealed class DetachTests
     [Fact]
     public void ADetachTimeoutAfterTheCommitIsHandedOff()
     {
-        var rig = Ready(budget: TimeSpan.FromMilliseconds(150));
+        var rig = Ready(budget: TimeSpan.FromMilliseconds(1500));
         using var hold = new ManualResetEventSlim(false);
         rig.Session.AfterDetachWrite = () => hold.Signalled("the test to release the slow best-effort steps");
 

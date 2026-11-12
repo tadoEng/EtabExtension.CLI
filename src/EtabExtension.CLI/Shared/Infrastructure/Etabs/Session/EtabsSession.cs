@@ -58,6 +58,14 @@ public interface IEtabsSession : IDisposable
         ManagedEtabsShutdownErrorCodes.DetachFailed,
         "This session does not support detach.");
 
+    /// <summary>
+    /// After a failed EOF detach left ETABS running on purpose: no later exit, kill or disposal
+    /// of this session may end it (review P1-1).
+    /// </summary>
+    void SuppressFurtherExit()
+    {
+    }
+
     /// <summary>True once the user was shown ETABS and this daemon still owns it (card C2).</summary>
     bool IsUserVisible => false;
 
@@ -297,8 +305,66 @@ public sealed class EtabsSession : IEtabsSession
     /// only when a detach won: the instance is then the user's, and no rival path may exit or
     /// kill it (card C1, I11).
     /// </summary>
-    private static bool MayTerminate(EtabsLaunchState? launch) =>
-        launch is null || launch.TryBeginReadyTermination() || !launch.IsDetachDisposition;
+    private bool MayTerminate(EtabsLaunchState? launch)
+    {
+        if (launch is null)
+        {
+            return true;
+        }
+
+        // A CAS loop over EXPLICIT states (review P1-4). Observing Ready is never enough: the
+        // path must WIN Ready -> Terminating, or it learns that something else owns the
+        // instance. A detach that rolled back and a retried detach can both pass through Ready
+        // in between, so the decision is re-made from the live state every time.
+        while (true)
+        {
+            var observed = launch.Lifecycle;
+            BetweenFenceObservationAndCas?.Invoke();
+            switch (observed)
+            {
+                case LaunchLifecycle.Ready:
+                    if (launch.TryBeginReadyTermination())
+                    {
+                        return true;
+                    }
+
+                    continue;
+                case LaunchLifecycle.Detaching:
+                case LaunchLifecycle.Detached:
+                case LaunchLifecycle.DetachUncertain:
+                    return false;
+                default:
+                    // Launching, Committing, Terminating, Ended: the termination fence is
+                    // already owned elsewhere (or never applied), and nothing detached.
+                    return true;
+            }
+        }
+    }
+
+    /// <summary>Test seam: runs between observing the lifecycle and the fence CAS (review P1-4).</summary>
+    internal Action? BetweenFenceObservationAndCas { get; set; }
+
+    // Set by the EOF path once a detach-visible detach failed and left ETABS running on purpose
+    // (review P1-1): nothing - including disposal of this session - may then exit or kill it.
+    private int _exitSuppressed;
+
+    /// <inheritdoc />
+    public void SuppressFurtherExit() => Volatile.Write(ref _exitSuppressed, 1);
+
+    private ManagedEtabsShutdownResult SuppressedAnswer() => new(
+        false,
+        ManagedEtabsShutdownErrorCodes.DetachFailed,
+        "ETABS was deliberately left running (a failed detach on EOF); nothing was exited or killed.",
+        new(
+            ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+            ProcessExitConfirmed: false,
+            Forced: false,
+            RecordRetained: true,
+            ApplicationExitReturnCode: null,
+            OwnedPid: _cell.Identity?.Pid)
+        {
+            Disposition = EtabsDisposition.Owned
+        });
 
     public ETABSApplication GetOrStart() => GetOrStartOwned().Application;
 
@@ -1208,7 +1274,14 @@ public sealed class EtabsSession : IEtabsSession
         Quietly("process handle hand-off", owned.ReleaseOwnedProcessHandleForHandoff);
         Quietly("record clear", launch.ClearRecordAfterHandoff);
         Quietly("publication clear", launch.ClearPublication);
-        _ = launch.TryTransition(LaunchLifecycle.Detaching, LaunchLifecycle.Detached);
+        // A write that landed AFTER the supervisor gave up (Uncertain) is committed handoff
+        // evidence now (review P2-8): publish it, or status would strand at "detaching" with
+        // the record already cleared.
+        if (!launch.TryTransition(LaunchLifecycle.Detaching, LaunchLifecycle.Detached))
+        {
+            _ = launch.TryTransition(LaunchLifecycle.DetachUncertain, LaunchLifecycle.Detached);
+        }
+
         _diagnostics.WriteLine($"✓ ETABS handed to the user (PID {identity.Pid}); this daemon no longer owns it.");
         return launch.Lifecycle == LaunchLifecycle.Detached
             ? new(DetachOutcome.Detached, null, null, identity, launch.LaunchRecordId)
@@ -1249,6 +1322,13 @@ public sealed class EtabsSession : IEtabsSession
         TimeSpan? gateWaitOverride = null)
     {
         var launch = Volatile.Read(ref _launch);
+
+        // -1. The EOF path chose to leave a visible instance running (review P1-1). Disposal of
+        //     the DI scope lands here too, and must not take the gate or end anything.
+        if (Volatile.Read(ref _exitSuppressed) == 1)
+        {
+            return SuppressedAnswer();
+        }
 
         // 0. A detach holds the instance: shutdown and EOF take NO destructive step and
         //    answer the detach's own disposition (card C1, I11).
