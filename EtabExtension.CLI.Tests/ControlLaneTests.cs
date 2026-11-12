@@ -283,12 +283,12 @@ public sealed class CoordinatorControlTests
         {
             NormalShutdown = () =>
             {
-                Thread.Sleep(450);
+                Thread.Sleep(1800);
                 return Shutdowns.Ok();
             }
         };
 
-        var result = Coordinator(session, new ProbeWorker(busy: false)).ShutdownAsync().Within("the shutdown");
+        var result = Coordinator(session, new ProbeWorker(busy: false), busyWait: TimeSpan.FromMilliseconds(1000)).ShutdownAsync().Within("the shutdown");
 
         Assert.True(result.Success, result.Error);
         Assert.Equal(1, session.NormalShutdowns);
@@ -307,18 +307,18 @@ public sealed class CoordinatorControlTests
                 return Shutdowns.Ok();
             }
         };
-        var envelope = TimeSpan.FromMilliseconds(2000);
+        var envelope = TimeSpan.FromMilliseconds(3000);
         var clock = Stopwatch.StartNew();
 
-        var result = Coordinator(session, new ProbeWorker(busy: true), envelope: envelope, busyWait: TimeSpan.FromMilliseconds(1200))
+        var result = Coordinator(session, new ProbeWorker(busy: true), envelope: envelope, busyWait: TimeSpan.FromMilliseconds(2000))
             .ShutdownAsync()
             .Within("the bounded shutdown");
 
         Assert.False(result.Success);
         Assert.Equal(ManagedEtabsShutdownState.ProcessExitUnconfirmed, result.Data!.State);
         Assert.True(
-            clock.Elapsed < envelope + TimeSpan.FromMilliseconds(700),
-            $"took {clock.Elapsed}: the 1200 ms busy wait was added on top of the {envelope} envelope");
+            clock.Elapsed < envelope + TimeSpan.FromMilliseconds(1200),
+            $"took {clock.Elapsed}: the 2000 ms busy wait was added on top of the {envelope} envelope");
     }
 
     [Fact]

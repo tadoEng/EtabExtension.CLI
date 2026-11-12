@@ -447,7 +447,7 @@ public sealed class ShutdownIfUnchangedTests
     [Fact]
     public void OnceTheExitCasIsWonATimeoutNeverAbandonsItAndTheExitRunsToItsAnswer()
     {
-        var rig = new Rig(budget: TimeSpan.FromMilliseconds(150));
+        var rig = new Rig(budget: TimeSpan.FromMilliseconds(1500));
         using var exitStarted = new ManualResetEventSlim(false);
         using var finishExit = new ManualResetEventSlim(false);
         rig.Session.NormalShutdown = () =>
@@ -459,7 +459,7 @@ public sealed class ShutdownIfUnchangedTests
 
         var running = rig.Run(Request());
         exitStarted.Signalled("the exit to start");
-        Thread.Sleep(450); // well past the 150 ms Checking budget
+        Thread.Sleep(2000); // well past the 1.5 s Checking budget
 
         Assert.False(running.IsCompleted, "a won exit is not answered as a Checking timeout");
         Assert.False(rig.Registry.AbandonCurrent(), "an exiting operation cannot be abandoned");

@@ -283,8 +283,8 @@ internal sealed class RecordingCoordinator : IServeShutdownCoordinator
 
     public Task<Result<ManagedEtabsShutdownData>> EndOfInputAsync(ServeEofPolicy policy)
     {
-        _ = Interlocked.Increment(ref _eof);
         EofPolicy = policy;
+        _ = Interlocked.Increment(ref _eof);
         return Task.FromResult(Result.Ok(Shutdowns.Ok().Data));
     }
 

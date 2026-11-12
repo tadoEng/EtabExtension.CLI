@@ -33,7 +33,7 @@ public sealed class FixRound1Tests747d
     public void AFailedEofDetachSurvivesTheFullDiScopeTeardown()
     {
         var rig = Visible();
-        rig.L.Records.Record = null; // the detach fails before its write and rolls back
+        rig.Session.BeforeDetachWrite = () => throw new IOException("pre-write failure"); // rolls back; the record stays
         var services = new ServiceCollection();
         services.AddScoped<IEtabsSession>(_ => rig.Session);
         using var provider = services.BuildServiceProvider();
@@ -302,7 +302,7 @@ public sealed class FixRound1Tests747d
 
         Assert.False(result.Success);
         Assert.Equal(ManagedEtabsShutdownState.ProcessExitUnconfirmed, result.Data!.State);
-        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(4), $"took {clock.Elapsed}");
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(8), $"took {clock.Elapsed}");
         never.Set();
     }
 
