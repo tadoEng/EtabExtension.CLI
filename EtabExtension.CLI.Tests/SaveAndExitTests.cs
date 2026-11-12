@@ -1469,13 +1469,15 @@ public sealed class SaveAndExitFileIdTests
     private static string Error(object result) =>
         Assert.IsType<Result>(result, exactMatch: false).Error ?? string.Empty;
 
-    private static (SaveAndExitRig Rig, PathStamps Stamps) Build(double? etOffsetMs, string edbId = NewId, int saveReturn = 0)
+    private static long Ms(double ms) => TimeSpan.FromMilliseconds(ms).Ticks;
+
+    private static (SaveAndExitRig Rig, PathStamps Stamps) Build(long? etOffsetTicks, string edbId = NewId, int saveReturn = 0)
     {
         var stamps = new PathStamps();
         stamps.Set(SaveAndExitRig.Edb, new SavedFileStamp(edbId, 100, T));
-        if (etOffsetMs is { } offset)
+        if (etOffsetTicks is { } offset)
         {
-            stamps.Set(SaveAndExitRig.Et, new SavedFileStamp("et", 50, T.AddMilliseconds(offset)));
+            stamps.Set(SaveAndExitRig.Et, new SavedFileStamp("et", 50, T.AddTicks(offset)));
         }
 
         var rig = new SaveAndExitRig(reader: stamps);
@@ -1492,7 +1494,7 @@ public sealed class SaveAndExitFileIdTests
     [Fact]
     public void ANewFileIdWithAMatchingFreshEtIsAcceptedAndReportedAndTheRecordRefreshed()
     {
-        var (rig, _) = Build(etOffsetMs: 15);
+        var (rig, _) = Build(etOffsetTicks: Ms(15));
 
         var result = rig.Run().Within("the command");
 
@@ -1504,14 +1506,11 @@ public sealed class SaveAndExitFileIdTests
     }
 
     // An external replacement does not touch the .$et. Mutation: accept without the evidence.
-    [Theory]
-    [InlineData(null)] // no .$et at all
-    [InlineData(-3600000.0)] // an old .$et
-    [InlineData(-600.0)] // just before the window
-    [InlineData(5100.0)] // just after the window
-    public void ANewFileIdWithoutEtabsSaveEvidenceRefusesNothingSavedNothingExited(double? etOffsetMs)
+    // Without evidence a changed id refuses. Mutation: accept without the evidence.
+    [Fact]
+    public void ANewFileIdWithNoEtRefusesNothingSavedNothingExited()
     {
-        var (rig, _) = Build(etOffsetMs);
+        var (rig, _) = Build(etOffsetTicks: null);
 
         var result = rig.Run().Within("the command");
 
@@ -1519,25 +1518,66 @@ public sealed class SaveAndExitFileIdTests
         rig.AssertUntouched();
     }
 
-    [Theory]
-    [InlineData(-400.0)]
-    [InlineData(4900.0)]
-    public void TheEvidenceWindowEdgesAreNamedAndAccepted(double etOffsetMs)
+    [Fact]
+    public void ANewFileIdWithAnOldEtRefusesNothingSavedNothingExited()
     {
-        Assert.Equal(TimeSpan.FromMilliseconds(500), SaveAndExitService.EtEvidenceBefore);
-        Assert.Equal(TimeSpan.FromSeconds(5), SaveAndExitService.EtEvidenceAfter);
-        var (rig, _) = Build(etOffsetMs);
+        var (rig, _) = Build(Ms(-3600000));
 
         var result = rig.Run().Within("the command");
 
-        Assert.True(Assert.IsType<Result<SaveAndExitData>>(result).Success);
+        Assert.Contains(SaveAndExitCodes.DocumentUnverified, Error(result), StringComparison.Ordinal);
+        rig.AssertUntouched();
+    }
+
+    // The window is [-500 ms, +5000 ms], inclusive: one tick outside each end refuses.
+    [Fact]
+    public void AnEtOneTickBeforeTheWindowRefuses()
+    {
+        var (rig, _) = Build(-SaveAndExitService.EtEvidenceBefore.Ticks - 1);
+
+        var result = rig.Run().Within("the command");
+
+        Assert.Contains(SaveAndExitCodes.DocumentUnverified, Error(result), StringComparison.Ordinal);
+        rig.AssertUntouched();
+    }
+
+    [Fact]
+    public void AnEtOneTickAfterTheWindowRefuses()
+    {
+        var (rig, _) = Build(SaveAndExitService.EtEvidenceAfter.Ticks + 1);
+
+        var result = rig.Run().Within("the command");
+
+        Assert.Contains(SaveAndExitCodes.DocumentUnverified, Error(result), StringComparison.Ordinal);
+        rig.AssertUntouched();
+    }
+
+    // The exact endpoints are INSIDE the window. Mutation: an exclusive comparison on either side.
+    [Fact]
+    public void TheEvidenceWindowEndpointsAreNamedAndInclusive()
+    {
+        Assert.Equal(TimeSpan.FromMilliseconds(500), SaveAndExitService.EtEvidenceBefore);
+        Assert.Equal(TimeSpan.FromSeconds(5), SaveAndExitService.EtEvidenceAfter);
+
+        foreach (var offset in new[]
+                 {
+                     -SaveAndExitService.EtEvidenceBefore.Ticks,
+                     SaveAndExitService.EtEvidenceAfter.Ticks
+                 })
+        {
+            var (rig, _) = Build(offset);
+
+            var result = rig.Run().Within("the command");
+
+            Assert.True(Assert.IsType<Result<SaveAndExitData>>(result).Success, $"offset {offset} ticks");
+        }
     }
 
     // The unchanged id needs no evidence and reports no change.
     [Fact]
     public void AnUnchangedFileIdNeedsNoEvidenceAndReportsNoChange()
     {
-        var (rig, _) = Build(etOffsetMs: null, edbId: SaveAndExitRig.FileId);
+        var (rig, _) = Build(etOffsetTicks: null, edbId: SaveAndExitRig.FileId);
 
         var result = rig.Run().Within("the command");
 
@@ -1550,7 +1590,7 @@ public sealed class SaveAndExitFileIdTests
     [Fact]
     public void ADifferentObservedPathStillRefusesEvenWithEvidence()
     {
-        var (rig, _) = Build(etOffsetMs: 15);
+        var (rig, _) = Build(etOffsetTicks: Ms(15));
         rig.Api.CurrentPath = @"D:\Project\.etabs-ext\main\working\other.edb";
 
         var result = rig.Run().Within("the command");
@@ -1563,7 +1603,7 @@ public sealed class SaveAndExitFileIdTests
     [Fact]
     public void AFailedSaveDoesNotAdoptTheNewFileId()
     {
-        var (rig, _) = Build(etOffsetMs: 15, saveReturn: 7);
+        var (rig, _) = Build(etOffsetTicks: Ms(15), saveReturn: 7);
 
         var result = rig.Run().Within("the command");
 
@@ -1661,13 +1701,30 @@ public sealed class SaveAndExitFixRound1Tests
         var write = Kit.OnDedicatedThread(() => rig.Session.RecordOpenedDocument(
             new EtabsDocumentRecord(Path.GetFullPath(SaveAndExitRig.Edb), SaveAndExitRig.FileId)));
         paused.Signalled("the writer to pause after its read");
-        var detach = Kit.OnDedicatedThread(rig.Session.Detach);
-        Thread.Sleep(300);
+        var writesBeforeDetach = rig.L.Records.Writes.Count;
+
+        DetachResult? detached = null;
+        var detachThread = new Thread(() => detached = rig.Session.Detach()) { IsBackground = true };
+        detachThread.Start();
+
+        // Contention is PROVEN, not slept for: the detach thread is blocked (waiting on the gate
+        // the paused writer holds) and has not finished. Without the gate it would complete here.
+        Kit.WaitUntil(
+            () => detachThread.ThreadState.HasFlag(ThreadState.WaitSleepJoin) || !detachThread.IsAlive,
+            "the detach to reach the record gate");
+        Assert.True(detachThread.IsAlive, "the detach must be waiting behind the writer, not finished");
+        Assert.Null(detached);
+
         resume.Set();
         _ = write.Within("the writer");
-        var detached = detach.Within("the detach");
+        Assert.True(detachThread.Join(TimeSpan.FromSeconds(10)), "the detach to finish after the writer");
 
-        Assert.Equal(DetachOutcome.Detached, detached.Outcome);
+        // Transaction order: the writer's write first, THEN the detach's write; the record ends cleared.
+        var order = rig.L.Records.Writes.Skip(writesBeforeDetach).Select(w => w.Phase).ToArray();
+        Assert.Equal(
+            [ManagedEtabsRecordPhase.Ready, ManagedEtabsRecordPhase.Detached],
+            order);
+        Assert.Equal(DetachOutcome.Detached, detached!.Outcome);
         Assert.Null(rig.L.Records.Record);
         Assert.Equal(0, rig.L.Process.KillCount);
     }
@@ -1793,5 +1850,127 @@ public sealed class SaveAndExitFixRound1Tests
         Assert.Contains("\"saved\":true", error, StringComparison.Ordinal);
         Assert.Contains("\"exited\":\"unknown\"", error, StringComparison.Ordinal);
         Assert.False(rig.Registry.Begin(2) is null, "the operation ended");
+    }
+}
+
+/// <summary>Fix round 2 (Codex recheck of C11): a passive record refresh, fenced by the arbiter.</summary>
+public sealed class SaveAndExitFixRound2Tests
+{
+    private const string NextId = "00020000-0000000000003400";
+
+    private static string Error(object result) =>
+        Assert.IsType<Result>(result, exactMatch: false).Error ?? string.Empty;
+
+    private static EtabsDocumentRecord Document(string fileId) =>
+        new(Path.GetFullPath(SaveAndExitRig.Edb), fileId);
+
+    // P1: the refresh never starts, verifies-with-teardown, exits or kills. A real session whose
+    // process inspection fails still takes the write and ends nothing.
+    // Mutation: the refresh goes through GetOrStartOwned.
+    [Fact]
+    public void APassiveRefreshWithFailingProcessInspectionEndsNothingAndStillWrites()
+    {
+        var sessionRig = new SessionRig();
+        _ = sessionRig.Session.GetOrStartOwned();
+        Assert.True(sessionRig.Session.RecordOpenedDocument(Document(SaveAndExitRig.FileId)).Success);
+        sessionRig.L.Census.Live = null; // every later inspection fails
+
+        var refreshed = sessionRig.Session.RefreshRecordedDocument(Document(NextId));
+
+        Assert.True(refreshed.Success, refreshed.Error);
+        Assert.Equal(NextId, sessionRig.Session.ReadRecordedDocument()!.FileId);
+        Assert.Equal(0, sessionRig.L.Api.ExitCount);
+        Assert.Equal(0, sessionRig.L.Process.KillCount);
+        Assert.True(sessionRig.Session.IsStarted);
+    }
+
+    [Fact]
+    public void APassiveRefreshOnASessionThatNeverStartedStartsNothing()
+    {
+        var sessionRig = new SessionRig();
+
+        var refreshed = sessionRig.Session.RefreshRecordedDocument(Document(NextId));
+
+        Assert.False(refreshed.Success);
+        Assert.False(sessionRig.Session.IsStarted);
+        Assert.Empty(sessionRig.L.Events.Where(e => e.StartsWith("spawn", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    // P1 + P2 end to end, real session: the Save completes AFTER a cancel and process inspection
+    // then fails. Nothing is exited or killed, and the record is untouched.
+    [Fact]
+    public void ASaveThatCompletesAfterACancelWithFailingInspectionEndsNothingAndAdoptsNothing()
+    {
+        var sessionRig = new SessionRig();
+        _ = sessionRig.Session.GetOrStartOwned();
+        Assert.True(sessionRig.Session.RecordOpenedDocument(Document(SaveAndExitRig.FileId)).Success);
+        var rig = new SaveAndExitRig(session: sessionRig.Session);
+        using var saving = new ManualResetEventSlim(false);
+        using var finish = new ManualResetEventSlim(false);
+        rig.Api.OnSave = () =>
+        {
+            saving.Set();
+            finish.Signalled("the test to finish the save");
+            sessionRig.L.Census.Live = null;
+            rig.Stamps.Current = new SavedFileStamp(NextId, 120, SaveAndExitRig.Saved.AddSeconds(5));
+            return 0;
+        };
+        Task<object>? sta = null;
+        var running = rig.Service.RunAsync(
+            SaveAndExitRig.Request(),
+            1,
+            body => sta = Kit.OnDedicatedThread(() => body().GetAwaiter().GetResult()));
+        saving.Signalled("the save to start");
+        Assert.Equal(SaveAndExitState.Abandoned, rig.Registry.Cancel(1));
+        Assert.Contains(SaveAndExitCodes.Abandoned, Error(running.Within("the abandonment answer")), StringComparison.Ordinal);
+
+        finish.Set();
+        _ = sta!.Within("the late body to complete");
+
+        Assert.Equal(0, sessionRig.L.Api.ExitCount);
+        Assert.Equal(0, sessionRig.L.Process.KillCount);
+        Assert.Equal(SaveAndExitRig.FileId, sessionRig.Session.ReadRecordedDocument()!.FileId);
+    }
+
+    // P2: a late Save with a GENUINELY changed file id never adopts it after Unknown or Abandoned.
+    // Mutation: refresh before the exit CAS.
+    [Theory]
+    [InlineData("timeout")]
+    [InlineData("cancel")]
+    public void ALateSaveWithAChangedFileIdNeverAdoptsItAfterUnknownOrAbandoned(string rival)
+    {
+        var stamps = new PathStamps();
+        stamps.Set(SaveAndExitRig.Edb, new SavedFileStamp(SaveAndExitRig.FileId, 100, SaveAndExitRig.Saved));
+        var rig = new SaveAndExitRig(
+            savingBudget: rival == "timeout" ? TimeSpan.FromMilliseconds(1500) : null,
+            reader: stamps);
+        using var saving = new ManualResetEventSlim(false);
+        using var finish = new ManualResetEventSlim(false);
+        rig.Api.OnSave = () =>
+        {
+            saving.Set();
+            finish.Signalled("the test to finish the late save");
+            stamps.Set(SaveAndExitRig.Edb, new SavedFileStamp(NextId, 120, SaveAndExitRig.Saved.AddSeconds(5)));
+            return 0;
+        };
+        Task<object>? sta = null;
+        var running = rig.Service.RunAsync(
+            SaveAndExitRig.Request(),
+            1,
+            body => sta = Kit.OnDedicatedThread(() => body().GetAwaiter().GetResult()));
+        saving.Signalled("the save to start");
+        if (rival == "cancel")
+        {
+            Assert.Equal(SaveAndExitState.Abandoned, rig.Registry.Cancel(1));
+        }
+
+        _ = running.Within("the early answer");
+
+        finish.Set();
+        _ = sta!.Within("the late body to complete");
+
+        Assert.Empty(rig.Session.RecordedWrites);
+        Assert.Equal(SaveAndExitRig.FileId, rig.Session.RecordedDocument!.FileId);
+        rig.AssertNeverExited();
     }
 }

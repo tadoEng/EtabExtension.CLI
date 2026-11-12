@@ -110,6 +110,8 @@ internal sealed class ProbeSession : IEtabsSession
         return Result.Ok();
     }
 
+    public Result RefreshRecordedDocument(EtabsDocumentRecord document) => RecordOpenedDocument(document);
+
     public EtabsDocumentRecord? ReadRecordedDocument() => RecordedDocument;
 
     public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();

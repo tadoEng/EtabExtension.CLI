@@ -615,21 +615,7 @@ public sealed class SaveAndExitService
                 new { stage = "saving", saved = false, exited = false });
         }
 
-        // ETABS replaces the EDB on every save, so its file id is new: keep the record current
-        // (live, 13 Nov). Best effort: the record is about to be retired by the exit, and a stale
-        // id is accepted at the next verification anyway (the path is the identity).
         var saved = new EtabsDocumentRecord(destination, after.FileId);
-        try
-        {
-            _ = _session.RecordOpenedDocument(saved);
-        }
-#pragma warning disable CA1031 // the exit does not depend on refreshing a record it is about to end
-        catch (Exception exception)
-#pragma warning restore CA1031
-        {
-            Console.Error.WriteLine($"⚠ The saved document could not be re-recorded: {exception.Message}");
-        }
-
         operation.SavedDocument = saved;
         operation.FileIdChanged = fileIdChanged;
         AfterSaveBeforeExitCas?.Invoke();
@@ -640,6 +626,21 @@ public sealed class SaveAndExitService
         if (!operation.TryEnterExiting())
         {
             return AbandonedAnswer();
+        }
+
+        // ETABS replaces the EDB on every save, so its file id is new (live, 13 Nov). Adopt it ONLY
+        // now that this operation owns the exit - never after Unknown, Abandoned, a timeout or a
+        // cancel - and only through the PASSIVE writer, which can never start, verify-with-teardown,
+        // exit or kill ETABS. Best effort: the exit that follows ends the record anyway.
+        try
+        {
+            _ = _session.RefreshRecordedDocument(saved);
+        }
+#pragma warning disable CA1031 // the exit does not depend on refreshing a record it is about to end
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            Console.Error.WriteLine($"⚠ The saved document could not be re-recorded: {exception.Message}");
         }
 
         ManagedEtabsShutdownResult terminal;

@@ -89,6 +89,15 @@ public interface IEtabsSession : IDisposable
     /// </summary>
     EtabsDocumentRecord? ReadRecordedDocument() => null;
 
+    /// <summary>
+    /// PASSIVE update of the recorded document (C11 fix round 2). Unlike
+    /// <see cref="RecordOpenedDocument"/> it NEVER starts, verifies-with-teardown, exits, kills or
+    /// latches anything: it only rewrites this launch's own record, and fails (typed) when there
+    /// is no owned launch or the record is not this launch's. For callers that already won their
+    /// right to act and must not be able to end ETABS through a bookkeeping write.
+    /// </summary>
+    Result RefreshRecordedDocument(EtabsDocumentRecord document) => Result.Ok();
+
     /// <summary>True once the user was shown ETABS and this daemon still owns it (card C2).</summary>
     bool IsUserVisible => false;
 
@@ -1112,32 +1121,57 @@ public sealed class EtabsSession : IEtabsSession
         lock (_gate)
         {
             var owned = GetOrStartOwned();
-            var launch = Volatile.Read(ref _launch);
-            if (launch is null)
-            {
-                return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
-                    $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] There is no launch to record the " +
-                    "opened document for."));
-            }
+            return WriteDocument(Volatile.Read(ref _launch), owned.Identity, document);
+        }
+    }
 
-            try
-            {
-                return launch.WriteDocumentRecord(owned.Identity, document)
-                    ? Result.Ok()
-                    : Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
-                        $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] The recovery record is not this " +
-                        "launch's, so the opened document was not recorded."));
-            }
+    /// <inheritdoc />
+    public Result RefreshRecordedDocument(EtabsDocumentRecord document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+
+        // No session gate, no identity proof, no start: only what this session already holds.
+        var launch = Volatile.Read(ref _launch);
+        var owned = Volatile.Read(ref _owned);
+        if (launch is null || owned is null)
+        {
+            return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] There is no owned launch to refresh the " +
+                "recorded document for."));
+        }
+
+        return WriteDocument(launch, owned.Identity, document);
+    }
+
+    private static Result WriteDocument(
+        EtabsLaunchState? launch,
+        ManagedProcessIdentity identity,
+        EtabsDocumentRecord document)
+    {
+        if (launch is null)
+        {
+            return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] There is no launch to record the " +
+                "opened document for."));
+        }
+
+        try
+        {
+            return launch.WriteDocumentRecord(identity, document)
+                ? Result.Ok()
+                : Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                    $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] The recovery record is not this " +
+                    "launch's, so the opened document was not recorded."));
+        }
 #pragma warning disable CA1031 // any failure to persist means the identity is not recorded
-            catch (Exception exception)
+        catch (Exception exception)
 #pragma warning restore CA1031
-            {
-                return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
-                    $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] The opened document could not be " +
-                    "recorded. " + EtabsApiDiagnosticFormatter.InfrastructureException(
-                        "ManagedEtabsSessionRecord.Write(document)",
-                        exception)));
-            }
+        {
+            return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] The opened document could not be " +
+                "recorded. " + EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "ManagedEtabsSessionRecord.Write(document)",
+                    exception)));
         }
     }
 
