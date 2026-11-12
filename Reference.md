@@ -415,6 +415,7 @@ etab-cli extract-results \
 | `materialListByStory` | `material_list_by_story.parquet` | No | — | — | No |
 | `materialPropertiesConcreteData` | `material_properties_concrete_data.parquet` | No | — | — | No |
 | `materialPropertiesBasicMechanicalProperties` | `material_properties_basic_mechanical_properties.parquet` | No | — | — | No (fields fixed to `Material`, `UnitWeight`) |
+| `materialPropertiesGeneral` | `material_properties_general.parquet` | No | — | — | No (fields fixed to `Material`, `Type`) |
 | `groupAssignments` | `group_assignments.parquet` | No | — | — | No |
 | `storyDefinitions` | `story_definitions.parquet` | No | — | — | No |
 | `pierSectionProperties` | `pier_section_properties.parquet` | No | — | — | Yes |
@@ -436,6 +437,7 @@ etab-cli extract-results \
     "materialListByStory":         {},
     "materialPropertiesConcreteData": {},
     "materialPropertiesBasicMechanicalProperties": {},
+    "materialPropertiesGeneral": {},
     "groupAssignments":            {},
     "storyDefinitions":            {},
     "pierSectionProperties":       {},
@@ -456,6 +458,7 @@ etab-cli extract-results \
     "materialListByStory": {},
     "materialPropertiesConcreteData": {},
     "materialPropertiesBasicMechanicalProperties": {},
+    "materialPropertiesGeneral": {},
     "groupAssignments": {},
     "storyDefinitions": {},
     "baseReactions": {

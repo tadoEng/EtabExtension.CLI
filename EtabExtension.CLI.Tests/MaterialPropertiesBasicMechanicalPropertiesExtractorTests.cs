@@ -114,6 +114,7 @@ public sealed class MaterialPropertiesBasicMechanicalPropertiesExtractorTests : 
         new MaterialListByStoryExtractor(NullLogger<MaterialListByStoryExtractor>.Instance),
         new MaterialPropertiesConcreteDataExtractor(NullLogger<MaterialPropertiesConcreteDataExtractor>.Instance),
         NewExtractor(),
+        new MaterialPropertiesGeneralExtractor(NullLogger<MaterialPropertiesGeneralExtractor>.Instance),
         new GroupAssignmentsExtractor(NullLogger<GroupAssignmentsExtractor>.Instance),
         new StoryDefinitionsExtractor(NullLogger<StoryDefinitionsExtractor>.Instance),
         new BaseReactionsExtractor(NullLogger<BaseReactionsExtractor>.Instance),

@@ -291,6 +291,7 @@ etab-cli extract-results -f <path.edb> -o <outputDir> -r '<requestJson>'
     "materialListByStory":         {},
     "materialPropertiesConcreteData": {},
     "materialPropertiesBasicMechanicalProperties": {},
+    "materialPropertiesGeneral": {},
     "groupAssignments":            {},
     "storyDefinitions":            {},
     "pierSectionProperties":       { "groups": ["Piers"] },
@@ -318,6 +319,7 @@ etab-cli extract-results -f <path.edb> -o <outputDir> -r '<requestJson>'
 | `materialListByStory` | `material_list_by_story.parquet` | false | `"Material List by Story"` |
 | `materialPropertiesConcreteData` | `material_properties_concrete_data.parquet` | false | `"Material Properties - Concrete Data"` |
 | `materialPropertiesBasicMechanicalProperties` | `material_properties_basic_mechanical_properties.parquet` | false | `"Material Properties - Basic Mechanical Properties"` (fields fixed to `Material`, `UnitWeight`) |
+| `materialPropertiesGeneral` | `material_properties_general.parquet` | false | `"Material Properties - General"` (fields fixed to `Material`, `Type`) |
 | `groupAssignments` | `group_assignments.parquet` | false | `"Group Assignments"` |
 | `storyDefinitions` | `story_definitions.parquet` | false | `"Story Definitions"` |
 | `pierSectionProperties` | `pier_section_properties.parquet` | false | `"Pier Section Properties"` |

@@ -50,6 +50,7 @@ internal static class ExtractionProfiles
         MaterialListByStory = new TableFilter(),
         MaterialPropertiesConcreteData = new TableFilter(),
         MaterialPropertiesBasicMechanicalProperties = new TableFilter(),
+        MaterialPropertiesGeneral = new TableFilter(),
         GroupAssignments = new TableFilter(),
         StoryDefinitions = new TableFilter(),
         PierSectionProperties = new TableFilter(),
@@ -76,6 +77,7 @@ internal static class ExtractionProfiles
         GroupAssignments = new TableFilter(),
         MaterialPropertiesConcreteData = new TableFilter(),
         MaterialPropertiesBasicMechanicalProperties = new TableFilter(),
+        MaterialPropertiesGeneral = new TableFilter(),
         MaterialListByStory = new TableFilter()
     };
 
@@ -85,6 +87,7 @@ internal static class ExtractionProfiles
         tables.MaterialListByStory is null
         && tables.MaterialPropertiesConcreteData is null
         && tables.MaterialPropertiesBasicMechanicalProperties is null
+        && tables.MaterialPropertiesGeneral is null
         && tables.GroupAssignments is null
         && tables.StoryDefinitions is null
         && tables.BaseReactions is null

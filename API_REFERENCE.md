@@ -53,6 +53,7 @@ Supported table keys:
 - `materialListByStory`
 - `materialPropertiesConcreteData`
 - `materialPropertiesBasicMechanicalProperties`
+- `materialPropertiesGeneral`
 - `groupAssignments`
 - `storyDefinitions`
 - `baseReactions`
