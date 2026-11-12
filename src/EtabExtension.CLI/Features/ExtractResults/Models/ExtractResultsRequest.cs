@@ -20,6 +20,7 @@ namespace EtabExtension.CLI.Features.ExtractResults.Models;
 ///   "tables": {
 ///     "materialListByStory":      {},
 ///     "materialPropertiesConcreteData": {},
+///     "materialPropertiesBasicMechanicalProperties": {},
 ///     "groupAssignments":         {},
 ///     "baseReactions":           { "loadCases": ["*"], "loadCombos": ["*"] },
 ///     "storyForces":             { "loadCases": ["DEAD","LIVE","EQX","EQY"] },
@@ -69,6 +70,13 @@ public record TableSelections
     /// </summary>
     [JsonPropertyName("materialPropertiesConcreteData")]
     public TableFilter? MaterialPropertiesConcreteData { get; init; }
+
+    /// <summary>
+    /// Material definition table narrowed to Material + UnitWeight. The filter is
+    /// ignored: the field keys are fixed by the extractor.
+    /// </summary>
+    [JsonPropertyName("materialPropertiesBasicMechanicalProperties")]
+    public TableFilter? MaterialPropertiesBasicMechanicalProperties { get; init; }
 
     /// <summary>
     /// Group membership table. Only FieldKeys is honoured.
