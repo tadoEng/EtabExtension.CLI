@@ -27,6 +27,7 @@ public static class ExtractResultsExtensions
         services.AddSingleton<MaterialListByStoryExtractor>();
         services.AddSingleton<MaterialPropertiesConcreteDataExtractor>();
         services.AddSingleton<MaterialPropertiesBasicMechanicalPropertiesExtractor>();
+        services.AddSingleton<MaterialPropertiesGeneralExtractor>();
         services.AddSingleton<GroupAssignmentsExtractor>();
         services.AddSingleton<StoryDefinitionsExtractor>();
         services.AddSingleton<BaseReactionsExtractor>();
