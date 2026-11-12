@@ -393,6 +393,33 @@ public sealed class SharedShutdownDeadlineTests
             $"2 s commit wait + 10 s kill wait were chained: {watch.Elapsed}");
     }
 
+    // The commit wait itself is capped by the shared budget: a 1 s budget cannot spend 2 s waiting.
+    [Fact]
+    public void TheCommitWaitIsCappedByTheSharedBudget()
+    {
+        var rig = new SessionRig(new LauncherRig(), blockedBudget: TimeSpan.FromSeconds(1));
+        var writing = new ManualResetEventSlim(false);
+        var release = new ManualResetEventSlim(false);
+        rig.L.Records.OnWrite = record =>
+        {
+            if (record.Phase == ManagedEtabsRecordPhase.Ready)
+            {
+                writing.Set();
+                release.Signalled("the test to release the stalled commit");
+            }
+        };
+        var launching = rig.StartOnBackgroundThread();
+        writing.Signalled("the commit to stall");
+        var watch = Stopwatch.StartNew();
+
+        _ = Task.Run(rig.Session.ShutdownWhileWorkerBlocked).Within("the budgeted shutdown");
+        watch.Stop();
+        release.Set();
+        _ = launching.Within("the stalled launch");
+
+        Assert.True(watch.Elapsed < TimeSpan.FromMilliseconds(1800), $"the 2 s commit wait ran over a 1 s budget: {watch.Elapsed}");
+    }
+
     [Fact]
     public void TheSessionBudgetEqualsTheCoordinatorEnvelope()
     {
