@@ -15,7 +15,8 @@ internal sealed class SessionRig
         LauncherRig? launcher = null,
         TimeSpan? gateWait = null,
         TimeSpan? graceful = null,
-        bool processExitsOnApplicationExit = true)
+        bool processExitsOnApplicationExit = true,
+        Func<ISessionRecordStore, IManagedEtabsShutdownMachine>? machine = null)
     {
         L = launcher ?? new LauncherRig();
         L.Census.Live = Kit.Identity;
@@ -31,7 +32,7 @@ internal sealed class SessionRig
             L.Launcher,
             L.Census,
             L.Records,
-            new ManagedEtabsShutdownMachine(L.Records, wait, wait),
+            machine?.Invoke(L.Records) ?? new ManagedEtabsShutdownMachine(L.Records, wait, wait),
             work,
             TextWriter.Null,
             L.Cell,

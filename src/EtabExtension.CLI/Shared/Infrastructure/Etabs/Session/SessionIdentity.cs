@@ -120,7 +120,13 @@ public sealed class JsonSessionRecordStore : ISessionRecordStore, IDisposable
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "EtabExtension", "sidecar", "managed-etabs-session.json");
 
-    public JsonSessionRecordStore(string? path = null) => FilePath = path ?? DefaultPath;
+    private readonly TimeSpan _lockWait;
+
+    public JsonSessionRecordStore(string? path = null, TimeSpan? lockWait = null)
+    {
+        FilePath = path ?? DefaultPath;
+        _lockWait = lockWait ?? DaemonRecordLock.DefaultWait;
+    }
 
     public string FilePath { get; }
 
@@ -136,7 +142,7 @@ public sealed class JsonSessionRecordStore : ISessionRecordStore, IDisposable
         }
     }
 
-    public void AcquireExclusive() => AcquireExclusive(DaemonRecordLock.DefaultWait);
+    public void AcquireExclusive() => AcquireExclusive(_lockWait);
 
     internal void AcquireExclusive(TimeSpan wait)
     {

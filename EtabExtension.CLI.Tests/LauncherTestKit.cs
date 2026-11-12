@@ -16,9 +16,9 @@ internal static class Kit
     /// <summary>The independent test deadline every hang-type test uses, so a mutation fails instead of hanging.</summary>
     public static readonly TimeSpan TestDeadline = TimeSpan.FromSeconds(10);
 
-    public static T Within<T>(this Task<T> task, string what)
+    public static T Within<T>(this Task<T> task, string what, TimeSpan? deadline = null)
     {
-        if (!task.Wait(TestDeadline))
+        if (!task.Wait(deadline ?? TestDeadline))
         {
             throw new TimeoutException($"Test deadline expired waiting for: {what}");
         }
