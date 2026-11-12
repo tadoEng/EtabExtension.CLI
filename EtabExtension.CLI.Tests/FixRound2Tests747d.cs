@@ -37,13 +37,13 @@ public sealed class FixRound2Tests747d
 
         // (a) a reveal already in flight fails after the decision: EndUncertainSession path.
         rig.L.Api.UnhideException = new InvalidOperationException("COM");
-        var late = rig.Session.RevealForExplicitUserRequest();
+        var late = Record.Exception(() => rig.Session.RevealForExplicitUserRequest()); // refused: the session is Suppressed
         // (b) a request whose identity verification fails: the GetOrStartOwned cleanup path.
         rig.L.Census.Live = null;
         Assert.ThrowsAny<Exception>(() => rig.Session.GetOrStartOwned());
         scope.Dispose();
 
-        Assert.False(late.Success);
+        Assert.NotNull(late);
         Assert.Equal(0, rig.L.Process.KillCount);
         Assert.Equal(0, rig.L.Api.ExitCount);
         Assert.False(rig.L.Process.HasExited);

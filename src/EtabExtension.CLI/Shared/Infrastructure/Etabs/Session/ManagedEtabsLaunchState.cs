@@ -29,7 +29,15 @@ public enum LaunchLifecycle
     /// The detach's durable write started and its outcome is unknown (card v2.3 §3): no
     /// rollback, and nothing destructive ever follows.
     /// </summary>
-    DetachUncertain = 7
+    DetachUncertain = 7,
+
+    /// <summary>
+    /// The EOF path decided to leave this instance running (review round 3, P1). It is a lifecycle
+    /// state, so <c>Ready -> Terminating</c> and <c>Ready -> Suppressed</c> compete on the SAME
+    /// compare-exchange: exactly one of "end it" and "never end it" can win, and there is no
+    /// separate flag to read before acting.
+    /// </summary>
+    Suppressed = 8
 }
 
 /// <summary>
@@ -354,6 +362,9 @@ public sealed class EtabsLaunchState
 
     private ManagedProcessIdentity? _detachedIdentity;
 
+    /// <summary>The suppression arbiter: <c>Ready -> Suppressed</c>, the rival of Terminating.</summary>
+    public bool TrySuppress() => TryTransition(LaunchLifecycle.Ready, LaunchLifecycle.Suppressed);
+
     /// <summary>The detach arbiter: <c>Ready → Detaching</c>, the single rival of Terminating.</summary>
     public bool TryBeginDetach() => TryTransition(LaunchLifecycle.Ready, LaunchLifecycle.Detaching);
 
@@ -622,7 +633,7 @@ public sealed class EtabsLaunchState
         while (true)
         {
             var state = Lifecycle;
-            if (state == LaunchLifecycle.Ready || IsDetachDisposition)
+            if (state == LaunchLifecycle.Ready || state == LaunchLifecycle.Suppressed || IsDetachDisposition)
             {
                 // Ready belongs to the normal shutdown; a detach disposition is never
                 // terminated at all (card C1).

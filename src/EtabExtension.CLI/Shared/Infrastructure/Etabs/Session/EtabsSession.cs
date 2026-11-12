@@ -318,14 +318,6 @@ public sealed class EtabsSession : IEtabsSession
     /// </summary>
     private bool MayTerminate(EtabsLaunchState? launch)
     {
-        // The EOF path chose to leave this instance running (review round 2, P1-1): EVERY path
-        // that would end it - the verification-failure cleanup, the uncertain-session end, the
-        // handle kill, shutdown and disposal - asks here, so none of them can.
-        if (Volatile.Read(ref _exitSuppressed) == 1)
-        {
-            return false;
-        }
-
         if (launch is null)
         {
             return true;
@@ -351,6 +343,9 @@ public sealed class EtabsSession : IEtabsSession
                 case LaunchLifecycle.Detaching:
                 case LaunchLifecycle.Detached:
                 case LaunchLifecycle.DetachUncertain:
+                case LaunchLifecycle.Suppressed:
+                    // Suppressed is decided by the SAME CAS word (review round 3, P1): a path
+                    // that lost Ready -> Terminating to Ready -> Suppressed learns it here.
                     return false;
                 default:
                     // Launching, Committing, Terminating, Ended: the termination fence is
@@ -365,10 +360,26 @@ public sealed class EtabsSession : IEtabsSession
 
     // Set by the EOF path once a detach-visible detach failed and left ETABS running on purpose
     // (review P1-1): nothing - including disposal of this session - may then exit or kill it.
-    private int _exitSuppressed;
-
     /// <inheritdoc />
-    public void SuppressFurtherExit() => Volatile.Write(ref _exitSuppressed, 1);
+    public void SuppressFurtherExit()
+    {
+        var launch = Volatile.Read(ref _launch);
+        if (launch is null)
+        {
+            return;
+        }
+
+        // ONE atomic decision (review round 3, P1): Ready -> Suppressed competes with
+        // Ready -> Terminating on the same CAS. Any other state means a rival already owns the
+        // instance (detach states, Terminating, Ended) and there is nothing to suppress.
+        while (true)
+        {
+            if (launch.Lifecycle != LaunchLifecycle.Ready || launch.TrySuppress())
+            {
+                return;
+            }
+        }
+    }
 
     private ManagedEtabsShutdownResult SuppressedAnswer() => new(
         false,
@@ -1393,7 +1404,7 @@ public sealed class EtabsSession : IEtabsSession
 
         // -1. The EOF path chose to leave a visible instance running (review P1-1). Disposal of
         //     the DI scope lands here too, and must not take the gate or end anything.
-        if (Volatile.Read(ref _exitSuppressed) == 1)
+        if (launch is { Lifecycle: LaunchLifecycle.Suppressed })
         {
             return SuppressedAnswer();
         }
@@ -1600,22 +1611,51 @@ public sealed class EtabsSession : IEtabsSession
 
     public void Dispose()
     {
-        if (Volatile.Read(ref _releaseAttempted) == 1 || Volatile.Read(ref _exitSuppressed) == 1)
+        if (Volatile.Read(ref _releaseAttempted) == 1
+            || Volatile.Read(ref _launch) is { Lifecycle: LaunchLifecycle.Suppressed })
         {
             return;
         }
 
-        // Never an unbounded wait on the gate, whatever happened before.
-        if (!Monitor.TryEnter(_gate, BlockedShutdownGateWait))
+        // Disposal NEVER enters the unsupervised ordinary shutdown (review round 3, P2): that one
+        // takes the gate without a bound and calls ExitWithoutSaving synchronously. It runs the
+        // bounded, supervised sequence (a bounded gate wait, a bounded graceful exit on a
+        // dedicated STA, a bounded kill of the owned handle) on its own thread under ONE overall
+        // deadline. An answer that did not confirm keeps its evidence and the recovery record.
+        var cleanup = new Thread(() =>
+        {
+            try
+            {
+                _ = ShutdownWith(_shutdownMachine.ShutdownWhileWorkerBlocked, workerBlocked: true);
+            }
+#pragma warning disable CA1031 // disposal must not throw
+            catch (Exception exception)
+#pragma warning restore CA1031
+            {
+                _diagnostics.WriteLine(EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "EtabsSession.Dispose", exception));
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "etab-cli-session-dispose"
+        };
+        if (OperatingSystem.IsWindows())
+        {
+            cleanup.SetApartmentState(ApartmentState.STA);
+        }
+
+        cleanup.Start();
+        if (!cleanup.Join(DisposeBudget))
         {
             _diagnostics.WriteLine(
-                "⚠ The session gate is held by a stuck command; disposal leaves the instance and its record as they are.");
-            return;
+                $"⚠ Session disposal did not finish within {DisposeBudget.TotalSeconds:0.###}s; " +
+                "the instance and its recovery record are left as they are.");
         }
-
-        Monitor.Exit(_gate);
-        _ = Shutdown();
     }
+
+    /// <summary>The one overall deadline of disposal. Tests shorten it.</summary>
+    internal TimeSpan DisposeBudget { get; set; } = BlockedShutdownBudget;
 
     private static ManagedEtabsShutdownResult NoOwnedProcessSuccess() => new(
         true,
