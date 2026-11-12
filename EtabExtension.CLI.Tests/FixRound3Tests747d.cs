@@ -80,6 +80,7 @@ public sealed class FixRound3Tests747d
         held.Signalled("the gate to be held");
         using var provider = ScopeOver(rig.Session);
         var scope = provider.CreateScope();
+        _ = scope.ServiceProvider.GetRequiredService<IEtabsSession>(); // resolved, so the scope owns and disposes it
 
         Kit.OnDedicatedThread(() =>
         {
@@ -103,6 +104,7 @@ public sealed class FixRound3Tests747d
         rig.L.Api.OnExit = () => never.Wait(TimeSpan.FromSeconds(30));
         using var provider = ScopeOver(rig.Session);
         var scope = provider.CreateScope();
+        _ = scope.ServiceProvider.GetRequiredService<IEtabsSession>(); // resolved, so the scope owns and disposes it
 
         Kit.OnDedicatedThread(() =>
         {
