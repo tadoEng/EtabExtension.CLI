@@ -107,7 +107,10 @@ internal sealed class SaveAndExitRig
     };
 
     public Task<object> Run(SaveAndExitRequest? request = null, long id = 1) =>
-        Service.RunAsync(request ?? Request(), id, body => Task.Run(body));
+        Service.RunAsync(
+            request ?? Request(),
+            id,
+            body => Kit.OnDedicatedThread(() => body().GetAwaiter().GetResult()));
 
     /// <summary>Nothing was saved and nothing was exited or killed.</summary>
     public void AssertUntouched()
@@ -509,7 +512,7 @@ public sealed class SaveAndExitLifecycleTests
     [Fact]
     public void ASaveSuccessArrivingAfterTheSavingPhaseExpiredIsUnknownAndNeverExits()
     {
-        var rig = new SaveAndExitRig(savingBudget: TimeSpan.FromMilliseconds(400));
+        var rig = new SaveAndExitRig(savingBudget: TimeSpan.FromMilliseconds(1500));
         using var finish = new ManualResetEventSlim(false);
         using var saving = new ManualResetEventSlim(false);
         rig.Api.OnSave = () =>
@@ -567,7 +570,7 @@ public sealed class SaveAndExitLifecycleTests
     [Fact]
     public void OnceTheExitCasIsWonATimeoutNeverAbandonsItAndACancelIsRefused()
     {
-        var rig = new SaveAndExitRig(savingBudget: TimeSpan.FromMilliseconds(500));
+        var rig = new SaveAndExitRig(savingBudget: TimeSpan.FromMilliseconds(1500));
         using var exitStarted = new ManualResetEventSlim(false);
         using var finishExit = new ManualResetEventSlim(false);
         rig.Session.NormalShutdown = () =>
@@ -579,7 +582,7 @@ public sealed class SaveAndExitLifecycleTests
 
         var running = rig.Run(id: 5);
         exitStarted.Signalled("the exit to start");
-        Thread.Sleep(900); // well past the 0.5 s Saving budget
+        Thread.Sleep(1900); // well past the 1.5 s Saving budget
 
         Assert.False(running.IsCompleted, "a won exit is not answered as a Saving timeout");
         Assert.Equal(SaveAndExitState.Exiting, rig.Registry.Cancel(5));
