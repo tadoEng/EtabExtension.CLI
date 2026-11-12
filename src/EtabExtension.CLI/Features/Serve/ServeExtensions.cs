@@ -96,6 +96,12 @@ public sealed class ServeSessionPaths
 public sealed class SessionShutdownIfUnchangedApiFactory(IEtabsChangeSignalSource changeSignal)
     : IShutdownIfUnchangedApiFactory
 {
-    public IEtabsModelFileApi Create(IEtabsSession session) =>
-        new EtabsModelFileApi(session.GetOrStart(), changeSignal);
+    public IEtabsModelFileApi Create(IEtabsSession session)
+    {
+        // Never GetOrStart(): its verification-failure cleanup ends the instance, and a check
+        // that precedes the exit decision must not (review round 2, P1-2).
+        var owned = session.InspectExisting(out var refusal)
+            ?? throw new InvalidOperationException(refusal ?? "No instance to inspect.");
+        return new EtabsModelFileApi(owned.Application, changeSignal);
+    }
 }

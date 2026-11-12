@@ -303,10 +303,13 @@ public sealed class ShutdownIfUnchangedService
             return await body.ConfigureAwait(false);
         }
 
-        return Fail(
+        // The exit was INITIATED and may even have completed: only its confirmation is unknown, so
+        // the evidence says "unknown" and never asserts that nothing was exited (round 2, P2-4).
+        return Result.Fail(EtabsTypedFailureCodes.Format(
             ExitUnconfirmedCode,
             $"The exit did not return within {_exitBudget.TotalSeconds:0.###}s; its outcome is unconfirmed. " +
-            "Observe the instance; an explicit shutdown may now end it.");
+            "Observe the instance; an explicit shutdown may now end it.",
+            new { exited = "unknown", exitConfirmed = false }));
     }
 
     private object Check(ShutdownIfUnchangedOperation operation, ShutdownIfUnchangedRequest request)

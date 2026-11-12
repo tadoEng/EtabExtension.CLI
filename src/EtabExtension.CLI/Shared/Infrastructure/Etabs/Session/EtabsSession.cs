@@ -59,6 +59,17 @@ public interface IEtabsSession : IDisposable
         "This session does not support detach.");
 
     /// <summary>
+    /// The existing, identity-verified instance, or null with the reason (review round 2, P1-2).
+    /// NEVER starts, shuts down or ends anything; the read-only path for commands that must not
+    /// destroy what they inspect.
+    /// </summary>
+    IManagedEtabsApplication? InspectExisting(out string? refusal)
+    {
+        refusal = "This session cannot inspect an existing instance.";
+        return null;
+    }
+
+    /// <summary>
     /// After a failed EOF detach left ETABS running on purpose: no later exit, kill or disposal
     /// of this session may end it (review P1-1).
     /// </summary>
@@ -307,6 +318,14 @@ public sealed class EtabsSession : IEtabsSession
     /// </summary>
     private bool MayTerminate(EtabsLaunchState? launch)
     {
+        // The EOF path chose to leave this instance running (review round 2, P1-1): EVERY path
+        // that would end it - the verification-failure cleanup, the uncertain-session end, the
+        // handle kill, shutdown and disposal - asks here, so none of them can.
+        if (Volatile.Read(ref _exitSuppressed) == 1)
+        {
+            return false;
+        }
+
         if (launch is null)
         {
             return true;
@@ -367,6 +386,45 @@ public sealed class EtabsSession : IEtabsSession
         });
 
     public ETABSApplication GetOrStart() => GetOrStartOwned().Application;
+
+    /// <inheritdoc />
+    public IManagedEtabsApplication? InspectExisting(out string? refusal)
+    {
+        refusal = null;
+        var launch = Volatile.Read(ref _launch);
+        var owned = Volatile.Read(ref _owned);
+        if (launch is not { Lifecycle: LaunchLifecycle.Ready } || owned is null)
+        {
+            refusal = "No ready, owned ETABS instance exists to inspect.";
+            return null;
+        }
+
+        // The same identity proof GetOrStartOwned makes, but a failure only REFUSES: it starts
+        // nothing, shuts nothing down and latches nothing (review round 2, P1-2).
+        try
+        {
+            var record = _records.Read();
+            var live = _processes.Find(owned.Identity.Pid);
+            if (record is null || live is null
+                || record.ManagedLaunchRecordId != owned.ManagedLaunchRecordId
+                || !OrphanSessionCleaner.IdentityMatches(record, live)
+                || live != owned.Identity)
+            {
+                refusal = "The instance's process identity could not be verified; nothing was started or ended.";
+                return null;
+            }
+        }
+#pragma warning disable CA1031 // an unreadable identity is a refusal, never a cleanup
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            refusal = "The instance's process identity could not be read: " +
+                EtabsApiDiagnosticFormatter.Bounded(exception.Message);
+            return null;
+        }
+
+        return owned;
+    }
 
     public IManagedEtabsApplication GetOrStartOwned()
     {
@@ -1321,6 +1379,16 @@ public sealed class EtabsSession : IEtabsSession
         bool workerBlocked,
         TimeSpan? gateWaitOverride = null)
     {
+        var result = ShutdownWithCore(shutdownWithin, workerBlocked, gateWaitOverride);
+        Volatile.Write(ref _releaseAttempted, 1);
+        return result;
+    }
+
+    private ManagedEtabsShutdownResult ShutdownWithCore(
+        Func<IManagedEtabsApplication, TimeSpan, ManagedEtabsShutdownResult> shutdownWithin,
+        bool workerBlocked,
+        TimeSpan? gateWaitOverride)
+    {
         var launch = Volatile.Read(ref _launch);
 
         // -1. The EOF path chose to leave a visible instance running (review P1-1). Disposal of
@@ -1525,8 +1593,27 @@ public sealed class EtabsSession : IEtabsSession
         }
     }
 
+    // Set once a shutdown attempt COMPLETED with an answer (review round 2, P2-3). Disposal then
+    // has nothing left to do: re-entering the shutdown would wait for a gate a stuck exit may
+    // hold for ever, and the unconfirmed evidence and the recovery record must stay as they are.
+    private int _releaseAttempted;
+
     public void Dispose()
     {
+        if (Volatile.Read(ref _releaseAttempted) == 1 || Volatile.Read(ref _exitSuppressed) == 1)
+        {
+            return;
+        }
+
+        // Never an unbounded wait on the gate, whatever happened before.
+        if (!Monitor.TryEnter(_gate, BlockedShutdownGateWait))
+        {
+            _diagnostics.WriteLine(
+                "⚠ The session gate is held by a stuck command; disposal leaves the instance and its record as they are.");
+            return;
+        }
+
+        Monitor.Exit(_gate);
         _ = Shutdown();
     }
 

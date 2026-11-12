@@ -479,8 +479,15 @@ internal sealed class FakeRawApi : IEtabsRawApi
         return 0;
     }
 
+    public Exception? UnhideException { get; set; }
+
     public int Unhide()
     {
+        if (UnhideException is not null)
+        {
+            throw UnhideException;
+        }
+
         Events.Add("unhide");
         UnhideCalls++;
         IsVisible = true;
