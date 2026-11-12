@@ -166,6 +166,7 @@ public sealed class StaleExtractionOutputWiringTests : IDisposable
     private static TableExtractorRegistry RealRegistry() => new(
         new MaterialListByStoryExtractor(NullLogger<MaterialListByStoryExtractor>.Instance),
         new MaterialPropertiesConcreteDataExtractor(NullLogger<MaterialPropertiesConcreteDataExtractor>.Instance),
+        new MaterialPropertiesBasicMechanicalPropertiesExtractor(NullLogger<MaterialPropertiesBasicMechanicalPropertiesExtractor>.Instance),
         new GroupAssignmentsExtractor(NullLogger<GroupAssignmentsExtractor>.Instance),
         new StoryDefinitionsExtractor(NullLogger<StoryDefinitionsExtractor>.Instance),
         new BaseReactionsExtractor(NullLogger<BaseReactionsExtractor>.Instance),

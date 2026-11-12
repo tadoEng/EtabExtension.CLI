@@ -273,6 +273,7 @@ static class Tui
         {
             (Key: "materialListByStory",         Label: "Material List by Story",         On: true),
             (Key: "materialPropertiesConcreteData", Label: "Material Properties - Concrete Data", On: true),
+            (Key: "materialPropertiesBasicMechanicalProperties", Label: "Material Properties - Basic Mechanical Properties", On: true),
             (Key: "groupAssignments",            Label: "Group Assignments",              On: true),
             (Key: "storyDefinitions",            Label: "Story Definitions",             On: true),
             (Key: "baseReactions",               Label: "Base Reactions",                On: true),
@@ -365,6 +366,7 @@ static class Tui
             {
                 "materialListByStory" => selections with { MaterialListByStory = filter },
                 "materialPropertiesConcreteData" => selections with { MaterialPropertiesConcreteData = filter },
+                "materialPropertiesBasicMechanicalProperties" => selections with { MaterialPropertiesBasicMechanicalProperties = filter },
                 "groupAssignments" => selections with { GroupAssignments = filter },
                 "storyDefinitions" => selections with { StoryDefinitions = filter },
                 "baseReactions" => selections with { BaseReactions = filter },
