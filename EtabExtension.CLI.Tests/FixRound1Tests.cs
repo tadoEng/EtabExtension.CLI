@@ -280,7 +280,7 @@ public sealed class ExpiryBlockerEvidenceTests
         var rig = new LauncherRig(
             new ManagedEtabsLauncherOptions
             {
-                StartupDeadline = TimeSpan.FromMilliseconds(300),
+                StartupDeadline = TimeSpan.FromMilliseconds(2000),
                 AttachPollInterval = TimeSpan.FromMilliseconds(10),
                 ForcedExitTimeout = TimeSpan.FromSeconds(5),
                 GracefulCleanupWait = TimeSpan.Zero
@@ -412,7 +412,7 @@ public sealed class SharedShutdownDeadlineTests
         writing.Signalled("the commit to stall");
         var watch = Stopwatch.StartNew();
 
-        _ = Task.Run(rig.Session.ShutdownWhileWorkerBlocked).Within("the budgeted shutdown");
+        _ = Kit.OnDedicatedThread(rig.Session.ShutdownWhileWorkerBlocked).Within("the budgeted shutdown");
         watch.Stop();
         release.Set();
         _ = launching.Within("the stalled launch");

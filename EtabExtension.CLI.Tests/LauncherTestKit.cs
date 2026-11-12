@@ -36,6 +36,25 @@ internal static class Kit
         task.GetAwaiter().GetResult();
     }
 
+    /// <summary>Runs on its own thread, so a starved thread pool cannot inflate a timing assertion.</summary>
+    public static Task<T> OnDedicatedThread<T>(Func<T> work)
+    {
+        var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        new Thread(() =>
+        {
+            try
+            {
+                completion.SetResult(work());
+            }
+            catch (Exception ex)
+            {
+                completion.SetException(ex);
+            }
+        })
+        { IsBackground = true }.Start();
+        return completion.Task;
+    }
+
     public static void Signalled(this ManualResetEventSlim signal, string what)
     {
         if (!signal.Wait(TestDeadline))
