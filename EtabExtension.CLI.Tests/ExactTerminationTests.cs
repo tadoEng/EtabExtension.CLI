@@ -22,11 +22,29 @@ public sealed class ExactTerminationTests
 
     private static ManagedProcessIdentity IdentityOf(Process process)
     {
-        process.Refresh();
-        return new ManagedProcessIdentity(
-            process.Id,
-            process.StartTime.ToUniversalTime(),
-            Path.GetFullPath(process.MainModule!.FileName));
+        // A young process can refuse to report its main module for a moment.
+        var deadline = Stopwatch.StartNew();
+        while (true)
+        {
+            try
+            {
+                process.Refresh();
+                if (process.MainModule?.FileName is { } path)
+                {
+                    return new ManagedProcessIdentity(
+                        process.Id,
+                        process.StartTime.ToUniversalTime(),
+                        Path.GetFullPath(path));
+                }
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+            {
+                // retried below
+            }
+
+            Assert.True(deadline.Elapsed < TimeSpan.FromSeconds(10), "the child never reported its main module");
+            Thread.Sleep(25);
+        }
     }
 
     private static void Reap(Process process)
