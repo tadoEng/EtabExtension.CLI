@@ -532,6 +532,25 @@ public sealed class ManagedEtabsOwnershipTests
         Assert.True(lease.IsDisposed);
     }
 
+    // The owner reference counts ONCE, however many parties believe they own the cleanup.
+    [Fact]
+    public void TheOwnerReferenceIsReleasedAtMostOnce()
+    {
+        var process = new FakeSpawnedProcess(Identity);
+        var lease = new HandleLease(process);
+        Assert.True(lease.TryAcquire());
+
+        lease.ReleaseOwner();
+        lease.ReleaseOwner();
+        lease.ReleaseOwner();
+
+        Assert.False(process.Disposed, "a second owner release dropped a reference it did not own");
+        Assert.True(lease.TryAcquire());
+        lease.Release();
+        lease.Release();
+        Assert.True(process.Disposed);
+    }
+
     [Fact]
     public void ALeaseUsedAfterDisposalIsAHarmlessNoOp()
     {
