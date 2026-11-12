@@ -506,6 +506,7 @@ public sealed class OperationManagerTests : IDisposable
         public Result CertifyNoUnconsentedExposure() => Result.Ok();
         public void MarkVisibilityStage(string stage) { }
         public ManagedEtabsShutdownResult Shutdown() => throw new InvalidOperationException();
+        public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked() => throw new InvalidOperationException();
         public void Dispose() { }
     }
 

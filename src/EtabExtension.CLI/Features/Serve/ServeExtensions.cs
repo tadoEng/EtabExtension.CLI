@@ -13,8 +13,18 @@ public static class ServeExtensions
         // Scoped: the serve command creates one scope for the daemon's lifetime,
         // so the shared ETABS session is a single instance for that run and the
         // dispatcher can depend on the scoped feature services.
-        services.AddScoped<ISessionRecordStore, JsonSessionRecordStore>();
-        services.AddScoped<IProcessInspector, WindowsProcessInspector>();
+        services.AddScoped<ServeSessionPaths>();
+        services.AddScoped<ISessionRecordStore>(provider => new JsonSessionRecordStore(
+            provider.GetRequiredService<ServeSessionPaths>().SessionRecordPath));
+        services.AddScoped<IProcessInspector>(provider => new SiblingAwareProcessInspector(
+            new WindowsProcessInspector(),
+            provider.GetRequiredService<ServeSessionPaths>().SiblingRecordPath is { } sibling
+                ? new JsonSiblingRecordSource(sibling)
+                : new NoSiblingRecordSource()));
+        services.AddScoped<IEtabsModalDialogWatchdog, EtabsModalDialogWatchdog>();
+        services.AddScoped<IEtabsInstalledVersion>(provider => new SessionEtabsInstalledVersion(
+            provider.GetRequiredService<IEtabsSession>(),
+            new FileEtabsVersionProbe()));
         services.AddScoped<IManagedEtabsLauncher, ManagedEtabsLauncher>();
         services.AddScoped<IOrphanSessionCleaner, OrphanSessionCleaner>();
         services.AddScoped<IManagedEtabsStartIntentScope, ManagedEtabsStartIntentScope>();
@@ -34,4 +44,17 @@ public static class ServeExtensions
         services.AddScoped<IReadModelMetadataService, ReadModelMetadataService>();
         return services;
     }
+}
+
+/// <summary>
+/// The daemon's record paths, set by <c>serve</c> from <c>--session-record</c> and
+/// <c>--sibling-record</c> BEFORE any record store or census is resolved from the scope.
+/// </summary>
+public sealed class ServeSessionPaths
+{
+    /// <summary>Null keeps <see cref="JsonSessionRecordStore.DefaultPath"/>.</summary>
+    public string? SessionRecordPath { get; set; }
+
+    /// <summary>The other daemon's record; null when this daemon runs alone.</summary>
+    public string? SiblingRecordPath { get; set; }
 }

@@ -803,6 +803,137 @@ public sealed class ManagedEtabsLauncherTests
             members);
     }
 
+    // ── Core-loop §2.3 / §2.7 (WP-C0) ──────────────────────────────────────────
+
+    private static readonly ManagedProcessIdentity SiblingEtabs = new(
+        5151,
+        new DateTimeOffset(2026, 8, 13, 5, 0, 0, TimeSpan.Zero),
+        Identity.ExecutablePath);
+
+    private static ManagedEtabsSessionRecord SiblingRecord(DateTimeOffset startTime) => new(
+        1,
+        SiblingEtabs.Pid,
+        startTime,
+        SiblingEtabs.ExecutablePath,
+        Guid.NewGuid(),
+        DateTimeOffset.UtcNow);
+
+    /// <summary>
+    /// The analysis daemon starts its ETABS while the editing daemon's ETABS runs. The
+    /// sibling (exact record match) is neither an external instance in the preflight nor a
+    /// candidate in the ownership census, and is never terminated.
+    /// </summary>
+    [Fact]
+    public void LaunchBesideTheSiblingsEtabsTakesOnlyItsOwnProcess()
+    {
+        var processes = new FakeProcesses
+        {
+            Preflight = [SiblingEtabs],
+            AfterStart = [SiblingEtabs, Identity]
+        };
+        var launcher = BuildWithSibling(
+            new FakeRawApi(), processes, SiblingRecord(SiblingEtabs.ProcessStartTimeUtc));
+
+        var managed = launcher.Launch();
+
+        Assert.Equal(Identity, managed.Identity);
+        Assert.Equal(0, processes.TerminateExactCalls);
+    }
+
+    /// <summary>
+    /// Mutation guard: matching the sibling by pid alone would accept a reused pid. The same
+    /// pid with a different start time is a foreign ETABS, so the start is refused.
+    /// </summary>
+    [Fact]
+    public void ASiblingRecordWithAnotherStartTimeDoesNotExcuseAnExternalEtabs()
+    {
+        var processes = new FakeProcesses { Preflight = [SiblingEtabs] };
+        var launcher = BuildWithSibling(
+            new FakeRawApi(),
+            processes,
+            SiblingRecord(SiblingEtabs.ProcessStartTimeUtc.AddSeconds(1)));
+
+        var error = Assert.Throws<EtabsLaunchException>(() => launcher.Launch());
+
+        Assert.Equal(EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance, error.Code);
+        Assert.Contains("already exists: observedPids=[5151]", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// P3-4(d): a failed start whose own process is already gone, beside the sibling
+    /// daemon's ETABS (exact record match). The survivor resolution sees only the sibling,
+    /// excludes it, resolves clean with no owned pid, and terminates nothing.
+    /// </summary>
+    [Fact]
+    public void AFailedStartWhoseProcessIsGoneNeverTerminatesTheSiblingsEtabs()
+    {
+        var processes = new FakeProcesses
+        {
+            Preflight = [SiblingEtabs],
+            AfterStart = [SiblingEtabs],
+            ExactTerminationResult = new(ExactProcessTerminationState.ConfirmedGone, SiblingEtabs)
+        };
+        var launcher = new ManagedEtabsLauncher(
+            new SiblingAwareProcessInspector(
+                processes,
+                new FixedSiblingRecord(SiblingRecord(SiblingEtabs.ProcessStartTimeUtc))),
+            new FakeResolver(Identity.ExecutablePath),
+            new NullReturningApiFactory(),
+            new FakeVersionProbe(),
+            TextWriter.Null);
+
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+
+        Assert.Equal(EtabsLaunchErrorCodes.ApiObjectCreationFailed, error.Code);
+        Assert.Equal(0, processes.TerminateExactCalls);
+        Assert.NotNull(error.Cleanup);
+        Assert.True(error.Cleanup!.Success);
+        Assert.True(error.Cleanup.Data.ProcessExitConfirmed);
+        Assert.Null(error.Cleanup.Data.OwnedPid);
+    }
+
+    /// <summary>
+    /// §2.7 / DD-5: an API-started ETABS asks "started using the API… continue closing?" when
+    /// its window is closed, so exit goes through cOAPI.ApplicationExit(false) - never a
+    /// window close, never a save.
+    /// </summary>
+    [Fact]
+    public void ManagedExitGoesThroughApplicationExitWithoutSaving()
+    {
+        var api = new FakeRawApi();
+        var managed = Build(api, new FakeProcesses { AfterStart = [Identity] }, out var events)
+            .Launch();
+
+        Assert.Equal(0, managed.ExitWithoutSaving());
+
+        Assert.Equal(1, api.ExitCount);
+        Assert.Equal("application-exit-save=False", events[^1]);
+    }
+
+    private static ManagedEtabsLauncher BuildWithSibling(
+        FakeRawApi api,
+        FakeProcesses processes,
+        ManagedEtabsSessionRecord sibling)
+    {
+        var recorded = new List<string>();
+        api.Events = recorded;
+        processes.Events = recorded;
+        processes.Guards.Events = recorded;
+        return new ManagedEtabsLauncher(
+            new SiblingAwareProcessInspector(processes, new FixedSiblingRecord(sibling)),
+            new FakeResolver(Identity.ExecutablePath),
+            new FakeApiFactory(api, recorded),
+            new FakeVersionProbe(recorded),
+            TextWriter.Null,
+            processes.Guards,
+            new FakeClock());
+    }
+
+    private sealed class FixedSiblingRecord(ManagedEtabsSessionRecord record) : ISiblingRecordSource
+    {
+        public ManagedEtabsSessionRecord? Read() => record;
+    }
+
     private static ManagedEtabsLauncher Build(
         FakeRawApi api,
         FakeProcesses processes,

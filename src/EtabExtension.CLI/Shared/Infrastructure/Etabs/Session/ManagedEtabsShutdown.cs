@@ -36,24 +36,52 @@ public interface IManagedEtabsShutdownMachine
     ManagedEtabsShutdownResult Shutdown(IManagedEtabsApplication owned);
     ManagedEtabsShutdownResult ShutdownAfterRecoveryRecordWriteFailure(
         IManagedEtabsApplication owned);
+
+    /// <summary>
+    /// <see cref="Shutdown"/> for a session whose STA worker is stuck inside a CSI call that
+    /// a modal ETABS dialog is holding (review finding P2-1). The same sequence, with one
+    /// difference: <c>ApplicationExit(false)</c> is attempted on a fresh dedicated STA thread
+    /// and abandoned if it has not returned within <see cref="ManagedEtabsShutdownMachine.GracefulExitTimeout"/>
+    /// - an ETABS sitting in a modal loop may never answer it - and the exact owned process
+    /// is then killed through its authoritative handle.
+    /// </summary>
+    ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(IManagedEtabsApplication owned);
 }
 
-public sealed class ManagedEtabsShutdownMachine(
-    ISessionRecordStore records) : IManagedEtabsShutdownMachine
+public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
 {
     public static readonly TimeSpan GracefulExitTimeout = TimeSpan.FromSeconds(10);
     public static readonly TimeSpan ForcedExitTimeout = TimeSpan.FromSeconds(10);
 
+    private readonly ISessionRecordStore _records;
+    private readonly TimeSpan _gracefulExitTimeout;
+
+    public ManagedEtabsShutdownMachine(ISessionRecordStore records)
+        : this(records, GracefulExitTimeout)
+    {
+    }
+
+    /// <summary>Tests shorten the graceful bound; production always uses the default.</summary>
+    internal ManagedEtabsShutdownMachine(ISessionRecordStore records, TimeSpan gracefulExitTimeout)
+    {
+        _records = records;
+        _gracefulExitTimeout = gracefulExitTimeout;
+    }
+
     public ManagedEtabsShutdownResult Shutdown(IManagedEtabsApplication owned)
-        => ShutdownCore(owned, ShutdownAuthority.RequireMatchingRecoveryRecord);
+        => ShutdownCore(owned, ShutdownAuthority.RequireMatchingRecoveryRecord, ExitAttempt.OnCallingThread);
 
     public ManagedEtabsShutdownResult ShutdownAfterRecoveryRecordWriteFailure(
         IManagedEtabsApplication owned)
-        => ShutdownCore(owned, ShutdownAuthority.AuthoritativeOwnedHandle);
+        => ShutdownCore(owned, ShutdownAuthority.AuthoritativeOwnedHandle, ExitAttempt.OnCallingThread);
+
+    public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(IManagedEtabsApplication owned)
+        => ShutdownCore(owned, ShutdownAuthority.RequireMatchingRecoveryRecord, ExitAttempt.BoundedOnDedicatedSta);
 
     private ManagedEtabsShutdownResult ShutdownCore(
         IManagedEtabsApplication owned,
-        ShutdownAuthority authority)
+        ShutdownAuthority authority,
+        ExitAttempt exitAttempt)
     {
         ArgumentNullException.ThrowIfNull(owned);
 
@@ -65,7 +93,7 @@ public sealed class ManagedEtabsShutdownMachine(
         // its way out must not flash a window.
         owned.DisposeWindowGuard();
 
-        var record = records.Read();
+        var record = _records.Read();
         var recordMatchesOwned = IdentityMatches(record, owned);
 
         if (authority == ShutdownAuthority.RequireMatchingRecoveryRecord
@@ -99,24 +127,66 @@ public sealed class ManagedEtabsShutdownMachine(
 
         int? applicationExitReturnCode = null;
         string? applicationExitError = null;
-        try
+        TimeSpan? gracefulWait = _gracefulExitTimeout;
+        if (exitAttempt == ExitAttempt.BoundedOnDedicatedSta)
         {
-            applicationExitReturnCode = owned.ExitWithoutSaving();
-            if (applicationExitReturnCode != 0)
+            var started = System.Diagnostics.Stopwatch.StartNew();
+            var attempt = AttemptExitOnDedicatedSta(owned, _gracefulExitTimeout);
+            if (attempt.Returned && attempt.Failure is null)
             {
-                applicationExitError = EtabsApiDiagnosticFormatter.ApiReturn(
-                    "cOAPI.ApplicationExit(false)",
-                    applicationExitReturnCode.Value);
+                applicationExitReturnCode = attempt.ReturnCode;
+                applicationExitError = applicationExitReturnCode is { } code and not 0
+                    ? EtabsApiDiagnosticFormatter.ApiReturn("cOAPI.ApplicationExit(false)", code)
+                    : null;
+                var remaining = _gracefulExitTimeout - started.Elapsed;
+                gracefulWait = remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+            }
+            else if (attempt.Failure is not null)
+            {
+                // Also expected here: the RCW belongs to the stuck worker's apartment, so a
+                // call from this thread typically throws (RPC_E_WRONG_THREAD) without ever
+                // reaching ETABS. No exit was requested, so there is nothing to wait for and
+                // nothing to report as an exit failure - straight to the kill.
+                Console.Error.WriteLine(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    EtabsApiDiagnosticFormatter.Exception("cOAPI.ApplicationExit(false)", attempt.Failure),
+                    "session blocked; exit not deliverable from the shutdown thread; " +
+                    $"killing the exact owned ETABS (PID {owned.Identity.Pid})"));
+                gracefulWait = null;
+            }
+            else
+            {
+                // Expected while a modal box holds ETABS: the exit request was made and not
+                // answered. Not an exit FAILURE - the bounded sequence moves on to the kill,
+                // exactly as it does when an answered exit does not end the process in time.
+                Console.Error.WriteLine(
+                    "⚠ cOAPI.ApplicationExit(false) did not return within " +
+                    $"{_gracefulExitTimeout.TotalSeconds:0.###}s while the session was blocked; " +
+                    $"killing the exact owned ETABS (PID {owned.Identity.Pid}).");
+                // The graceful bound is already spent on the unanswered request.
+                gracefulWait = null;
             }
         }
-        catch (Exception exception)
+        else
         {
-            applicationExitError = EtabsApiDiagnosticFormatter.Exception(
-                "cOAPI.ApplicationExit(false)",
-                exception);
+            try
+            {
+                applicationExitReturnCode = owned.ExitWithoutSaving();
+                if (applicationExitReturnCode != 0)
+                {
+                    applicationExitError = EtabsApiDiagnosticFormatter.ApiReturn(
+                        "cOAPI.ApplicationExit(false)",
+                        applicationExitReturnCode.Value);
+                }
+            }
+            catch (Exception exception)
+            {
+                applicationExitError = EtabsApiDiagnosticFormatter.Exception(
+                    "cOAPI.ApplicationExit(false)",
+                    exception);
+            }
         }
 
-        var processExitConfirmed = TryWait(owned, GracefulExitTimeout);
+        var processExitConfirmed = gracefulWait is { } wait && TryWait(owned, wait);
         var forced = false;
         string? cleanupError = null;
         if (!processExitConfirmed)
@@ -181,7 +251,7 @@ public sealed class ManagedEtabsShutdownMachine(
     {
         if (recordMatchesOwned)
         {
-            records.Clear();
+            _records.Clear();
             return false;
         }
 
@@ -246,9 +316,60 @@ public sealed class ManagedEtabsShutdownMachine(
             applicationExitReturnCode,
             ownedPid));
 
+    /// <summary>
+    /// Runs <c>ApplicationExit(false)</c> on a fresh background STA thread and waits at most
+    /// <paramref name="bound"/>. A thread that never returns is abandoned: it is a background
+    /// thread, it holds no lock, and the process it is calling is about to be killed.
+    /// </summary>
+    private static ExitAttemptOutcome AttemptExitOnDedicatedSta(
+        IManagedEtabsApplication owned,
+        TimeSpan bound)
+    {
+        int? returnCode = null;
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                returnCode = owned.ExitWithoutSaving();
+            }
+#pragma warning disable CA1031 // reported to the caller as the exit failure
+            catch (Exception exception)
+#pragma warning restore CA1031
+            {
+                failure = exception;
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "etab-cli-blocked-shutdown-exit"
+        };
+        if (OperatingSystem.IsWindows())
+        {
+            thread.SetApartmentState(ApartmentState.STA);
+        }
+
+        thread.Start();
+        // Join is the memory barrier for returnCode/failure; they are read only after it.
+        return thread.Join(bound)
+            ? new ExitAttemptOutcome(true, returnCode, failure)
+            : new ExitAttemptOutcome(false, null, null);
+    }
+
+    private readonly record struct ExitAttemptOutcome(bool Returned, int? ReturnCode, Exception? Failure);
+
     private enum ShutdownAuthority
     {
         RequireMatchingRecoveryRecord,
         AuthoritativeOwnedHandle
+    }
+
+    private enum ExitAttempt
+    {
+        /// <summary>The normal path: on the session's own STA worker, unbounded.</summary>
+        OnCallingThread,
+
+        /// <summary>The worker is stuck behind a dialog: dedicated STA, bounded, then kill.</summary>
+        BoundedOnDedicatedSta
     }
 }

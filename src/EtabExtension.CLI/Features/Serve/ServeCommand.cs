@@ -29,12 +29,42 @@ public static class ServeCommand
             "Long-lived daemon: one owned ETABS instance shared across all requests. " +
             "Reads line-delimited JSON requests on stdin, writes one JSON response per line on stdout.");
 
-        command.SetAction(async _ =>
+        var sessionRecordOption = new Option<string?>("--session-record")
+        {
+            Description =
+                "Path of this daemon's managed-session record. Default: the per-user " +
+                "sidecar record. Give each of two daemons its own."
+        };
+        var siblingRecordOption = new Option<string?>("--sibling-record")
+        {
+            Description =
+                "Path of the OTHER daemon's managed-session record. Its ETABS (exact pid, " +
+                "start time and executable match) is a sibling, never external or managed."
+        };
+        command.Options.Add(sessionRecordOption);
+        command.Options.Add(siblingRecordOption);
+
+        command.SetAction(async parseResult =>
         {
             // One DI scope for the daemon's whole life so the shared session and the
             // (scoped) feature services live and die together.
             await using var scope = services.CreateAsyncScope();
             var provider = scope.ServiceProvider;
+
+            // First, before anything resolves a record store or a census.
+            var paths = provider.GetRequiredService<ServeSessionPaths>();
+            paths.SessionRecordPath = FullPathOrNull(parseResult.GetValue(sessionRecordOption));
+            paths.SiblingRecordPath = FullPathOrNull(parseResult.GetValue(siblingRecordOption));
+            if (string.Equals(
+                    paths.SiblingRecordPath,
+                    paths.SessionRecordPath ?? JsonSessionRecordStore.DefaultPath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                // Our own process would otherwise be classified as the sibling's.
+                Console.Error.WriteLine("⚠ --sibling-record names this daemon's own record; ignored.");
+                paths.SiblingRecordPath = null;
+            }
+
             var dispatcher = provider.GetRequiredService<IServeDispatcher>();
             var orphanCleaner = provider.GetRequiredService<IOrphanSessionCleaner>();
             var shutdown = provider.GetRequiredService<IServeShutdownCoordinator>();
@@ -53,7 +83,15 @@ public static class ServeCommand
             var outcome = await RunLifecycleAsync(
                 orphanCleaner,
                 shutdown,
-                () => new ServeLoop(dispatcher, shutdown, startIntent).RunAsync(stdin, stdout),
+                () => new ServeLoop(
+                    dispatcher,
+                    shutdown,
+                    startIntent,
+                    capabilities => ServeHandshake.Current(capabilities) with
+                    {
+                        RecordPath = records.FilePath
+                    },
+                    Console.Error).RunAsync(stdin, stdout),
                 stdout,
                 Console.Error,
                 recovery => ServeStartupRefusal.Current(recovery, records.FilePath));
@@ -67,6 +105,9 @@ public static class ServeCommand
 
         return command;
     }
+
+    private static string? FullPathOrNull(string? path) =>
+        string.IsNullOrWhiteSpace(path) ? null : Path.GetFullPath(path);
 
     /// <summary>
     /// Runs orphan recovery, then the request loop, then converges on the one

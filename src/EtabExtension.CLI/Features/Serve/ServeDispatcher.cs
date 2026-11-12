@@ -52,6 +52,8 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly IProcessInspector _processes;
     private readonly IRunAnalysisService _runAnalysis;
     private readonly IEtabsWorkEnvelope _envelope;
+    private readonly IEtabsModalDialogWatchdog _watchdog;
+    private readonly IEtabsInstalledVersion _installedVersion;
     private readonly Dictionary<
         string,
         Func<JsonElement?, CancellationToken, Task<object>>> _handlers;
@@ -77,7 +79,9 @@ public sealed class ServeDispatcher : IServeDispatcher
         ICachedSessionStatus cachedStatus,
         IProcessInspector processes,
         IRunAnalysisService runAnalysis,
-        IEtabsWorkEnvelope envelope)
+        IEtabsWorkEnvelope envelope,
+        IEtabsModalDialogWatchdog watchdog,
+        IEtabsInstalledVersion installedVersion)
     {
         _session = session;
         _status = status;
@@ -98,6 +102,8 @@ public sealed class ServeDispatcher : IServeDispatcher
         _processes = processes;
         _runAnalysis = runAnalysis;
         _envelope = envelope;
+        _watchdog = watchdog;
+        _installedVersion = installedVersion;
 
         var handlers = new Dictionary<
             string,
@@ -158,8 +164,9 @@ public sealed class ServeDispatcher : IServeDispatcher
         _ = request;
         _ = ct;
         // During an async operation the protocol thread must never issue COM
-        // calls. Report the most recent worker-owned snapshot instead.
-        if (_operations.HasActiveOperation)
+        // calls. Report the most recent worker-owned snapshot instead. The same holds
+        // while a command is stuck behind an unanswered ETABS dialog: the worker is busy.
+        if (_operations.HasActiveOperation || _watchdog.IsBlocked)
         {
             return ReadActiveStatus();
         }
@@ -194,7 +201,9 @@ public sealed class ServeDispatcher : IServeDispatcher
     {
         _ = ct;
         var req = Deserialize<StartOperationRequest>(request);
-        return Task.FromResult<object>(_operations.Start(req.Kind, req.Payload));
+        return Task.FromResult<object>(_watchdog.IsBlocked
+            ? _watchdog.BlockedFailure()
+            : _operations.Start(req.Kind, req.Payload));
     }
 
     private Task<object> DispatchGetOperationStatusAsync(
@@ -237,11 +246,27 @@ public sealed class ServeDispatcher : IServeDispatcher
     {
         _ = ct;
         var req = Deserialize<ServeOpenModelRequest>(request);
-        return await ExecuteComAsync(async () => (object)RevealAfterConfirmedOpen(
-            await _open.OpenModelOnAppAsync(
-                _session.GetOrStart(),
-                req.FilePath,
-                req.SaveOnClose)));
+
+        // Read on the protocol thread, while this request's frozen context is current.
+        // Either signal keeps ETABS hidden: the request flag, or a request that declared the
+        // background-consented intent. The engineer agreed to a HIDDEN second ETABS, so an
+        // open that merely omits "background" must not put it on screen.
+        var reveal = !req.Background
+            && _pendingWork.StartIntent != ManagedEtabsStartIntent.BackgroundByConsent;
+        return await ExecuteWatchedComAsync(async () =>
+        {
+            var app = _session.GetOrStart();
+            if (ModelVersionRefusal(req.ExpectedModelVersion) is { } refused)
+            {
+                return Result.Fail<OpenModelData>(refused);
+            }
+
+            var opened = await _open.OpenModelOnAppAsync(app, req.FilePath, req.SaveOnClose);
+
+            // The analysis daemon's open (core-loop §2.4): the model is opened and ETABS
+            // stays hidden. Only the explicit user-visible open ever reveals.
+            return reveal ? RevealAfterConfirmedOpen(opened) : (object)opened;
+        });
     }
 
     /// <summary>
@@ -295,6 +320,12 @@ public sealed class ServeDispatcher : IServeDispatcher
         CancellationToken ct)
     {
         var payload = RequirePayload(request);
+        if (_watchdog.IsBlocked)
+        {
+            // Accepting it would queue the operation behind the command a dialog is holding.
+            return Task.FromResult<object>(_watchdog.BlockedFailure());
+        }
+
         var started = _operations.Start("analyze-and-extract", payload);
         if (!started.Success || started.Data is null)
         {
@@ -302,8 +333,11 @@ public sealed class ServeDispatcher : IServeDispatcher
                 started.Error ?? "Could not start analyze-and-extract operation"));
         }
 
-        return Task.FromResult<object>(new DeferredServeResponse(
-            _operations.WaitAsync(started.Data.OperationId, ct)));
+        var operationId = started.Data.OperationId;
+        return Task.FromResult<object>(new DeferredServeResponse(_watchdog.GuardAsync(
+            () => _session.ProcessId,
+            () => _operations.WaitAsync(operationId, ct),
+            ct)));
     }
 
     private async Task<object> DispatchSnapshotExportAsync(
@@ -346,7 +380,7 @@ public sealed class ServeDispatcher : IServeDispatcher
                 "No managed ETABS session is running, so there is no open model to save.");
         }
 
-        return await ExecuteComAsync(async () => await _save.SaveModelOnAppAsync(
+        return await ExecuteWatchedComAsync(async () => await _save.SaveModelOnAppAsync(
             _session.GetOrStart(), req.FilePath));
     }
 
@@ -384,8 +418,14 @@ public sealed class ServeDispatcher : IServeDispatcher
     {
         _ = ct;
         var req = Deserialize<ServeGenerateE2KRequest>(request);
-        return await ExecuteComAsync(async () => await _generateE2K.GenerateE2KOnAppAsync(
-            _session.GetOrStart(), req.FilePath, req.OutputFile, req.Overwrite));
+        return await ExecuteWatchedComAsync(async () =>
+        {
+            var app = _session.GetOrStart();
+            return ModelVersionRefusal(req.ExpectedModelVersion) is { } refused
+                ? Result.Fail(refused)
+                : await _generateE2K.GenerateE2KOnAppAsync(
+                    app, req.FilePath, req.OutputFile, req.Overwrite);
+        });
     }
 
     private async Task<object> DispatchReadModelMetadataAsync(
@@ -404,6 +444,14 @@ public sealed class ServeDispatcher : IServeDispatcher
     {
         _ = ct;
         var req = Deserialize<ServeRunAnalysisRequest>(request);
+
+        // Deliberately NOT under the modal-dialog watchdog in C0. A running analysis shows
+        // the ETABS analysis monitor over a disabled main window, and the watchdog's current
+        // modal test (visible, or owner disabled) may not tell it apart from a blocking box.
+        // Watching run-analysis waits on the stricter modal test and its live probe (C0
+        // follow-up, review finding P2-3). The commands that hit the DD-5 "older version"
+        // box - open-model, save-model, generate-e2k - are watched, and so is the legacy
+        // analyze-and-extract lane.
         return await ExecuteComAsync(async () => await _runAnalysis.RunAnalysisOnAppAsync(
             _session.GetOrStart(), req.FilePath, req.Cases, req.Units));
     }
@@ -517,8 +565,37 @@ public sealed class ServeDispatcher : IServeDispatcher
                 "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"));
         }
 
+        // A command abandoned to an unanswered dialog still holds the STA worker; queueing
+        // behind it would stop the protocol reader, so refuse with the same typed code.
+        if (_watchdog.IsBlocked)
+        {
+            return Task.FromResult<object>(_watchdog.BlockedFailure());
+        }
+
         var work = _pendingWork;
         return _operations.ExecuteSynchronousAsync(() => _envelope.RunAsync(work, action));
+    }
+
+    /// <summary>
+    /// <see cref="ExecuteComAsync"/> under the modal-dialog watchdog (core-loop §2.6), for
+    /// the commands that open or write a model: a modal ETABS dialog fails the command with
+    /// ETABS_MODAL_DIALOG instead of hanging it until the client times out.
+    /// </summary>
+    private Task<object> ExecuteWatchedComAsync(Func<Task<object>> action) =>
+        _watchdog.GuardAsync(() => _session.ProcessId, () => ExecuteComAsync(action), CancellationToken.None);
+
+    /// <summary>
+    /// The version pre-check (core-loop §2.5), against the running ETABS's executable file
+    /// version. Null when the caller stated no version or the model may open.
+    /// </summary>
+    private string? ModelVersionRefusal(string? expectedModelVersion)
+    {
+        if (expectedModelVersion is null)
+        {
+            return null;
+        }
+
+        return EtabsModelVersionCheck.Check(expectedModelVersion, _installedVersion.Read());
     }
 
     private Result<GetStatusData> ReadActiveStatus()

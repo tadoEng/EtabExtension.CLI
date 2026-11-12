@@ -33,6 +33,14 @@ public interface IEtabsSession : IDisposable
     void MarkVisibilityStage(string stage);
 
     ManagedEtabsShutdownResult Shutdown();
+
+    /// <summary>
+    /// <see cref="Shutdown"/> for when the session's STA worker is stuck behind a modal
+    /// ETABS dialog and can never run the normal shutdown (review finding P2-1). Called from
+    /// a dedicated STA thread, never the worker: the CSI exit is attempted bounded, then the
+    /// exact owned process is killed through its authoritative handle.
+    /// </summary>
+    ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked();
 }
 
 public sealed class EtabsSession : IEtabsSession
@@ -133,8 +141,8 @@ public sealed class EtabsSession : IEtabsSession
                 RequireVisibleStartConsent();
 
                 _diagnostics.WriteLine(
-                    "ℹ Starting ETABS (shared serve session; the engineer consented to a " +
-                    "visible start)...");
+                    "ℹ Starting ETABS (shared serve session; declared start intent: " +
+                    $"{_work.Current.StartIntent})...");
                 var launched = Launch();
                 _owned = launched;
                 try
@@ -278,7 +286,7 @@ public sealed class EtabsSession : IEtabsSession
         // whatever the ambient field had decayed to - or worse, whatever a later polling
         // request had just published into it.
         var intent = _work.Current.StartIntent;
-        if (intent == ManagedEtabsStartIntent.VisibleByConsent)
+        if (ManagedEtabsStartIntents.PermitsStart(intent))
         {
             return;
         }
@@ -621,7 +629,14 @@ public sealed class EtabsSession : IEtabsSession
         }
     }
 
-    public ManagedEtabsShutdownResult Shutdown()
+    public ManagedEtabsShutdownResult Shutdown() => ShutdownWith(_shutdownMachine.Shutdown);
+
+    /// <inheritdoc />
+    public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked() =>
+        ShutdownWith(_shutdownMachine.ShutdownWhileWorkerBlocked);
+
+    private ManagedEtabsShutdownResult ShutdownWith(
+        Func<IManagedEtabsApplication, ManagedEtabsShutdownResult> shutdown)
     {
         lock (_gate)
         {
@@ -639,7 +654,7 @@ public sealed class EtabsSession : IEtabsSession
                 return _shutdownResult;
             }
 
-            _shutdownResult = _shutdownMachine.Shutdown(_owned);
+            _shutdownResult = shutdown(_owned);
             if (_shutdownResult.Data.ProcessExitConfirmed)
             {
                 _owned = null;

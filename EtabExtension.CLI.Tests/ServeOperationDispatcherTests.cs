@@ -168,7 +168,11 @@ public sealed class ServeOperationDispatcherTests : IDisposable
                 "get-status", null, TestContext.Current.CancellationToken));
 
             Assert.True(response.Success);
-            Assert.Equal(EtabsInstanceOwnership.Ambiguous, response.Data!.Ownership);
+            // Core-loop §2.3: an unidentified ETABS is Ambiguous; an identified one that is
+            // neither ours nor the sibling's is External.
+            Assert.Equal(
+                unidentified ? EtabsInstanceOwnership.Ambiguous : EtabsInstanceOwnership.External,
+                response.Data!.Ownership);
             Assert.Equal(
                 unidentified ? [42] : [42, 99],
                 response.Data.ObservedPids);
@@ -452,6 +456,185 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.Equal(1, session.RevealCalls);
         Assert.Equal(["get-or-start", "open", "reveal"], session.Events);
         Assert.Equal(@"C:\v1\sample_v2.edb", open.FilePath);
+    }
+
+    // ── WP-C0: background open, version pre-check, modal-dialog watchdog ────────
+
+    /// <summary>The analysis daemon's open (core-loop §2.4) never reveals ETABS.</summary>
+    [Fact]
+    public async Task ABackgroundOpenNeverRevealsEtabs()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var open = new FakeOpenModelService(session.Events);
+        var dispatcher = CreateDispatcher(_manager, session, open: open);
+
+        var response = Assert.IsType<Result<OpenModelData>>(await dispatcher.DispatchAsync(
+            "open-model",
+            Json("""{"filePath":"C:/scratch/main-v3.edb","background":true}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.True(response.Success);
+        Assert.Equal(0, session.RevealCalls);
+        Assert.Equal(["get-or-start", "open"], session.Events);
+    }
+
+    /// <summary>
+    /// P2-4: the engineer agreed to a HIDDEN second ETABS. An open on a request that
+    /// declared background-consented must not reveal it just because the payload omitted
+    /// <c>background</c>.
+    /// </summary>
+    [Fact]
+    public async Task ABackgroundConsentedOpenWithoutTheBackgroundFieldNeverRevealsEtabs()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var open = new FakeOpenModelService(session.Events);
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            open: open,
+            declaredIntent: ManagedEtabsStartIntent.BackgroundByConsent);
+
+        var response = Assert.IsType<Result<OpenModelData>>(await dispatcher.DispatchAsync(
+            "open-model",
+            Json("""{"filePath":"C:/scratch/main-v3.edb"}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.True(response.Success);
+        Assert.Equal(0, session.RevealCalls);
+        Assert.Equal(["get-or-start", "open"], session.Events);
+    }
+
+    /// <summary>DD-5: a 23.3 model on 23.2 ETABS is refused typed, before OpenFile.</summary>
+    [Fact]
+    public async Task ANewerModelVersionIsRefusedBeforeOpenFile()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var open = new FakeOpenModelService(session.Events);
+        var dispatcher = CreateDispatcher(_manager, session, open: open);
+
+        var response = Assert.IsAssignableFrom<Result>(await dispatcher.DispatchAsync(
+            "open-model",
+            Json("""{"filePath":"C:/v1/sample_v2.edb","expectedModelVersion":"23.3.0"}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.False(response.Success);
+        Assert.StartsWith("[ETABS_VERSION_MISMATCH] ", response.Error, StringComparison.Ordinal);
+        Assert.Contains("detail={\"model\":\"23.3.0\",\"installed\":\"23.2.0\"}", response.Error, StringComparison.Ordinal);
+        Assert.Null(open.FilePath);
+        Assert.Equal(0, session.RevealCalls);
+    }
+
+    [Fact]
+    public async Task AnEqualModelVersionOpens()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var open = new FakeOpenModelService(session.Events);
+        var dispatcher = CreateDispatcher(_manager, session, open: open);
+
+        var response = Assert.IsType<Result<OpenModelData>>(await dispatcher.DispatchAsync(
+            "open-model",
+            Json("""{"filePath":"C:/v1/sample_v2.edb","expectedModelVersion":"23.2.0"}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.True(response.Success);
+    }
+
+    /// <summary>
+    /// The DD-5 hang, reproduced without ETABS: OpenFile blocks behind a dialog. The open
+    /// fails typed instead of hanging, and while it is still blocked, later ETABS commands
+    /// are refused with the same code rather than queueing behind it.
+    /// </summary>
+    [Fact]
+    public async Task AModalDialogFailsTheOpenAndRefusesLaterCommandsWhileItBlocks()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var session = new FakeSession();
+        var open = new FakeOpenModelService(session.Events) { Gate = release.Task };
+        var watchdog = new EtabsModalDialogWatchdog(
+            new OneDialog(new(7, "ETABS", ["Unexpected dialog"])),
+            TimeSpan.FromMilliseconds(5),
+            TimeSpan.FromSeconds(1));
+        var dispatcher = CreateDispatcher(_manager, session, open: open, watchdog: watchdog);
+
+        try
+        {
+            var opened = Assert.IsAssignableFrom<Result>(await dispatcher.DispatchAsync(
+                "open-model",
+                Json("""{"filePath":"C:/v1/sample_v2.edb"}"""),
+                TestContext.Current.CancellationToken));
+            var saved = Assert.IsAssignableFrom<Result>(await dispatcher.DispatchAsync(
+                "save-model",
+                Json("""{"filePath":"C:/v1/sample_v2.edb"}"""),
+                TestContext.Current.CancellationToken));
+
+            Assert.False(opened.Success);
+            Assert.StartsWith("[ETABS_MODAL_DIALOG] ", opened.Error, StringComparison.Ordinal);
+            Assert.Contains("\"dismissed\":false", opened.Error, StringComparison.Ordinal);
+            Assert.False(saved.Success);
+            Assert.StartsWith("[ETABS_MODAL_DIALOG] ", saved.Error, StringComparison.Ordinal);
+            Assert.Equal(0, session.RevealCalls);
+        }
+        finally
+        {
+            release.SetResult();
+        }
+    }
+
+    /// <summary>
+    /// P3-4(c): while a command is stuck behind an unanswered dialog, neither operation lane
+    /// may accept work - it would only queue behind the stuck STA worker. Both refuse with
+    /// the same typed code, and no operation is started.
+    /// </summary>
+    [Theory]
+    [InlineData("start-operation", """{"kind":"analyze-and-extract","payload":{}}""")]
+    [InlineData("analyze-and-extract", """{"filePath":"C:/v1/sample_v2.edb","outputDir":"C:/v1/out","tables":{}}""")]
+    public async Task OperationLanesAreRefusedTypedWhileACommandIsBlockedOnADialog(
+        string command,
+        string payload)
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var session = new FakeSession();
+        var open = new FakeOpenModelService(session.Events) { Gate = release.Task };
+        var watchdog = new EtabsModalDialogWatchdog(
+            new OneDialog(new(7, "ETABS", ["Unexpected dialog"])),
+            TimeSpan.FromMilliseconds(5),
+            TimeSpan.FromSeconds(1));
+        var dispatcher = CreateDispatcher(_manager, session, open: open, watchdog: watchdog);
+
+        try
+        {
+            _ = await dispatcher.DispatchAsync(
+                "open-model",
+                Json("""{"filePath":"C:/v1/sample_v2.edb"}"""),
+                TestContext.Current.CancellationToken);
+            Assert.True(watchdog.IsBlocked);
+
+            var refused = Assert.IsAssignableFrom<Result>(await dispatcher.DispatchAsync(
+                command,
+                Json(payload),
+                TestContext.Current.CancellationToken));
+
+            Assert.False(refused.Success);
+            Assert.StartsWith("[ETABS_MODAL_DIALOG] ", refused.Error, StringComparison.Ordinal);
+            Assert.False(_manager.HasActiveOperation);
+            Assert.False(Directory.Exists(_directory) && Directory.EnumerateDirectories(_directory).Any());
+        }
+        finally
+        {
+            release.SetResult();
+        }
+    }
+
+    private sealed class OneDialog(EtabsDialogWindow dialog) : IEtabsDialogWindowSource
+    {
+        public IReadOnlyList<EtabsDialogWindow> FindModalDialogs(int pid) => [dialog];
+        public bool TryDismiss(EtabsDialogWindow dialog) => false;
     }
 
     /// <summary>
@@ -1245,7 +1428,10 @@ esults"
         ICachedSessionStatus? cachedStatus = null,
         ISnapshotExportService? snapshot = null,
         IOpenModelService? open = null,
-        ISaveModelService? save = null) => new(
+        ISaveModelService? save = null,
+        IEtabsModalDialogWatchdog? watchdog = null,
+        IEtabsInstalledVersion? installedVersion = null,
+        ManagedEtabsStartIntent declaredIntent = ManagedEtabsStartIntent.VisibleByConsent) => new(
             session ?? null!,
             null!,
             open ?? null!,
@@ -1264,7 +1450,35 @@ esults"
             cachedStatus ?? new CachedSessionStatus(),
             processes ?? new FakeProcesses(new EtabsProcessObservation([], 0)),
             runAnalysis ?? null!,
-            WorkEnvelopeFixtures.Consented(session ?? new FakeSession()));
+            Declared(session ?? new FakeSession(), declaredIntent),
+            watchdog ?? new EtabsModalDialogWatchdog(
+                new NoDialogs(), TimeSpan.FromMilliseconds(5), TimeSpan.FromSeconds(1)),
+            installedVersion ?? new FixedInstalledVersion("23.2.0"));
+
+    /// <summary>An envelope whose request declared <paramref name="intent"/>.</summary>
+    private static EtabsWorkEnvelope Declared(IEtabsSession session, ManagedEtabsStartIntent intent)
+    {
+        var declared = new ManagedEtabsStartIntentScope();
+        _ = declared.Publish(intent);
+        return new EtabsWorkEnvelope(declared, new EtabsWorkScope(), session);
+    }
+
+    private sealed class FixedInstalledVersion(string version) : IEtabsInstalledVersion
+    {
+        public int Reads { get; private set; }
+
+        public string Read()
+        {
+            Reads++;
+            return version;
+        }
+    }
+
+    private sealed class NoDialogs : IEtabsDialogWindowSource
+    {
+        public IReadOnlyList<EtabsDialogWindow> FindModalDialogs(int pid) => [];
+        public bool TryDismiss(EtabsDialogWindow dialog) => false;
+    }
 
     private static JsonElement Json(string value) => JsonSerializer.Deserialize<JsonElement>(value);
 
@@ -1348,6 +1562,7 @@ esults"
                 : Result.Fail("ETABS_VISIBILITY_NOT_CONFIRMED; operation=cOAPI.Unhide");
         }
         public ManagedEtabsShutdownResult Shutdown() => throw new NotSupportedException();
+        public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked() => throw new NotSupportedException();
         public void Dispose() { }
     }
 
@@ -1361,12 +1576,15 @@ esults"
         public bool Save { get; private set; }
         public string? Failure { get; init; }
 
+        /// <summary>Holds OpenFile "inside ETABS" until released, like a modal box does.</summary>
+        public Task? Gate { get; init; }
+
         public Task<Result<OpenModelData>> OpenModelAsync(
             string filePath,
             bool save,
             bool newInstance) => throw new NotSupportedException();
 
-        public Task<Result<OpenModelData>> OpenModelOnAppAsync(
+        public async Task<Result<OpenModelData>> OpenModelOnAppAsync(
             ETABSApplication app,
             string filePath,
             bool save)
@@ -1374,9 +1592,14 @@ esults"
             FilePath = filePath;
             Save = save;
             _events?.Add("open");
-            return Task.FromResult(Failure is null
+            if (Gate is not null)
+            {
+                await Gate;
+            }
+
+            return Failure is null
                 ? Result.Ok(new OpenModelData { FilePath = filePath })
-                : Result.Fail<OpenModelData>(Failure));
+                : Result.Fail<OpenModelData>(Failure);
         }
     }
 
