@@ -512,6 +512,48 @@ public sealed class EtabsLaunchState
         return true;
     }
 
+    // The model this attempt's record names (card v2.5a A1). Kept in memory as well, so every
+    // later record write (detach, userVisible) carries it forward instead of dropping it.
+    private EtabsDocumentRecord? _document;
+
+    /// <summary>
+    /// Persists the opened model's identity durably (card v2.5a A1). Returns false when the
+    /// record on disk is not this attempt's. A write that throws leaves the in-memory copy as
+    /// it was, so the record and memory never disagree about what was persisted.
+    /// </summary>
+    public bool WriteDocumentRecord(ManagedProcessIdentity identity, EtabsDocumentRecord document)
+    {
+        var existing = _records.Read();
+        if (existing is null || existing.ManagedLaunchRecordId != LaunchRecordId)
+        {
+            return false;
+        }
+
+        var previous = Volatile.Read(ref _document);
+        Volatile.Write(ref _document, document);
+        try
+        {
+            _records.Write(ToRecord(identity, existing.Phase ?? ManagedEtabsRecordPhase.Ready)
+                with { UserVisible = existing.UserVisible });
+        }
+        catch
+        {
+            Volatile.Write(ref _document, previous);
+            throw;
+        }
+
+        return true;
+    }
+
+    /// <summary>The <c>document</c> of this attempt's record as persisted, or null when absent.</summary>
+    public EtabsDocumentRecord? ReadDocument()
+    {
+        var existing = _records.Read();
+        return existing is not null && existing.ManagedLaunchRecordId == LaunchRecordId
+            ? existing.Document
+            : null;
+    }
+
     /// <summary>The <c>userVisible</c> flag of this attempt's record, or null when absent.</summary>
     public bool? ReadUserVisible()
     {
@@ -613,7 +655,8 @@ public sealed class EtabsLaunchState
         LaunchRecordId,
         DateTimeOffset.UtcNow)
     {
-        Phase = phase
+        Phase = phase,
+        Document = Volatile.Read(ref _document)
     };
 
     // ── launch-phase termination (card W1, X1, X2, Y1, Y2, Y3) ─────────────

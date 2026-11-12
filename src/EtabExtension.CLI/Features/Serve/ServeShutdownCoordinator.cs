@@ -124,6 +124,7 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
     private readonly IEtabsSession _session;
     private readonly IEtabsModalDialogWatchdog _watchdog;
     private readonly ShutdownIfUnchangedRegistry? _c10;
+    private readonly SaveAndExitRegistry? _c11;
     private readonly TimeSpan _blockedEnvelope;
     private readonly TimeSpan _staBusyWait;
     private readonly TimeSpan _startedGrace;
@@ -137,8 +138,9 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
         IStaExecutionWorker worker,
         IEtabsSession session,
         IEtabsModalDialogWatchdog watchdog,
-        ShutdownIfUnchangedRegistry? c10 = null)
-        : this(worker, session, watchdog, BlockedShutdownEnvelope, StaBusyWait, c10)
+        ShutdownIfUnchangedRegistry? c10 = null,
+        SaveAndExitRegistry? c11 = null)
+        : this(worker, session, watchdog, BlockedShutdownEnvelope, StaBusyWait, c10, c11: c11)
     {
     }
 
@@ -150,8 +152,10 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
         TimeSpan? staBusyWait = null,
         ShutdownIfUnchangedRegistry? c10 = null,
         TimeSpan? startedGrace = null,
-        TimeSpan? startedDeadline = null)
+        TimeSpan? startedDeadline = null,
+        SaveAndExitRegistry? c11 = null)
     {
+        _c11 = c11;
         _startedGrace = startedGrace ?? StartedExitGrace;
         _startedDeadline = startedDeadline ?? StartedExitDeadline;
         _worker = worker;
@@ -194,8 +198,10 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
 
     private async Task<Result<DetachData>> RunDetachAsync()
     {
-        // A pending C10 can no longer exit once a detach is asked for (card v2.4 §2).
+        // A pending C10 or C11 can no longer exit once a detach is asked for (card v2.4 §2,
+        // v2.5a A4).
         _ = _c10?.AbandonCurrent();
+        _ = _c11?.AbandonCurrent();
 
         DetachResult detached;
         try
@@ -253,6 +259,10 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
 
     private async Task<Result<ManagedEtabsShutdownData>> RunEndOfInputAsync(ServeEofPolicy policy)
     {
+        // Whatever EOF decides (a detach, a suppression after a failed detach, or the exit), a
+        // save-and-exit still Saving can no longer exit on its own account (card v2.5a A4).
+        _ = _c11?.AbandonCurrent();
+
         // A detach the host already asked for decides EOF too: nothing destructive follows a
         // detached or uncertain instance.
         Task<Result<DetachData>>? prior;
@@ -340,6 +350,7 @@ public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
             // An explicit shutdown (or EOF) ends the process anyway, so a pending
             // shutdown-if-unchanged can no longer exit on its own account (card v2.4 §2).
             _ = _c10?.AbandonCurrent();
+            _ = _c11?.AbandonCurrent();
 
             // While a command is abandoned to an unanswered ETABS dialog, the STA worker is
             // stuck inside that CSI call: a shutdown queued behind it would never run, ETABS

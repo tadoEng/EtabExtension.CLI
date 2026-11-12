@@ -35,6 +35,8 @@ public static class ServeExtensions
         services.AddScoped<ISavedFileStampReader, DiskSavedFileStampReader>();
         services.AddScoped<IShutdownIfUnchangedApiFactory, SessionShutdownIfUnchangedApiFactory>();
         services.AddScoped<ShutdownIfUnchangedService>();
+        services.AddScoped<SaveAndExitRegistry>();
+        services.AddScoped<SaveAndExitService>();
         services.AddScoped<IProcessInspector>(provider => new SiblingAwareProcessInspector(
             new WindowsProcessInspector(),
             provider.GetRequiredService<ServeSessionPaths>().SiblingRecordPath is { } sibling

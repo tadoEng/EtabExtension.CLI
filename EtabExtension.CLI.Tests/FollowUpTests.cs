@@ -67,19 +67,30 @@ public sealed class StartBlockerFollowUpTests
         Assert.False(cell.StartupBlockerArmed, "a clean first command disarms the watch");
     }
 
+    // Card v2.5a A3 (replaces P2-A's owner clause): a visible non-main window is a blocker only
+    // while the KNOWN main window is disabled; a modal child of a disabled main counts too.
     [Theory]
     [InlineData(true, 0, false)] // ownerless, main enabled: nothing is held up
+    [InlineData(true, 0x100, false)] // owned by an enabled main: modeless/progress, not a blocker
     [InlineData(false, 0, true)] // ownerless, main disabled: a blocker
-    [InlineData(false, 0x100, false)] // owned BY main (its own child dialog): not a blocker
+    [InlineData(false, 0x100, true)] // owned BY a disabled main (a modal child): a blocker
     [InlineData(false, 0x777, true)] // owned by some other window, main disabled: a blocker
-    public void TheBlockerRuleIsOwnerlessOrNotOwnedByMainAndOnlyWhileMainIsDisabled(
+    public void ANonMainWindowBlocksOnlyWhileTheKnownMainWindowIsDisabled(
         bool mainEnabled,
         int owner,
         bool expectBlocker)
     {
-        var window = new StartupWindow(0x200, "Sign in", "AuthenticationView", (nint)owner);
+        var window = new StartupWindow(0x200, "Opening model", "ProgressForm", (nint)owner);
+        var main = new StartupWindow(Main, "ETABS", "HwndWrapper");
 
-        Assert.Equal(expectBlocker, EtabsPostReadyBlockerRule.IsBlocker(window, Main, mainEnabled));
+        var assessment = EtabsStartupBlockerRule.Assess(
+            [main, window],
+            Main,
+            _ => true,
+            _ => mainEnabled);
+
+        Assert.Equal(expectBlocker, assessment.Blocker is not null);
+        Assert.Equal(Main, assessment.Main);
 
         var (watchdog, _, windows) = Build(mainEnabled);
         windows.Windows.Add((Identity.Pid, window));
@@ -94,10 +105,13 @@ public sealed class StartBlockerFollowUpTests
     [Fact]
     public void TheMainWindowItselfIsNeverABlocker()
     {
-        Assert.False(EtabsPostReadyBlockerRule.IsBlocker(
-            new StartupWindow(Main, "ETABS", "HwndWrapper"),
+        var assessment = EtabsStartupBlockerRule.Assess(
+            [new StartupWindow(Main, "ETABS", "HwndWrapper")],
             Main,
-            mainWindowEnabled: false));
+            _ => true,
+            _ => false);
+
+        Assert.Null(assessment.Blocker);
     }
 
     // P3-G: the post-Ready failure says so; the launch-phase one says "launch" and reports its cleanup.

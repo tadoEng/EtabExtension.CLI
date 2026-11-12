@@ -41,6 +41,7 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         "read-model-metadata",
         "resolve-area-targets",
         "run-analysis",
+        "save-and-exit",
         "save-model",
         "shutdown-if-unchanged",
         "snapshot-export",

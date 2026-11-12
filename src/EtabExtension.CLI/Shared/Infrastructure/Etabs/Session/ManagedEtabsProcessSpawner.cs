@@ -135,4 +135,11 @@ public interface IEtabsStartupWindowSource
     /// of the MAIN window (review P2-A): a main window that is still enabled cannot be held up.
     /// </summary>
     bool IsWindowEnabled(nint window);
+
+    /// <summary>
+    /// Whether <paramref name="window"/> still exists and belongs to <paramref name="pid"/>
+    /// (card v2.5a A3: the captured main window is validated on every use). A source with no
+    /// way to ask answers "live" for any non-zero handle.
+    /// </summary>
+    bool IsLiveWindowOf(nint window, int pid) => window != nint.Zero;
 }

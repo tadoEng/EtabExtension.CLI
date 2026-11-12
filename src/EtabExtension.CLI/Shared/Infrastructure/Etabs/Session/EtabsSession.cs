@@ -77,6 +77,18 @@ public interface IEtabsSession : IDisposable
     {
     }
 
+    /// <summary>
+    /// Persists the model the daemon just opened, durably, in the instance record (card v2.5a
+    /// A1). A failure means the identity is NOT recorded, and <c>save-and-exit</c> will refuse.
+    /// </summary>
+    Result RecordOpenedDocument(EtabsDocumentRecord document) => Result.Ok();
+
+    /// <summary>
+    /// The model identity in the instance record as persisted, or null when none was written
+    /// (or the record is not this launch's). Reads the durable record, not memory.
+    /// </summary>
+    EtabsDocumentRecord? ReadRecordedDocument() => null;
+
     /// <summary>True once the user was shown ETABS and this daemon still owns it (card C2).</summary>
     bool IsUserVisible => false;
 
@@ -1090,6 +1102,57 @@ public sealed class EtabsSession : IEtabsSession
                 $"csiReturnCode={csi.ReturnCode}, state={owned.VisibilityState})");
 
             return Result.Ok();
+        }
+    }
+
+    /// <inheritdoc />
+    public Result RecordOpenedDocument(EtabsDocumentRecord document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        lock (_gate)
+        {
+            var owned = GetOrStartOwned();
+            var launch = Volatile.Read(ref _launch);
+            if (launch is null)
+            {
+                return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                    $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] There is no launch to record the " +
+                    "opened document for."));
+            }
+
+            try
+            {
+                return launch.WriteDocumentRecord(owned.Identity, document)
+                    ? Result.Ok()
+                    : Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                        $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] The recovery record is not this " +
+                        "launch's, so the opened document was not recorded."));
+            }
+#pragma warning disable CA1031 // any failure to persist means the identity is not recorded
+            catch (Exception exception)
+#pragma warning restore CA1031
+            {
+                return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                    $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] The opened document could not be " +
+                    "recorded. " + EtabsApiDiagnosticFormatter.InfrastructureException(
+                        "ManagedEtabsSessionRecord.Write(document)",
+                        exception)));
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public EtabsDocumentRecord? ReadRecordedDocument()
+    {
+        try
+        {
+            return Volatile.Read(ref _launch)?.ReadDocument();
+        }
+#pragma warning disable CA1031 // an unreadable record is "no recorded document", which refuses
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            return null;
         }
     }
 
