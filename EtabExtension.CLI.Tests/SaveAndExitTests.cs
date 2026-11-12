@@ -1211,6 +1211,21 @@ public sealed class StartupBlockerRuleTests
         Assert.Equal(0, rig.Attach.AttachCalls);
     }
 
+    // "At once": before ANY main window exists the launcher does not wait out the deadline; it
+    // blocks on the first look. Mutation: only look for a blocker once a main window exists.
+    [Fact]
+    public void ALicenseWindowSeenBeforeAnyMainWindowExistsBlocksOnTheFirstLookWithoutWaiting()
+    {
+        var rig = new LauncherRig(process: new FakeSpawnedProcess(Identity) { NoWindowPolls = int.MaxValue });
+        rig.Windows.Windows.Add((Identity.Pid, License()));
+
+        var error = Assert.Throws<EtabsLaunchException>(() => rig.Launcher.Launch(rig.NewState()));
+
+        Assert.Equal(EtabsLaunchErrorCodes.StartBlocked, error.Code);
+        Assert.Empty(rig.Clock.Waits);
+        Assert.Equal(0, rig.Attach.AttachCalls);
+    }
+
     // main_is_identified_by_the_attach_hwnd: the main window is captured by the rule from the
     // visible windows - NOT Process.MainWindowHandle, which the licence dialog became on a live
     // run. Mutation: trust Process.MainWindowHandle.
