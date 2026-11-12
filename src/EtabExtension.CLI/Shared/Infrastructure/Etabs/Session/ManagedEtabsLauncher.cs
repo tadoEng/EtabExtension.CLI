@@ -56,6 +56,11 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
 {
     public static readonly TimeSpan ForcedExitTimeout = TimeSpan.FromSeconds(10);
 
+    private static readonly JsonSerializerOptions DetailJson = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
     private readonly IProcessInspector _processes;
     private readonly IEtabsExecutableResolver _executableResolver;
     private readonly IEtabsRawApiFactory _apiFactory;
@@ -509,7 +514,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         var windowClass = EtabsApiDiagnosticFormatter.Bounded(blocker.ClassName);
         var detail = JsonSerializer.Serialize(
             new { title, @class = windowClass, dismissed = false },
-            new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+            DetailJson);
         throw new EtabsLaunchException(
             EtabsLaunchErrorCodes.StartBlocked,
             $"ETABS is waiting on a window it cannot continue past: title='{title}', " +
@@ -524,7 +529,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     /// whole of the background life of the session it is about to create. Not defended
     /// against failure on purpose: an exception here fails the launch.
     /// </summary>
-    private IManagedEtabsWindowGuard ActivateWindowGuard(IOwnedEtabsProcess ownedProcess)
+    private IManagedEtabsWindowGuard ActivateWindowGuard(LeasedOwnedProcess ownedProcess)
     {
         IManagedEtabsWindowGuard guard;
         try

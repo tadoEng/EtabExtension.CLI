@@ -1,7 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
-using System.Text;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
@@ -167,9 +166,9 @@ public sealed class DaemonRecordLock : IDisposable
             return string.Empty;
         }
 
-        var buffer = new StringBuilder(1024);
-        var length = NativeMethods.GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
-        return length == 0 || length > buffer.Capacity ? string.Empty : buffer.ToString();
+        var buffer = new char[1024];
+        var length = NativeMethods.GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Length, 0);
+        return length == 0 || length > buffer.Length ? string.Empty : new string(buffer, 0, (int)length);
     }
 
     [SupportedOSPlatform("windows")]
@@ -199,7 +198,7 @@ public sealed class DaemonRecordLock : IDisposable
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         internal static extern uint GetFinalPathNameByHandleW(
             Microsoft.Win32.SafeHandles.SafeFileHandle handle,
-            StringBuilder path,
+            [Out] char[] path,
             uint pathLength,
             uint flags);
     }

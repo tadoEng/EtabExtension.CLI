@@ -17,13 +17,15 @@ public sealed class NoSiblingRecordSource : ISiblingRecordSource
 }
 
 /// <summary>Read-only view of the sibling daemon's record file. Never writes or clears it.</summary>
-public sealed class JsonSiblingRecordSource(string path) : ISiblingRecordSource
+public sealed class JsonSiblingRecordSource(string path) : ISiblingRecordSource, IDisposable
 {
     private readonly JsonSessionRecordStore _store = new(path);
 
     public string FilePath => _store.FilePath;
 
     public ManagedEtabsSessionRecord? Read() => _store.Read();
+
+    public void Dispose() => _store.Dispose();
 }
 
 public static class EtabsSiblingCensus
