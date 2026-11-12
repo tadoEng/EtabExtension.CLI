@@ -97,7 +97,7 @@ public class ServeLoopTests
             .EnumerateArray()
             .Select(item => item.GetString()!)
             .ToArray();
-        Assert.Equal(["boom", "get-status", "open-model", "shutdown"], capabilities);
+        Assert.Equal(["boom", "detach", "get-status", "open-model", "shutdown"], capabilities);
     }
 
     [Fact]

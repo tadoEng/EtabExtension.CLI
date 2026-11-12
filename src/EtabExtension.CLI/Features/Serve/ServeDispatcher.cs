@@ -54,9 +54,17 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly IEtabsWorkEnvelope _envelope;
     private readonly IEtabsModalDialogWatchdog _watchdog;
     private readonly IEtabsInstalledVersion _installedVersion;
+    private readonly AbandonedRequests _abandoned;
+    private readonly OrphanDispositionCell _orphan;
+    private readonly ShutdownIfUnchangedService? _shutdownIfUnchanged;
+    private readonly ShutdownIfUnchangedRegistry _c10;
     private readonly Dictionary<
         string,
         Func<JsonElement?, CancellationToken, Task<object>>> _handlers;
+
+    // Synchronous ETABS commands queued on or running on the STA. While any is, get-status is
+    // answered from the daemon's own state and never queues behind it (card C8).
+    private int _synchronousInFlight;
 
     public IReadOnlyCollection<string> Capabilities { get; }
 
@@ -81,8 +89,16 @@ public sealed class ServeDispatcher : IServeDispatcher
         IRunAnalysisService runAnalysis,
         IEtabsWorkEnvelope envelope,
         IEtabsModalDialogWatchdog watchdog,
-        IEtabsInstalledVersion installedVersion)
+        IEtabsInstalledVersion installedVersion,
+        AbandonedRequests? abandoned = null,
+        OrphanDispositionCell? orphan = null,
+        ShutdownIfUnchangedService? shutdownIfUnchanged = null,
+        ShutdownIfUnchangedRegistry? c10 = null)
     {
+        _abandoned = abandoned ?? new AbandonedRequests();
+        _orphan = orphan ?? new OrphanDispositionCell();
+        _shutdownIfUnchanged = shutdownIfUnchanged;
+        _c10 = c10 ?? new ShutdownIfUnchangedRegistry();
         _session = session;
         _status = status;
         _open = open;
@@ -126,6 +142,7 @@ public sealed class ServeDispatcher : IServeDispatcher
             ["resolve-area-targets"] = DispatchResolveAreaTargetsAsync,
             ["run-analysis"] = DispatchRunAnalysisAsync,
             ["save-model"] = DispatchSaveModelAsync,
+            ["shutdown-if-unchanged"] = DispatchShutdownIfUnchangedAsync,
             ["snapshot-export"] = DispatchSnapshotExportAsync,
             ["start-operation"] = DispatchStartOperationAsync,
             ["unlock-model"] = DispatchUnlockModelAsync
@@ -149,7 +166,7 @@ public sealed class ServeDispatcher : IServeDispatcher
         // ACCEPTS here and defers its answer, rather than awaiting the whole operation and
         // taking the reader down with it. Exactly one dispatch is ever executing, so the
         // ambient request state below stays single-writer.
-        _pendingWork = _envelope.Capture(command);
+        _pendingWork.Value = _envelope.Capture(command);
 
         return _handlers.TryGetValue(command, out var handler)
             ? handler(request, ct)
@@ -166,12 +183,16 @@ public sealed class ServeDispatcher : IServeDispatcher
         // During an async operation the protocol thread must never issue COM
         // calls. Report the most recent worker-owned snapshot instead. The same holds
         // while a command is stuck behind an unanswered ETABS dialog: the worker is busy.
-        if (_operations.HasActiveOperation || _watchdog.IsBlocked)
+        // And while a SYNCHRONOUS command runs (card C8): get-status is a control command,
+        // accepted and answered without queueing behind the work it reports on.
+        if (_operations.HasActiveOperation
+            || _watchdog.IsBlocked
+            || Volatile.Read(ref _synchronousInFlight) > 0)
         {
             return ReadActiveStatus();
         }
 
-        var work = _pendingWork;
+        var work = _pendingWork.Value;
         return await _operations.ExecuteSynchronousAsync(() => _envelope.RunAsync(work, () =>
         {
             try
@@ -185,7 +206,7 @@ public sealed class ServeDispatcher : IServeDispatcher
                     observation,
                     _session.ProcessId);
                 _cachedStatus.Update(current);
-                return Task.FromResult<object>(current);
+                return Task.FromResult<object>(WithDaemonFacts(current));
             }
             catch (Exception ex)
             {
@@ -229,8 +250,25 @@ public sealed class ServeDispatcher : IServeDispatcher
         CancellationToken ct)
     {
         _ = ct;
-        var req = Deserialize<OperationIdRequest>(request);
-        return Task.FromResult<object>(_operations.Cancel(req.OperationId));
+        var req = Deserialize<ServeCancelRequest>(request);
+        if (req.RequestId is { } requestId)
+        {
+            // The host abandons a shutdown-if-unchanged that is still Checking (card v2.4 §2).
+            // A command already Exiting cannot be cancelled: its exit is won.
+            return Task.FromResult<object>(_c10.Cancel(requestId) switch
+            {
+                ShutdownIfUnchangedState.Abandoned => Result.Ok(new CancelOperationData(
+                    $"request:{requestId}",
+                    OperationCancellationState.Honored)),
+                null => Result.Fail<CancelOperationData>($"Request not found or not cancellable: '{requestId}'"),
+                { } state => Result.Fail<CancelOperationData>(
+                    $"Request '{requestId}' can no longer be cancelled (state {state})."),
+            });
+        }
+
+        return Task.FromResult<object>(_operations.Cancel(
+            req.OperationId ?? throw new InvalidOperationException(
+                "cancel-operation needs an 'operationId' or a 'requestId'")));
     }
 
     /// <summary>
@@ -252,7 +290,7 @@ public sealed class ServeDispatcher : IServeDispatcher
         // background-consented intent. The engineer agreed to a HIDDEN second ETABS, so an
         // open that merely omits "background" must not put it on screen.
         var reveal = !req.Background
-            && _pendingWork.StartIntent != ManagedEtabsStartIntent.BackgroundByConsent;
+            && _pendingWork.Value.StartIntent != ManagedEtabsStartIntent.BackgroundByConsent;
         return await ExecuteWatchedComAsync(async () =>
         {
             var app = _session.GetOrStart();
@@ -334,10 +372,56 @@ public sealed class ServeDispatcher : IServeDispatcher
         }
 
         var operationId = started.Data.OperationId;
-        return Task.FromResult<object>(new DeferredServeResponse(_watchdog.GuardAsync(
-            () => _session.ProcessId,
-            () => _operations.WaitAsync(operationId, ct),
-            ct)));
+        var servedRequest = ServeRequestContext.Current;
+        return Task.FromResult<object>(new DeferredServeResponse(NoteAbandonedAfter(
+            _watchdog.GuardAsync(
+                () => _session.ProcessId,
+                () => _operations.WaitAsync(operationId, ct),
+                ct),
+            servedRequest)));
+    }
+
+    /// <summary>
+    /// A command a modal dialog abandoned still holds the STA. Once its guard answered, the
+    /// still-running work is recorded as an abandoned request (card C5), so the host can tell
+    /// "outstanding work" from "none" and later see it finished.
+    /// </summary>
+    private async Task<object> NoteAbandonedAfter(Task<object> guarded, ServeRequestInfo? request)
+    {
+        var result = await guarded.ConfigureAwait(false);
+        if (request is not null && _watchdog.BlockedWork is { } work)
+        {
+            _abandoned.Add(request.Id, request.Command, work);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// The daemon's own facts about the instance it holds (card C5): the launch generation, the
+    /// disposition, requests abandoned to a dialog, and what recovery detached. Never read from
+    /// ETABS, so it is always available.
+    /// </summary>
+    private Result<GetStatusData> WithDaemonFacts(Result<GetStatusData> status)
+    {
+        if (!status.Success || status.Data is null)
+        {
+            return status;
+        }
+
+        var detached = _orphan.Detached;
+        return Result.Ok(status.Data with
+        {
+            LaunchRecordId = _session.LaunchRecordId,
+            Disposition = _session.Disposition,
+            Abandoned = _abandoned.Snapshot(),
+            OrphanDisposition = detached is null
+                ? null
+                : new OrphanDispositionInfo(new DetachedIdentity(
+                    detached.Pid,
+                    detached.ProcessStartTimeUtc,
+                    detached.ExecutablePath))
+        });
     }
 
     private async Task<object> DispatchSnapshotExportAsync(
@@ -373,15 +457,55 @@ public sealed class ServeDispatcher : IServeDispatcher
         CancellationToken ct)
     {
         _ = ct;
-        var req = Deserialize<ServeFileRequest>(request);
+        var req = Deserialize<ServeSaveModelRequest>(request);
         if (!_session.IsStarted)
         {
             return Result.Fail<SaveModelData>(
                 "No managed ETABS session is running, so there is no open model to save.");
         }
 
+        // An ordinary request: its answer is written when the save returns, and NOTHING is
+        // chained to that answer. A reply that lands after the host stopped waiting is dropped
+        // by the host and can never cause an exit (card v2.3 §2, I13').
         return await ExecuteWatchedComAsync(async () => await _save.SaveModelOnAppAsync(
-            _session.GetOrStart(), req.FilePath));
+            _session.GetOrStart(), req.FilePath, req.ExpectedDocument?.FileId));
+    }
+
+    /// <summary>
+    /// <c>shutdown-if-unchanged</c> (C10, cards v2.3/v2.4): one STA command that refuses on a
+    /// modal, re-reads the document and the change signal, and exits only if they still match.
+    /// </summary>
+    private async Task<object> DispatchShutdownIfUnchangedAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<ShutdownIfUnchangedRequest>(request);
+        if (_shutdownIfUnchanged is null)
+        {
+            return Result.Fail("shutdown-if-unchanged is not available in this daemon.");
+        }
+
+        // Refused without queueing, exactly like every other synchronous command: an operation
+        // or an abandoned dialog already holds the STA, and nothing here may exit under them.
+        if (_operations.HasActiveOperation)
+        {
+            return Result.Fail(
+                "A daemon operation is active; shutdown-if-unchanged is unavailable until it completes. " +
+                "ETABS was not exited.");
+        }
+
+        if (_watchdog.IsBlocked)
+        {
+            return _watchdog.BlockedFailure();
+        }
+
+        var requestId = ServeRequestContext.Current?.Id ?? 0;
+        var work = _pendingWork.Value;
+        return await _shutdownIfUnchanged.RunAsync(
+            req,
+            requestId,
+            check => RunSynchronousAsync(() => _envelope.RunAsync(work, check)));
     }
 
     private async Task<object> DispatchUnlockModelAsync(
@@ -540,7 +664,7 @@ public sealed class ServeDispatcher : IServeDispatcher
     /// earlier dispatch is looking at it. What outlives the request is the captured
     /// <see cref="EtabsWorkContext"/> copy, never this field.</para>
     /// </summary>
-    private EtabsWorkContext _pendingWork = EtabsWorkContext.None;
+    private readonly AsyncLocal<EtabsWorkContext> _pendingWork = new();
 
     /// <summary>
     /// Every ETABS-backed command runs through here, which makes it the one place a
@@ -572,8 +696,26 @@ public sealed class ServeDispatcher : IServeDispatcher
             return Task.FromResult<object>(_watchdog.BlockedFailure());
         }
 
-        var work = _pendingWork;
-        return _operations.ExecuteSynchronousAsync(() => _envelope.RunAsync(work, action));
+        var work = _pendingWork.Value;
+        return RunSynchronousAsync(() => _envelope.RunAsync(work, action));
+    }
+
+    /// <summary>
+    /// Queues one synchronous command on the STA and counts it while it is queued or running, so
+    /// a concurrent get-status knows the worker is busy and answers from the daemon's own state
+    /// (card C8).
+    /// </summary>
+    private async Task<object> RunSynchronousAsync(Func<Task<object>> work)
+    {
+        _ = Interlocked.Increment(ref _synchronousInFlight);
+        try
+        {
+            return await _operations.ExecuteSynchronousAsync(work).ConfigureAwait(false);
+        }
+        finally
+        {
+            _ = Interlocked.Decrement(ref _synchronousInFlight);
+        }
     }
 
     /// <summary>
@@ -582,7 +724,9 @@ public sealed class ServeDispatcher : IServeDispatcher
     /// ETABS_MODAL_DIALOG instead of hanging it until the client times out.
     /// </summary>
     private Task<object> ExecuteWatchedComAsync(Func<Task<object>> action) =>
-        _watchdog.GuardAsync(() => _session.ProcessId, () => ExecuteComAsync(action), CancellationToken.None);
+        NoteAbandonedAfter(
+            _watchdog.GuardAsync(() => _session.ProcessId, () => ExecuteComAsync(action), CancellationToken.None),
+            ServeRequestContext.Current);
 
     /// <summary>
     /// The version pre-check (core-loop §2.5), against the running ETABS's executable file
@@ -602,7 +746,7 @@ public sealed class ServeDispatcher : IServeDispatcher
     {
         try
         {
-            return _cachedStatus.Read(_session, _processes.ObserveEtabs());
+            return WithDaemonFacts(_cachedStatus.Read(_session, _processes.ObserveEtabs()));
         }
         catch (Exception ex)
         {

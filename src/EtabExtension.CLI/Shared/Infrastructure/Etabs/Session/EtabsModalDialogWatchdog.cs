@@ -41,6 +41,16 @@ public static class EtabsTypedFailureCodes
     };
 }
 
+/// <summary>The <c>phase</c> detail of an <c>ETABS_START_BLOCKED</c> failure (review P3-G).</summary>
+public static class StartBlockerPhases
+{
+    /// <summary>Seen between <c>Process.Start</c> and Ready; the launch's own process was ended.</summary>
+    public const string Launch = "launch";
+
+    /// <summary>Seen after Ready, during the first watched command; the process is alive and owned.</summary>
+    public const string PostReady = "postReady";
+}
+
 /// <summary>One top-level dialog-class (<c>#32770</c>) window of the watched process.</summary>
 public sealed record EtabsDialogWindow(nint Handle, string Title, IReadOnlyList<string> Texts)
 {
@@ -65,7 +75,10 @@ public sealed record EtabsModalDialogObservation(
             EtabsLaunchErrorCodes.StartBlocked,
             $"ETABS is waiting on a window it cannot continue past: title='{Title}', class='{windowClass}'. " +
             "It was left alone; the engineer must act (for example sign in to the ETABS licence).",
-            new { title = Title, @class = windowClass, dismissed = false })
+            // phase: this blocker was seen AFTER the session was Ready (review P3-G), so the
+            // process is alive and owned. A launch-phase START_BLOCKED says "launch" and
+            // reports that its own process was ended.
+            new { title = Title, @class = windowClass, dismissed = false, phase = StartBlockerPhases.PostReady })
         : EtabsTypedFailureCodes.Format(
         EtabsTypedFailureCodes.ModalDialog,
         Dismissed
@@ -108,6 +121,47 @@ public static class EtabsModalDialogRule
 
         return window.Owner == nint.Zero || !window.OwnerEnabled;
     }
+}
+
+/// <summary>
+/// The post-Ready startup-blocker rule (review P2-A), pure over window facts.
+///
+/// <para>A visible top-level window of the pid is a blocker only when it is NOT the main
+/// window, it is ownerless or owned by something other than the main window, AND the main
+/// window is disabled. An owned popup of an enabled main window (a progress form, a floating
+/// tool window after a reveal) cannot be holding the startup up. The live window-dump that
+/// confirms this against real ETABS windows is still pending (L1).</para>
+/// </summary>
+public static class EtabsPostReadyBlockerRule
+{
+    public static bool IsBlocker(StartupWindow window, nint mainWindow, bool mainWindowEnabled)
+    {
+        ArgumentNullException.ThrowIfNull(window);
+        return window.Handle != mainWindow
+            && !mainWindowEnabled
+            && (window.Owner == nint.Zero || window.Owner != mainWindow);
+    }
+}
+
+/// <summary>What one immediate dialog check concluded (card v2.4 C10).</summary>
+public enum EtabsDialogCheckKind
+{
+    /// <summary>No modal candidate was found.</summary>
+    Clean,
+
+    /// <summary>A modal candidate exists.</summary>
+    Modal,
+
+    /// <summary>The window station could not be read; nothing may be concluded.</summary>
+    Inconclusive
+}
+
+public sealed record EtabsDialogCheck(
+    EtabsDialogCheckKind Kind,
+    EtabsModalDialogObservation? Dialog,
+    string? Reason)
+{
+    public static readonly EtabsDialogCheck Clean = new(EtabsDialogCheckKind.Clean, null, null);
 }
 
 /// <summary>
@@ -156,6 +210,22 @@ public interface IEtabsModalDialogWatchdog
 
     /// <summary>The refusal for a command arriving while an earlier one is still blocked.</summary>
     Result BlockedFailure();
+
+    /// <summary>
+    /// The work a dialog abandoned, while it is blocked; null otherwise. The dispatcher records
+    /// it as an abandoned request (card C5).
+    /// </summary>
+    Task? BlockedWork => null;
+
+    /// <summary>
+    /// One immediate, non-dismissing look for a modal dialog of the owned pid (the watchdog
+    /// rule, used by <c>shutdown-if-unchanged</c>). Throws nothing: a look that could not be
+    /// taken is <see cref="EtabsDialogCheckKind.Inconclusive"/>, never Clean.
+    /// </summary>
+    EtabsDialogCheck CheckNow(Func<int?> ownedPid) => new(
+        EtabsDialogCheckKind.Inconclusive,
+        null,
+        "this watchdog cannot check on demand");
 }
 
 public sealed class EtabsModalDialogWatchdog(
@@ -222,6 +292,57 @@ public sealed class EtabsModalDialogWatchdog(
         : throw new PlatformNotSupportedException("The ETABS dialog watchdog requires Windows.");
 
     public bool IsBlocked => Volatile.Read(ref _blocked) is { Work.IsCompleted: false };
+
+    public Task? BlockedWork => Volatile.Read(ref _blocked) is { Work.IsCompleted: false } blocked
+        ? blocked.Work
+        : null;
+
+    public EtabsDialogCheck CheckNow(Func<int?> ownedPid)
+    {
+        ArgumentNullException.ThrowIfNull(ownedPid);
+#pragma warning disable CA1031 // a failed look is Inconclusive, never Clean
+        try
+        {
+            if (ownedPid() is not { } pid)
+            {
+                return EtabsDialogCheck.Clean;
+            }
+
+            var scan = Task.Run(() => windows.FindModalDialogs(pid));
+            if (!scan.Wait(_scanTimeout))
+            {
+                _ = scan.ContinueWith(
+                    static task => _ = task.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted,
+                    TaskScheduler.Default);
+                return new(
+                    EtabsDialogCheckKind.Inconclusive,
+                    null,
+                    $"the dialog scan did not finish within {_scanTimeout.TotalSeconds:0.###}s");
+            }
+
+            var dialogs = scan.GetAwaiter().GetResult();
+            return dialogs.Count == 0
+                ? EtabsDialogCheck.Clean
+                : new(
+                    EtabsDialogCheckKind.Modal,
+                    new EtabsModalDialogObservation(
+                        EtabsApiDiagnosticFormatter.Bounded(dialogs[0].Title),
+                        EtabsApiDiagnosticFormatter.Bounded(dialogs[0].Text),
+                        false),
+                    null);
+        }
+        catch (Exception exception)
+        {
+            var cause = exception is AggregateException { InnerException: { } inner } ? inner : exception;
+            return new(
+                EtabsDialogCheckKind.Inconclusive,
+                null,
+                $"the dialog scan failed: {EtabsApiDiagnosticFormatter.Bounded(cause.Message)}");
+        }
+#pragma warning restore CA1031
+    }
 
     public Result BlockedFailure() => Result.Fail(
         (Volatile.Read(ref _blocked)?.By
@@ -363,8 +484,14 @@ public sealed class EtabsModalDialogWatchdog(
             return (dialogs, null);
         }
 
+        // Review P2-A: only while the main window is DISABLED can anything be holding the
+        // startup up, and only an ownerless window or one not owned by main counts.
         var main = cell.MainWindow;
-        return (dialogs, startupWindows.VisibleTopLevelWindows(pid).FirstOrDefault(w => w.Handle != main));
+        var mainEnabled = startupWindows.IsWindowEnabled(main);
+        return (
+            dialogs,
+            startupWindows.VisibleTopLevelWindows(pid)
+                .FirstOrDefault(w => EtabsPostReadyBlockerRule.IsBlocker(w, main, mainEnabled)));
     }
 
     private ScanOutcome Scan(Func<int?> ownedPid)
@@ -524,7 +651,7 @@ public sealed class Win32EtabsDialogWindowSource : IEtabsDialogWindowSource, IEt
             _ = GetWindowThreadProcessId(handle, out var processId);
             if (unchecked((int)processId) == pid && IsWindowVisible(handle))
             {
-                found.Add(new(handle, TextOf(handle), ClassOf(handle)));
+                found.Add(new(handle, TextOf(handle), ClassOf(handle), GetWindow(handle, GwOwner)));
             }
 
             handle = GetWindow(handle, GwHwndNext);
@@ -533,6 +660,9 @@ public sealed class Win32EtabsDialogWindowSource : IEtabsDialogWindowSource, IEt
         return found;
     }
 
+    /// <inheritdoc />
+    public bool IsWindowEnabled(nint window) => window != nint.Zero && IsWindowEnabledNative(window);
+
     private static EtabsWindowFacts FactsOf(nint handle)
     {
         var owner = GetWindow(handle, GwOwner);
@@ -540,7 +670,7 @@ public sealed class Win32EtabsDialogWindowSource : IEtabsDialogWindowSource, IEt
             handle,
             ClassOf(handle),
             owner,
-            owner == nint.Zero || IsWindowEnabled(owner));
+            owner == nint.Zero || IsWindowEnabledNative(owner));
     }
 
     private static IEnumerable<nint> Children(nint parent)
@@ -592,9 +722,9 @@ public sealed class Win32EtabsDialogWindowSource : IEtabsDialogWindowSource, IEt
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsWindowVisible(nint hWnd);
 
-    [DllImport("user32.dll", SetLastError = false)]
+    [DllImport("user32.dll", EntryPoint = "IsWindowEnabled", SetLastError = false)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool IsWindowEnabled(nint hWnd);
+    private static extern bool IsWindowEnabledNative(nint hWnd);
 
     [DllImport("user32.dll", SetLastError = false)]
     [return: MarshalAs(UnmanagedType.Bool)]

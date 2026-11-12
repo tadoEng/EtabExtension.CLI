@@ -42,6 +42,7 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         "resolve-area-targets",
         "run-analysis",
         "save-model",
+        "shutdown-if-unchanged",
         "snapshot-export",
         "start-operation",
         "unlock-model"
@@ -1099,11 +1100,17 @@ esults"
                 () => reader.LinesRead == 2,
                 "the daemon must read the shutdown request while the analysis is still running");
 
+            // Card C7a: the shutdown is answered while the analysis is STILL blocked. The
+            // accepted request is never awaited first - that wait is what made a stuck
+            // analysis cost the caller its whole shutdown budget.
+            await WaitUntilAsync(
+                () => writer.Responses().Count >= 1,
+                "the shutdown must be answered without waiting for the accepted analysis");
+            Assert.Equal([9L], writer.Responses().Select(Id).ToArray());
+            Assert.True(_manager.HasActiveOperation);
+
             release.SetResult();
             await run.WaitAsync(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken);
-
-            // The accepted analysis is answered before the daemon announces it is gone.
-            Assert.Equal([1L, 9L], writer.Responses().Select(Id).ToArray());
         }
         finally
         {

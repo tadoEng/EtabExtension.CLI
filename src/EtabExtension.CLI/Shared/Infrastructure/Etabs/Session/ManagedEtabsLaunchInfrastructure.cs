@@ -71,6 +71,12 @@ public static class EtabsLaunchErrorCodes
 
     /// <summary>A launch failed with an untyped exception.</summary>
     public const string LaunchFailed = "ETABS_LAUNCH_FAILED";
+
+    /// <summary>
+    /// A command arrived after this daemon handed its ETABS to the user (card C1). Nothing
+    /// is started, exited or killed: the instance is no longer this daemon's to touch.
+    /// </summary>
+    public const string SessionDetached = "ETABS_SESSION_DETACHED";
 }
 
 public sealed class EtabsLaunchException : InvalidOperationException
@@ -507,6 +513,12 @@ public interface IManagedEtabsApplication
     void Kill();
     void ReleaseOwnedProcessHandle();
     void ReleaseApiReferences();
+
+    /// <summary>
+    /// Releases the owner reference of a handle whose process was HANDED to the user (card
+    /// C1, step 4): marked handed-off, never "exit confirmed".
+    /// </summary>
+    void ReleaseOwnedProcessHandleForHandoff() => ReleaseOwnedProcessHandle();
 }
 
 /// <summary>Version metadata captured at launch and used only to wrap the started object.</summary>
@@ -599,6 +611,12 @@ public sealed class ManagedEtabsApplication(
     public void Kill() => lease.Kill();
 
     public void ReleaseOwnedProcessHandle() => lease.ReleaseOwner();
+
+    public void ReleaseOwnedProcessHandleForHandoff()
+    {
+        lease.MarkHandedOff();
+        lease.ReleaseOwner();
+    }
 
     public void ReleaseApiReferences() => rawApi.ReleaseApiReferences();
 }

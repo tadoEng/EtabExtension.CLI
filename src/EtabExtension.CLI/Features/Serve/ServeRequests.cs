@@ -70,3 +70,25 @@ public sealed class ServeRunAnalysisRequest
     [JsonPropertyName("cases")] public List<string>? Cases { get; init; }
     [JsonPropertyName("units")] public string? Units { get; init; }
 }
+
+/// <summary>
+/// Payload of <c>save-model</c>: the file to save, and optionally the document the caller
+/// expects it to be (card v2.3 §2, <c>expectedDocument</c>).
+/// </summary>
+public sealed class ServeSaveModelRequest
+{
+    [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
+
+    [JsonPropertyName("expectedDocument")] public ExpectedDocument? ExpectedDocument { get; init; }
+}
+
+/// <summary>
+/// Payload of <c>cancel-operation</c>: an operation id, or the id of a REQUEST that is still
+/// Checking (a <c>shutdown-if-unchanged</c> the host is abandoning, card v2.4 §2).
+/// </summary>
+public sealed class ServeCancelRequest
+{
+    [JsonPropertyName("operationId")] public string? OperationId { get; init; }
+
+    [JsonPropertyName("requestId")] public long? RequestId { get; init; }
+}

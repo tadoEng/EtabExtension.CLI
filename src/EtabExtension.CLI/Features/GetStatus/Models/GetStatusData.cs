@@ -13,6 +13,46 @@ public enum EtabsInstanceOwnership
     Ambiguous
 }
 
+/// <summary>Who holds the managed instance, as reported by the daemon (card C5).</summary>
+public enum EtabsDisposition
+{
+    /// <summary>This daemon owns a started or starting instance.</summary>
+    Owned,
+
+    /// <summary>A detach is in flight, or its outcome is unresolved. Nothing is destroyed.</summary>
+    Detaching,
+
+    /// <summary>The daemon handed the instance to the user and no longer owns it.</summary>
+    Detached,
+
+    /// <summary>This daemon owns no instance.</summary>
+    None
+}
+
+public enum AbandonedRequestState
+{
+    /// <summary>The abandoned work has not returned yet.</summary>
+    Running,
+
+    /// <summary>The abandoned work has returned.</summary>
+    Finished
+}
+
+/// <summary>A request the daemon answered but whose ETABS work it could not stop (card C5).</summary>
+public sealed record AbandonedRequestInfo(
+    [property: JsonPropertyName("requestId")] long RequestId,
+    [property: JsonPropertyName("command")] string Command,
+    [property: JsonPropertyName("state")] AbandonedRequestState State);
+
+/// <summary>The live identity a recovery pass detached instead of terminating (card C5).</summary>
+public sealed record OrphanDispositionInfo(
+    [property: JsonPropertyName("detached")] DetachedIdentity? Detached);
+
+public sealed record DetachedIdentity(
+    [property: JsonPropertyName("pid")] int Pid,
+    [property: JsonPropertyName("startTimeUtc")] DateTimeOffset StartTimeUtc,
+    [property: JsonPropertyName("exePath")] string ExePath);
+
 public record GetStatusData
 {
     [JsonPropertyName("isRunning")]
@@ -33,6 +73,25 @@ public record GetStatusData
     /// </summary>
     [JsonPropertyName("siblingPids")]
     public IReadOnlyList<int> SiblingPids { get; init; } = [];
+
+    /// <summary>The launch generation of the instance this daemon holds, or null (card C5).</summary>
+    [JsonPropertyName("launchRecordId")]
+    public Guid? LaunchRecordId { get; init; }
+
+    /// <summary>
+    /// <c>owned | detaching | detached | none</c>. A reader that finds this missing must
+    /// treat the daemon's outstanding work as UNKNOWN, never as none.
+    /// </summary>
+    [JsonPropertyName("disposition")]
+    public EtabsDisposition? Disposition { get; init; }
+
+    /// <summary>Requests abandoned to an unanswered ETABS dialog and whether they returned.</summary>
+    [JsonPropertyName("abandoned")]
+    public IReadOnlyList<AbandonedRequestInfo>? Abandoned { get; init; }
+
+    /// <summary>What the startup recovery pass did to a live identity, or null.</summary>
+    [JsonPropertyName("orphanDisposition")]
+    public OrphanDispositionInfo? OrphanDisposition { get; init; }
 
     [JsonPropertyName("etabsVersion")]
     public string? EtabsVersion { get; init; }

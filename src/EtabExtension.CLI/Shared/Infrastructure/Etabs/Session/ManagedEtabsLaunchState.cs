@@ -13,7 +13,23 @@ public enum LaunchLifecycle
     Committing = 1,
     Ready = 2,
     Terminating = 3,
-    Ended = 4
+    Ended = 4,
+
+    /// <summary>
+    /// A detach won <c>Ready → Detaching</c> (card C1): the single arbiter against
+    /// <c>Ready → Terminating</c>. It can still roll back to Ready until its durable write has
+    /// started.
+    /// </summary>
+    Detaching = 5,
+
+    /// <summary>The durable detach write committed and the daemon no longer owns the instance.</summary>
+    Detached = 6,
+
+    /// <summary>
+    /// The detach's durable write started and its outcome is unknown (card v2.3 §3): no
+    /// rollback, and nothing destructive ever follows.
+    /// </summary>
+    DetachUncertain = 7
 }
 
 /// <summary>
@@ -68,6 +84,35 @@ public sealed class LaunchPublicationCell
     internal void DisarmStartupBlocker() => Volatile.Write(ref _blockerArmed, 0);
 }
 
+/// <summary>
+/// One detach attempt's claim on its own commit point (card v2.3 §3). The write is claimed
+/// <c>0 → started</c> by the worker, or a rollback is claimed <c>0 → rolled back</c> by the
+/// supervisor (or the worker's own pre-write failure): whichever wins decides, so a rollback
+/// can never be followed by a write, and a write that started can never be rolled back. A
+/// fresh attempt per detach keeps a worker that wakes late from touching a LATER attempt.
+/// </summary>
+public sealed class DetachAttempt
+{
+    private int _claim;
+
+    /// <summary>The worker's claim on the durable write. False once a rollback was chosen.</summary>
+    public bool TryStartWrite() => Interlocked.CompareExchange(ref _claim, 1, 0) == 0;
+
+    /// <summary>The claim on a rollback. False once the write has started.</summary>
+    public bool TryChooseRollback() => Interlocked.CompareExchange(ref _claim, 2, 0) == 0;
+
+    /// <summary>True once the durable write was claimed.</summary>
+    public bool WriteStarted => Volatile.Read(ref _claim) == 1;
+
+    private int _committed;
+
+    /// <summary>The durable write returned: the commit point has passed (card v2.3 §3).</summary>
+    public void MarkCommitted() => Volatile.Write(ref _committed, 1);
+
+    /// <summary>True once the durable write returned. After it, a timeout is Detached, never Uncertain.</summary>
+    public bool Committed => Volatile.Read(ref _committed) == 1;
+}
+
 /// <summary>The first visible non-main window that was blocking a startup.</summary>
 public sealed record StartupBlockerEvidence(string Title, string ClassName);
 
@@ -90,6 +135,7 @@ public sealed class HandleLease
     private int _refs = 1;
     private int _ownerReleased;
     private int _exitConfirmed;
+    private int _handedOff;
 
     public HandleLease(IProcessHandle process)
     {
@@ -145,6 +191,15 @@ public sealed class HandleLease
     /// and the retained-record rule depend on this flag, never on a convention.
     /// </summary>
     public bool ExitConfirmed => Volatile.Read(ref _exitConfirmed) == 1;
+
+    /// <summary>
+    /// True once the instance was handed to the user (card C1, step 4). A handed-off lease is
+    /// released, never "exit confirmed": the process is alive and no longer ours.
+    /// </summary>
+    public bool HandedOff => Volatile.Read(ref _handedOff) == 1;
+
+    /// <summary>Marks the lease handed off. Never sets <see cref="ExitConfirmed"/>.</summary>
+    public void MarkHandedOff() => Volatile.Write(ref _handedOff, 1);
 
     /// <summary>Whether the process is known to have exited; a gone handle answers the flag.</summary>
     public bool HasExited
@@ -295,6 +350,40 @@ public sealed class EtabsLaunchState
     public bool TryTransition(LaunchLifecycle from, LaunchLifecycle to) =>
         Interlocked.CompareExchange(ref _lifecycle, (int)to, (int)from) == (int)from;
 
+    // ── detach arbitration (card C1, v2.3 §3) ───────────────────────────────
+
+    private ManagedProcessIdentity? _detachedIdentity;
+
+    /// <summary>The detach arbiter: <c>Ready → Detaching</c>, the single rival of Terminating.</summary>
+    public bool TryBeginDetach() => TryTransition(LaunchLifecycle.Ready, LaunchLifecycle.Detaching);
+
+    /// <summary>True in Detaching, Detached or DetachUncertain: nothing destructive may follow.</summary>
+    public bool IsDetachDisposition =>
+        Lifecycle is LaunchLifecycle.Detaching or LaunchLifecycle.Detached or LaunchLifecycle.DetachUncertain;
+
+    /// <summary>The identity handed to the user, kept after the publication is cleared.</summary>
+    public ManagedProcessIdentity? DetachedIdentity
+    {
+        get => Volatile.Read(ref _detachedIdentity);
+        set => Volatile.Write(ref _detachedIdentity, value);
+    }
+
+    /// <summary>
+    /// Waits up to <paramref name="wait"/> for a Detaching launch to settle (card C1: a
+    /// concurrent shutdown or EOF waits at most 5 s for the outcome). Returns the lifecycle
+    /// it settled on, or Detaching when it did not.
+    /// </summary>
+    public LaunchLifecycle WaitForDetachOutcome(TimeSpan wait)
+    {
+        var deadline = Stopwatch.StartNew();
+        while (Lifecycle == LaunchLifecycle.Detaching && deadline.Elapsed < wait)
+        {
+            Thread.Sleep(5);
+        }
+
+        return Lifecycle;
+    }
+
     /// <summary>The atomic terminal fence for the Ready state (card W1).</summary>
     public bool TryBeginReadyTermination() =>
         TryTransition(LaunchLifecycle.Ready, LaunchLifecycle.Terminating);
@@ -363,6 +452,9 @@ public sealed class EtabsLaunchState
     /// <summary>Arms the post-Ready startup-blocker watch (card P2-3).</summary>
     public void ArmStartupBlocker() => _cell.ArmStartupBlocker();
 
+    /// <summary>Disarms the watch; the explicit reveal does it (review P2-A).</summary>
+    public void DisarmStartupBlocker() => _cell.DisarmStartupBlocker();
+
     /// <summary>True once the session started the launch this state describes.</summary>
     public bool Began => Volatile.Read(ref _began) == 1;
 
@@ -385,6 +477,62 @@ public sealed class EtabsLaunchState
 
     public void WriteFinalRecord(ManagedProcessIdentity identity) =>
         _records.Write(ToRecord(identity, ManagedEtabsRecordPhase.Ready));
+
+    /// <summary>
+    /// The detach commit point (card v2.3 §3): the durable write of <c>phase: detached</c>.
+    /// Carries the existing <c>userVisible</c> flag so the evidence stays truthful.
+    /// </summary>
+    public void WriteDetachedRecord(ManagedProcessIdentity identity, bool? userVisible) =>
+        _records.Write(ToRecord(identity, ManagedEtabsRecordPhase.Detached) with { UserVisible = userVisible });
+
+    /// <summary>
+    /// Persists <c>userVisible</c> durably (card C3), BEFORE the reveal is issued. Returns false
+    /// when the record on disk is not this attempt's, which means nothing may be revealed.
+    /// </summary>
+    public bool WriteUserVisibleRecord(ManagedProcessIdentity identity)
+    {
+        var existing = _records.Read();
+        if (existing is null || existing.ManagedLaunchRecordId != LaunchRecordId)
+        {
+            return false;
+        }
+
+        _records.Write(ToRecord(identity, existing.Phase ?? ManagedEtabsRecordPhase.Ready) with { UserVisible = true });
+        return true;
+    }
+
+    /// <summary>The <c>userVisible</c> flag of this attempt's record, or null when absent.</summary>
+    public bool? ReadUserVisible()
+    {
+        var existing = _records.Read();
+        return existing is not null && existing.ManagedLaunchRecordId == LaunchRecordId
+            ? existing.UserVisible
+            : null;
+    }
+
+    /// <summary>
+    /// Whether the record on disk is this attempt's generation. The detach checks it BEFORE
+    /// its write starts, so a record that is gone or replaced rolls the detach back.
+    /// </summary>
+    public bool OwnsTheRecord()
+    {
+        var existing = _records.Read();
+        return existing is not null && existing.ManagedLaunchRecordId == LaunchRecordId;
+    }
+
+    /// <summary>
+    /// Clears this attempt's record after a committed detach (generation-matched). The process
+    /// is alive, so unlike <see cref="ClearRecordAfterConfirmedExit(Func{bool})"/> no exit is
+    /// required: the detached record has done its job and the instance is the user's.
+    /// </summary>
+    public void ClearRecordAfterHandoff()
+    {
+        var record = _records.Read();
+        if (record is not null && record.ManagedLaunchRecordId == LaunchRecordId)
+        {
+            _records.Clear();
+        }
+    }
 
     /// <summary>
     /// Writes the provisional record only when the attempt's record is not already there, so
@@ -474,8 +622,10 @@ public sealed class EtabsLaunchState
         while (true)
         {
             var state = Lifecycle;
-            if (state == LaunchLifecycle.Ready)
+            if (state == LaunchLifecycle.Ready || IsDetachDisposition)
             {
+                // Ready belongs to the normal shutdown; a detach disposition is never
+                // terminated at all (card C1).
                 return null;
             }
 

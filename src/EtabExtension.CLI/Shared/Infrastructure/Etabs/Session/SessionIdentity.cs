@@ -66,7 +66,14 @@ public enum ManagedEtabsRecordPhase
     Provisional,
 
     /// <summary>Written at commit, once the session is API-ready.</summary>
-    Ready
+    Ready,
+
+    /// <summary>
+    /// Written as the durable commit point of a detach (card v2.3 §3): this daemon has
+    /// handed the instance to the user. A recovery pass clears such a record and never kills
+    /// the process it names.
+    /// </summary>
+    Detached
 }
 
 public sealed record ManagedEtabsSessionRecord(
@@ -80,6 +87,14 @@ public sealed record ManagedEtabsSessionRecord(
     /// <summary>Optional: absent in records written before the provisional phase existed.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public ManagedEtabsRecordPhase? Phase { get; init; }
+
+    /// <summary>
+    /// Set durably BEFORE the explicit reveal is issued (card C3): the instance is, or is
+    /// about to be, on the user's screen. A recovery pass detaches such an identity (clears
+    /// the record) and never terminates it. Optional: absent in older records.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? UserVisible { get; init; }
 }
 
 public interface ISessionRecordStore
@@ -102,6 +117,12 @@ public interface ISessionRecordStore
     void AcquireExclusive()
     {
     }
+
+    /// <summary>
+    /// <see cref="AcquireExclusive()"/> with an explicit bounded wait: a recovery daemon takes
+    /// the lock for at most this long (card v2.3 §4, 5 s) before it reads anything.
+    /// </summary>
+    void AcquireExclusive(TimeSpan wait) => AcquireExclusive();
 }
 
 public sealed class JsonSessionRecordStore : ISessionRecordStore, IDisposable
@@ -149,7 +170,7 @@ public sealed class JsonSessionRecordStore : ISessionRecordStore, IDisposable
 
     public void AcquireExclusive() => AcquireExclusive(_lockWait);
 
-    internal void AcquireExclusive(TimeSpan wait)
+    public void AcquireExclusive(TimeSpan wait)
     {
         lock (_lockGate)
         {
@@ -401,9 +422,26 @@ public interface IOrphanSessionCleaner
     ManagedEtabsShutdownResult Clean();
 }
 
+/// <summary>
+/// What a recovery pass did to a live identity it DETACHED instead of terminating (card C5,
+/// <c>orphanDisposition</c>). Shared by the cleaner that sets it and the status that reports it.
+/// </summary>
+public sealed class OrphanDispositionCell
+{
+    private ManagedProcessIdentity? _detached;
+
+    /// <summary>The live identity the last cleaner run cleared without terminating, or null.</summary>
+    public ManagedProcessIdentity? Detached
+    {
+        get => Volatile.Read(ref _detached);
+        internal set => Volatile.Write(ref _detached, value);
+    }
+}
+
 public sealed class OrphanSessionCleaner(
     ISessionRecordStore records,
-    IProcessInspector processes) : IOrphanSessionCleaner
+    IProcessInspector processes,
+    OrphanDispositionCell? disposition = null) : IOrphanSessionCleaner
 {
     public ManagedEtabsShutdownResult Clean()
     {
@@ -434,6 +472,14 @@ public sealed class OrphanSessionCleaner(
             record.Pid,
             record.ProcessStartTimeUtc,
             record.ExecutablePath);
+
+        // A handed-off or user-visible identity is NEVER terminated (card C3, v2.3 §3): the
+        // user may be working in it. The record is cleared and the identity reported.
+        if (record.Phase == ManagedEtabsRecordPhase.Detached || record.UserVisible == true)
+        {
+            return Detach(record, expected);
+        }
+
         var termination = processes.TerminateExact(expected, TimeSpan.FromSeconds(10));
         switch (termination.State)
         {
@@ -463,7 +509,27 @@ public sealed class OrphanSessionCleaner(
         }
     }
 
-    private static ManagedEtabsShutdownResult LockFailed(string errorCode, string error) => new(
+    private ManagedEtabsShutdownResult Detach(
+        ManagedEtabsSessionRecord record,
+        ManagedProcessIdentity expected)
+    {
+        // Liveness is read, never acted on: a live exact match is reported as detached; a
+        // dead or reused pid is a stale record. Either way the record goes and nothing dies.
+        var live = processes.Find(record.Pid);
+        var liveAndExact = live is not null && IdentityMatches(record, live);
+        records.Clear();
+        if (liveAndExact && disposition is not null)
+        {
+            disposition.Detached = expected;
+        }
+
+        var result = Succeeded(record.Pid, forced: false);
+        return liveAndExact
+            ? result with { Data = result.Data with { ProcessExitConfirmed = false, Disposition = EtabsDisposition.Detached } }
+            : result;
+    }
+
+    internal static ManagedEtabsShutdownResult LockFailed(string errorCode, string error) => new(
         false,
         errorCode,
         error,

@@ -439,7 +439,8 @@ public sealed class ManagedEtabsLauncherTests
         Assert.Contains("Sign in to ETABS", error.Message, StringComparison.Ordinal);
         Assert.Contains("AuthenticationView", error.Message, StringComparison.Ordinal);
         Assert.Contains(
-            "detail={\"title\":\"Sign in to ETABS\",\"class\":\"AuthenticationView\",\"dismissed\":false}",
+            "detail={\"title\":\"Sign in to ETABS\",\"class\":\"AuthenticationView\",\"dismissed\":false," +
+            "\"phase\":\"launch\",\"ownedExitConfirmed\":true,\"recordRetained\":false}",
             error.Message,
             StringComparison.Ordinal);
 

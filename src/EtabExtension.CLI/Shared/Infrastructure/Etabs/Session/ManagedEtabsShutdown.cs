@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
@@ -7,6 +9,18 @@ public static class ManagedEtabsShutdownErrorCodes
     public const string ApplicationExitFailed = "ETABS_APPLICATION_EXIT_FAILED";
     public const string IdentityMismatch = "ETABS_SHUTDOWN_IDENTITY_MISMATCH";
     public const string ProcessExitUnconfirmed = "ETABS_PROCESS_EXIT_UNCONFIRMED";
+
+    /// <summary>
+    /// A detach failed BEFORE its durable write started and was rolled back (card v2.3 §3).
+    /// Effect none: the instance is still owned, nothing was exited or killed.
+    /// </summary>
+    public const string DetachFailed = "ETABS_DETACH_FAILED";
+
+    /// <summary>
+    /// A detach's durable write started and its outcome is unknown (card v2.3 §3). There is
+    /// no rollback and nothing destructive follows; the record is the evidence.
+    /// </summary>
+    public const string DetachUncertain = "ETABS_DETACH_UNCERTAIN";
 }
 
 public enum ManagedEtabsShutdownState
@@ -23,7 +37,16 @@ public sealed record ManagedEtabsShutdownData(
     bool Forced,
     bool RecordRetained,
     int? ApplicationExitReturnCode,
-    int? OwnedPid);
+    int? OwnedPid)
+{
+    /// <summary>
+    /// Who holds the instance after this answer (card C5): <c>detached</c> when the daemon
+    /// handed it to the user, <c>detaching</c> when a detach's outcome is unresolved. Absent
+    /// for an ordinary owned/exited answer.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public EtabsDisposition? Disposition { get; init; }
+}
 
 public sealed record ManagedEtabsShutdownResult(
     bool Success,
