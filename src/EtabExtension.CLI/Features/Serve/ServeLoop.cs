@@ -41,7 +41,13 @@ public sealed class ServeLoop
         // synchronous command, but its cancellation entry and its Checking deadline exist from
         // the moment it is read, so a request stuck behind a blocked command can still be
         // cancelled or expire, and can never later exit on an old decision.
-        "shutdown-if-unchanged"
+        "shutdown-if-unchanged",
+
+        // C11 (card v2.5a A4): a control command like C10 - registered and timed at intake, its
+        // body queued on the STA, so a request stuck behind a blocked command can still be
+        // cancelled, detached over, or expire, and can never later save-then-exit on an old
+        // decision.
+        "save-and-exit"
     };
 
     private readonly IServeDispatcher _dispatcher;

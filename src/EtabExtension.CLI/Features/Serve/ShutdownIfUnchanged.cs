@@ -145,7 +145,15 @@ public sealed class ShutdownIfUnchangedRegistry
 }
 
 public sealed record ExpectedDocument(
-    [property: JsonPropertyName("fileId")] string? FileId);
+    [property: JsonPropertyName("fileId")] string? FileId)
+{
+    /// <summary>
+    /// The document's full path (card v2.5a A1: <c>expectedDocument</c> is <c>{path, fileId}</c>).
+    /// Optional on the older commands, which compare the file id alone.
+    /// </summary>
+    [JsonPropertyName("path")]
+    public string? Path { get; init; }
+}
 
 public sealed class ShutdownIfUnchangedRequest
 {

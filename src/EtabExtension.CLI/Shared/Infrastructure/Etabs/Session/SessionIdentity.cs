@@ -76,6 +76,15 @@ public enum ManagedEtabsRecordPhase
     Detached
 }
 
+/// <summary>
+/// The model the daemon opened in its instance (card v2.5a A1): the full path and the NTFS
+/// file id of the file at open time. <c>save-and-exit</c> saves to this path only, and only
+/// while the file on disk still has this id.
+/// </summary>
+public sealed record EtabsDocumentRecord(
+    [property: JsonPropertyName("path")] string Path,
+    [property: JsonPropertyName("fileId")] string? FileId);
+
 public sealed record ManagedEtabsSessionRecord(
     int SchemaVersion,
     int Pid,
@@ -95,6 +104,13 @@ public sealed record ManagedEtabsSessionRecord(
     /// </summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? UserVisible { get; init; }
+
+    /// <summary>
+    /// The model this daemon opened (card v2.5a A1), written durably when the open succeeds.
+    /// Optional: absent in older records and before any model was opened.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public EtabsDocumentRecord? Document { get; init; }
 }
 
 public interface ISessionRecordStore

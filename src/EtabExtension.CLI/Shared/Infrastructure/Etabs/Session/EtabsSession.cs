@@ -77,6 +77,27 @@ public interface IEtabsSession : IDisposable
     {
     }
 
+    /// <summary>
+    /// Persists the model the daemon just opened, durably, in the instance record (card v2.5a
+    /// A1). A failure means the identity is NOT recorded, and <c>save-and-exit</c> will refuse.
+    /// </summary>
+    Result RecordOpenedDocument(EtabsDocumentRecord document) => Result.Ok();
+
+    /// <summary>
+    /// The model identity in the instance record as persisted, or null when none was written
+    /// (or the record is not this launch's). Reads the durable record, not memory.
+    /// </summary>
+    EtabsDocumentRecord? ReadRecordedDocument() => null;
+
+    /// <summary>
+    /// PASSIVE update of the recorded document (C11 fix round 2). Unlike
+    /// <see cref="RecordOpenedDocument"/> it NEVER starts, verifies-with-teardown, exits, kills or
+    /// latches anything: it only rewrites this launch's own record, and fails (typed) when there
+    /// is no owned launch or the record is not this launch's. For callers that already won their
+    /// right to act and must not be able to end ETABS through a bookkeeping write.
+    /// </summary>
+    Result RefreshRecordedDocument(EtabsDocumentRecord document) => Result.Ok();
+
     /// <summary>True once the user was shown ETABS and this daemon still owns it (card C2).</summary>
     bool IsUserVisible => false;
 
@@ -1090,6 +1111,82 @@ public sealed class EtabsSession : IEtabsSession
                 $"csiReturnCode={csi.ReturnCode}, state={owned.VisibilityState})");
 
             return Result.Ok();
+        }
+    }
+
+    /// <inheritdoc />
+    public Result RecordOpenedDocument(EtabsDocumentRecord document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        lock (_gate)
+        {
+            var owned = GetOrStartOwned();
+            return WriteDocument(Volatile.Read(ref _launch), owned.Identity, document);
+        }
+    }
+
+    /// <inheritdoc />
+    public Result RefreshRecordedDocument(EtabsDocumentRecord document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+
+        // No session gate, no identity proof, no start: only what this session already holds.
+        var launch = Volatile.Read(ref _launch);
+        var owned = Volatile.Read(ref _owned);
+        if (launch is null || owned is null)
+        {
+            return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] There is no owned launch to refresh the " +
+                "recorded document for."));
+        }
+
+        return WriteDocument(launch, owned.Identity, document);
+    }
+
+    private static Result WriteDocument(
+        EtabsLaunchState? launch,
+        ManagedProcessIdentity identity,
+        EtabsDocumentRecord document)
+    {
+        if (launch is null)
+        {
+            return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] There is no launch to record the " +
+                "opened document for."));
+        }
+
+        try
+        {
+            return launch.WriteDocumentRecord(identity, document)
+                ? Result.Ok()
+                : Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                    $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] The recovery record is not this " +
+                    "launch's, so the opened document was not recorded."));
+        }
+#pragma warning disable CA1031 // any failure to persist means the identity is not recorded
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] The opened document could not be " +
+                "recorded. " + EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "ManagedEtabsSessionRecord.Write(document)",
+                    exception)));
+        }
+    }
+
+    /// <inheritdoc />
+    public EtabsDocumentRecord? ReadRecordedDocument()
+    {
+        try
+        {
+            return Volatile.Read(ref _launch)?.ReadDocument();
+        }
+#pragma warning disable CA1031 // an unreadable record is "no recorded document", which refuses
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            return null;
         }
     }
 

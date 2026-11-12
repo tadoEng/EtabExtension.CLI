@@ -170,7 +170,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             // Windows certifies AND the startup-consent interval closes, in one
             // indivisible step (CLI #24).
             RequireWindowsSuppressed(windowGuard, "after cHelper.GetObjectProcess");
-            RequireNoStartupBlocker(identity.Pid, started.Process.RefreshMainWindowHandle());
+            RequireNoStartupBlocker(state, identity.Pid);
             RequireStillLaunching(state);
 
             RequireSapModel(rawApi);
@@ -455,7 +455,6 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     private void CaptureBlockerWithoutMainWindow(EtabsLaunchState state)
     {
         if (state.BlockerEvidence is not null
-            || state.MainWindow != nint.Zero
             || state.Publication.Identity is not { } identity)
         {
             return;
@@ -463,10 +462,16 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
 
         try
         {
-            var windows = _startupWindows.VisibleTopLevelWindows(identity.Pid);
-            if (windows.Count > 0)
+            // The same narrowed rule (card v2.5a A3): only a licence/auth window, or a disabled
+            // known main window with another visible window, counts as what held the startup.
+            var assessment = EtabsStartupBlockerRule.Assess(
+                _startupWindows.VisibleTopLevelWindows(identity.Pid),
+                state.MainWindow,
+                main => _startupWindows.IsLiveWindowOf(main, identity.Pid),
+                _startupWindows.IsWindowEnabled);
+            if (assessment.Blocker is { } blocker)
             {
-                state.RecordBlockerEvidence(new StartupBlockerEvidence(windows[0].Title, windows[0].ClassName));
+                state.RecordBlockerEvidence(new StartupBlockerEvidence(blocker.Title, blocker.ClassName));
             }
         }
 #pragma warning disable CA1031 // evidence only: a failed scan changes nothing
@@ -650,13 +655,16 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                     $"The started ETABS process (pid={started.Identity.Pid}) exited before it could be attached.");
             }
 
+            // Card v2.5a A3: a licence/sign-in window blocks AT ONCE, the moment it is seen - even
+            // before any main window exists - and the main window is captured by the rule, never
+            // from Process.MainWindowHandle (the licence dialog became that on a live run).
+            RequireNoStartupBlocker(state, started.Identity.Pid);
+
             // Z1: never attach to a half-initialised instance. Until the main window
             // exists, GetObjectProcess hands back an object whose OpenFile never returns.
             var main = started.Process.RefreshMainWindowHandle();
             if (main != nint.Zero)
             {
-                state.SetMainWindow(main);
-                RequireNoStartupBlocker(started.Identity.Pid, main);
                 try
                 {
                     var api = _apiFactory.TryAttach(started.Identity.Pid);
@@ -697,17 +705,23 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     }
 
     /// <summary>
-    /// Between <c>Process.Start</c> and Ready, any VISIBLE top-level window of OUR pid other
-    /// than the main window blocks the startup, whatever its class (card Z2). The failure is
-    /// typed, nothing is dismissed (a sign-in needs the user), and a window of another pid
-    /// is never considered.
+    /// The startup-blocker rule of card v2.5a A3, applied between <c>Process.Start</c> and Ready:
+    /// a visible licence/auth window, or a KNOWN main window that is disabled while another
+    /// visible window of the pid exists (<see cref="EtabsStartupBlockerRule"/>). The untitled
+    /// splash before the main window exists is not a blocker. The failure is typed, nothing is
+    /// dismissed (a sign-in needs the user), and a window of another pid is never considered.
+    /// The captured main window is kept in <paramref name="state"/>.
     /// </summary>
-    private void RequireNoStartupBlocker(int pid, nint mainWindow)
+    private void RequireNoStartupBlocker(EtabsLaunchState state, int pid)
     {
-        IReadOnlyList<StartupWindow> windows;
+        StartupBlockerAssessment assessment;
         try
         {
-            windows = _startupWindows.VisibleTopLevelWindows(pid);
+            assessment = EtabsStartupBlockerRule.Assess(
+                _startupWindows.VisibleTopLevelWindows(pid),
+                state.MainWindow,
+                main => _startupWindows.IsLiveWindowOf(main, pid),
+                _startupWindows.IsWindowEnabled);
         }
 #pragma warning disable CA1031 // no evidence either way: the deadline still bounds the start
         catch (Exception ex)
@@ -717,13 +731,11 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             return;
         }
 
-        var blocker = windows.FirstOrDefault(window => window.Handle != mainWindow);
-        if (blocker is null)
+        state.SetMainWindow(assessment.Main);
+        if (assessment.Blocker is { } blocker)
         {
-            return;
+            throw StartBlocked(blocker.Title, blocker.ClassName);
         }
-
-        throw StartBlocked(blocker.Title, blocker.ClassName);
     }
 
     // ── unchanged lifecycle steps ───────────────────────────────────────────

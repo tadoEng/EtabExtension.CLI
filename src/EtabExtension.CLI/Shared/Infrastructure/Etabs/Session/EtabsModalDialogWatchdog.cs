@@ -123,23 +123,89 @@ public static class EtabsModalDialogRule
     }
 }
 
+/// <summary>What one assessment of an ETABS process's visible windows concluded.</summary>
+/// <param name="Main">The validated main window, or zero while it is still unknown.</param>
+/// <param name="Blocker">The window the startup cannot continue past, or null.</param>
+public sealed record StartupBlockerAssessment(nint Main, StartupWindow? Blocker);
+
 /// <summary>
-/// The post-Ready startup-blocker rule (review P2-A), pure over window facts.
+/// The startup-blocker rule (card v2.5a A3), pure over window facts. It is SEPARATE from the
+/// ordinary modal-dialog rule (<see cref="EtabsModalDialogRule"/>): this one decides whether a
+/// licence/sign-in window or a disabled main window is holding a launch or a first command up.
 ///
-/// <para>A visible top-level window of the pid is a blocker only when it is NOT the main
-/// window, it is ownerless or owned by something other than the main window, AND the main
-/// window is disabled. An owned popup of an enabled main window (a progress form, a floating
-/// tool window after a reveal) cannot be holding the startup up. The live window-dump that
-/// confirms this against real ETABS windows is still pending (L1).</para>
+/// <para><b>Main window.</b> The first VISIBLE, ownerless top-level window of the pid whose
+/// title starts with "ETABS" and which is not licence/auth-titled. It is NOT
+/// <c>Process.MainWindowHandle</c> (the licence dialog became that on a live run), it stays
+/// UNKNOWN - never "blocked" - until captured (this covers the untitled splash), and it is
+/// validated on every use (the window still exists and still belongs to the pid).</para>
+///
+/// <para><b>Blocker</b> = (i) a visible window of the pid titled "License Message" or
+/// "AuthenticationView" (a licence/auth window, matched by trimmed title, or by the
+/// <c>AuthenticationView</c> window class), or (ii) the main window is KNOWN and confirmed
+/// DISABLED and a visible non-main window of the pid exists. A visible owned window while the
+/// main window is enabled is modeless or progress UI and is NOT a blocker.</para>
 /// </summary>
-public static class EtabsPostReadyBlockerRule
+public static class EtabsStartupBlockerRule
 {
-    public static bool IsBlocker(StartupWindow window, nint mainWindow, bool mainWindowEnabled)
+    public const string LicenseMessageTitle = "License Message";
+    public const string AuthenticationViewTitle = "AuthenticationView";
+
+    /// <summary>The licence or sign-in window: its title, or the WinForms class of the sign-in view.</summary>
+    public static bool IsLicenseWindow(StartupWindow window)
     {
         ArgumentNullException.ThrowIfNull(window);
-        return window.Handle != mainWindow
-            && !mainWindowEnabled
-            && (window.Owner == nint.Zero || window.Owner != mainWindow);
+        var title = window.Title.Trim();
+        return string.Equals(title, LicenseMessageTitle, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(title, AuthenticationViewTitle, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(window.ClassName, AuthenticationViewTitle, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Ownerless, "ETABS"-titled and not a licence window. Visibility is the caller's list.</summary>
+    public static bool IsMainCandidate(StartupWindow window)
+    {
+        ArgumentNullException.ThrowIfNull(window);
+        return window.Owner == nint.Zero
+            && !IsLicenseWindow(window)
+            && window.Title.Trim().StartsWith("ETABS", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Assesses <paramref name="visible"/> (the visible top-level windows of the pid).
+    /// <paramref name="knownMain"/> is the main window captured earlier (zero when unknown);
+    /// <paramref name="mainIsLive"/> validates it on this use, and a stale one is forgotten and
+    /// captured afresh. <paramref name="isEnabled"/> reads the main window's enabled state.
+    /// </summary>
+    public static StartupBlockerAssessment Assess(
+        IReadOnlyList<StartupWindow> visible,
+        nint knownMain,
+        Func<nint, bool> mainIsLive,
+        Func<nint, bool> isEnabled)
+    {
+        ArgumentNullException.ThrowIfNull(visible);
+        ArgumentNullException.ThrowIfNull(mainIsLive);
+        ArgumentNullException.ThrowIfNull(isEnabled);
+
+        var main = knownMain != nint.Zero && mainIsLive(knownMain) ? knownMain : nint.Zero;
+
+        // (i) A licence/auth window blocks at once, whatever the main window's state.
+        var license = visible.FirstOrDefault(IsLicenseWindow);
+        if (license is not null)
+        {
+            return new(main, license);
+        }
+
+        if (main == nint.Zero)
+        {
+            main = visible.FirstOrDefault(IsMainCandidate)?.Handle ?? nint.Zero;
+        }
+
+        // (ii) Only a KNOWN main window that is confirmed disabled can be held up.
+        if (main != nint.Zero && !isEnabled(main))
+        {
+            return new(main, visible.FirstOrDefault(window => window.Handle != main));
+        }
+
+        return new(main, null);
     }
 }
 
@@ -478,20 +544,21 @@ public sealed class EtabsModalDialogWatchdog(
         var dialogs = windows.FindModalDialogs(pid);
         if (dialogs.Count > 0
             || cell is not { StartupBlockerArmed: true }
-            || startupWindows is null
-            || cell.MainWindow == nint.Zero)
+            || startupWindows is null)
         {
             return (dialogs, null);
         }
 
-        // Review P2-A: only while the main window is DISABLED can anything be holding the
-        // startup up, and only an ownerless window or one not owned by main counts.
-        var main = cell.MainWindow;
-        var mainEnabled = startupWindows.IsWindowEnabled(main);
-        return (
-            dialogs,
-            startupWindows.VisibleTopLevelWindows(pid)
-                .FirstOrDefault(w => EtabsPostReadyBlockerRule.IsBlocker(w, main, mainEnabled)));
+        // Card v2.5a A3, separate from the modal rule above: the main window is captured by the
+        // rule (never Process.MainWindowHandle) and validated on every use; until it is known it
+        // is neither enabled nor disabled. A licence window blocks whether or not it is known.
+        var assessment = EtabsStartupBlockerRule.Assess(
+            startupWindows.VisibleTopLevelWindows(pid),
+            cell.MainWindow,
+            main => startupWindows.IsLiveWindowOf(main, pid),
+            startupWindows.IsWindowEnabled);
+        cell.SetMainWindow(assessment.Main);
+        return (dialogs, assessment.Blocker);
     }
 
     private ScanOutcome Scan(Func<int?> ownedPid)
@@ -662,6 +729,18 @@ public sealed class Win32EtabsDialogWindowSource : IEtabsDialogWindowSource, IEt
 
     /// <inheritdoc />
     public bool IsWindowEnabled(nint window) => window != nint.Zero && IsWindowEnabledNative(window);
+
+    /// <inheritdoc />
+    public bool IsLiveWindowOf(nint window, int pid)
+    {
+        if (window == nint.Zero || !IsWindow(window))
+        {
+            return false;
+        }
+
+        _ = GetWindowThreadProcessId(window, out var processId);
+        return unchecked((int)processId) == pid;
+    }
 
     private static EtabsWindowFacts FactsOf(nint handle)
     {

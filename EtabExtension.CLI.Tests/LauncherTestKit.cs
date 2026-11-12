@@ -36,6 +36,21 @@ internal static class Kit
         task.GetAwaiter().GetResult();
     }
 
+    /// <summary>Polls a condition until it holds, failing at the test deadline (never a fixed sleep).</summary>
+    public static void WaitUntil(Func<bool> condition, string what)
+    {
+        var deadline = DateTime.UtcNow + TestDeadline;
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException($"Test deadline expired waiting for: {what}");
+            }
+
+            Thread.Yield();
+        }
+    }
+
     /// <summary>Runs on its own thread, so a starved thread pool cannot inflate a timing assertion.</summary>
     public static Task<T> OnDedicatedThread<T>(Func<T> work)
     {

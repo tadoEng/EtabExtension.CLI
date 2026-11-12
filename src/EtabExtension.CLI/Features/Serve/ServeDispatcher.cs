@@ -58,6 +58,9 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly OrphanDispositionCell _orphan;
     private readonly ShutdownIfUnchangedService? _shutdownIfUnchanged;
     private readonly ShutdownIfUnchangedRegistry _c10;
+    private readonly SaveAndExitService? _saveAndExit;
+    private readonly SaveAndExitRegistry _c11;
+    private readonly ISavedFileStampReader _stamps;
     private readonly Dictionary<
         string,
         Func<JsonElement?, CancellationToken, Task<object>>> _handlers;
@@ -93,8 +96,14 @@ public sealed class ServeDispatcher : IServeDispatcher
         AbandonedRequests? abandoned = null,
         OrphanDispositionCell? orphan = null,
         ShutdownIfUnchangedService? shutdownIfUnchanged = null,
-        ShutdownIfUnchangedRegistry? c10 = null)
+        ShutdownIfUnchangedRegistry? c10 = null,
+        SaveAndExitService? saveAndExit = null,
+        SaveAndExitRegistry? c11 = null,
+        ISavedFileStampReader? stamps = null)
     {
+        _saveAndExit = saveAndExit;
+        _c11 = c11 ?? new SaveAndExitRegistry();
+        _stamps = stamps ?? new DiskSavedFileStampReader();
         _abandoned = abandoned ?? new AbandonedRequests();
         _orphan = orphan ?? new OrphanDispositionCell();
         _shutdownIfUnchanged = shutdownIfUnchanged;
@@ -141,6 +150,7 @@ public sealed class ServeDispatcher : IServeDispatcher
             ["read-model-metadata"] = DispatchReadModelMetadataAsync,
             ["resolve-area-targets"] = DispatchResolveAreaTargetsAsync,
             ["run-analysis"] = DispatchRunAnalysisAsync,
+            ["save-and-exit"] = DispatchSaveAndExitAsync,
             ["save-model"] = DispatchSaveModelAsync,
             ["shutdown-if-unchanged"] = DispatchShutdownIfUnchangedAsync,
             ["snapshot-export"] = DispatchSnapshotExportAsync,
@@ -253,9 +263,21 @@ public sealed class ServeDispatcher : IServeDispatcher
         var req = Deserialize<ServeCancelRequest>(request);
         if (req.RequestId is { } requestId)
         {
-            // The host abandons a shutdown-if-unchanged that is still Checking (card v2.4 §2).
-            // A command already Exiting cannot be cancelled: its exit is won.
-            return Task.FromResult<object>(_c10.Cancel(requestId) switch
+            // The host abandons a shutdown-if-unchanged that is still Checking (card v2.4 §2) or
+            // a save-and-exit that is still Saving (card v2.5a A4). A command already Exiting
+            // cannot be cancelled: its exit is won.
+            var c10 = _c10.Cancel(requestId);
+            if (c10 is null && _c11.Cancel(requestId) is { } c11)
+            {
+                return Task.FromResult<object>(c11 == SaveAndExitState.Abandoned
+                    ? Result.Ok(new CancelOperationData(
+                        $"request:{requestId}",
+                        OperationCancellationState.Honored))
+                    : Result.Fail<CancelOperationData>(
+                        $"Request '{requestId}' can no longer be cancelled (state {c11})."));
+            }
+
+            return Task.FromResult<object>(c10 switch
             {
                 ShutdownIfUnchangedState.Abandoned => Result.Ok(new CancelOperationData(
                     $"request:{requestId}",
@@ -299,12 +321,47 @@ public sealed class ServeDispatcher : IServeDispatcher
                 return Result.Fail<OpenModelData>(refused);
             }
 
-            var opened = await _open.OpenModelOnAppAsync(app, req.FilePath, req.SaveOnClose);
+            var opened = RecordOpenedDocument(
+                await _open.OpenModelOnAppAsync(app, req.FilePath, req.SaveOnClose));
 
             // The analysis daemon's open (core-loop §2.4): the model is opened and ETABS
             // stays hidden. Only the explicit user-visible open ever reveals.
             return reveal ? RevealAfterConfirmedOpen(opened) : (object)opened;
         });
+    }
+
+    /// <summary>
+    /// Writes the opened model's identity into the instance record, durably (card v2.5a A1),
+    /// BEFORE the open is answered or anything is revealed. A model that is open but whose
+    /// identity could not be recorded fails the open typed: without the record
+    /// <c>save-and-exit</c> would refuse, and the host must not be told the open went well.
+    /// </summary>
+    private Result<OpenModelData> RecordOpenedDocument(Result<OpenModelData> opened)
+    {
+        if (!opened.Success || opened.Data is null)
+        {
+            return opened;
+        }
+
+        EtabsDocumentRecord document;
+        try
+        {
+            var full = Path.GetFullPath(opened.Data.FilePath);
+            document = new EtabsDocumentRecord(full, _stamps.Read(full)?.FileId);
+        }
+#pragma warning disable CA1031 // an unreadable file identity is recorded as absent, which refuses a save
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            document = new EtabsDocumentRecord(opened.Data.FilePath, null);
+        }
+
+        var recorded = _session.RecordOpenedDocument(document);
+        return recorded.Success
+            ? Result.Ok(opened.Data with { Document = document })
+            : Result.Fail<OpenModelData>(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                recorded.Error ?? "The opened document could not be recorded.",
+                $"modelOpened={document.Path}"));
     }
 
     /// <summary>
@@ -467,8 +524,46 @@ public sealed class ServeDispatcher : IServeDispatcher
         // An ordinary request: its answer is written when the save returns, and NOTHING is
         // chained to that answer. A reply that lands after the host stopped waiting is dropped
         // by the host and can never cause an exit (card v2.3 §2, I13').
-        return await ExecuteWatchedComAsync(async () => await _save.SaveModelOnAppAsync(
-            _session.GetOrStart(), req.FilePath, req.ExpectedDocument?.FileId));
+        return await ExecuteWatchedComAsync(async () => RecordSavedDocument(await _save.SaveModelOnAppAsync(
+            _session.GetOrStart(), req.FilePath, req.ExpectedDocument?.FileId)));
+    }
+
+    /// <summary>
+    /// ETABS replaces the EDB on every save, so its file id changes (live, 13 Nov): after a
+    /// successful daemon save of the RECORDED document, the record's file id is refreshed. A
+    /// failed refresh never fails the save: the next save-and-exit accepts a changed id anyway.
+    /// </summary>
+    private Result<SaveModelData> RecordSavedDocument(Result<SaveModelData> saved)
+    {
+        if (!saved.Success || saved.Data?.SavedStamp?.FileId is not { } fileId)
+        {
+            return saved;
+        }
+
+        try
+        {
+            if (_session.ReadRecordedDocument() is { } recorded
+                && string.Equals(
+                    Path.GetFullPath(recorded.Path),
+                    Path.GetFullPath(saved.Data.FilePath),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                // PASSIVE: after the save a failed verification must never be able to end ETABS.
+                var refreshed = _session.RefreshRecordedDocument(recorded with { FileId = fileId });
+                if (!refreshed.Success)
+                {
+                    Console.Error.WriteLine($"⚠ The saved document's file id could not be re-recorded: {refreshed.Error}");
+                }
+            }
+        }
+#pragma warning disable CA1031 // refreshing the record never fails a save that already happened
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            Console.Error.WriteLine($"⚠ The saved document's file id could not be re-recorded: {exception.Message}");
+        }
+
+        return saved;
     }
 
     /// <summary>
@@ -506,6 +601,43 @@ public sealed class ServeDispatcher : IServeDispatcher
             req,
             requestId,
             check => RunSynchronousAsync(() => _envelope.RunUncertifiedAsync(work, check)));
+    }
+
+    /// <summary>
+    /// <c>save-and-exit</c> (C11, cards v2.5/v2.5a): one STA command that refuses on a modal,
+    /// verifies the document against the instance record, saves to the recorded path, and exits.
+    /// </summary>
+    private async Task<object> DispatchSaveAndExitAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<SaveAndExitRequest>(request);
+        if (_saveAndExit is null)
+        {
+            return Result.Fail("save-and-exit is not available in this daemon.");
+        }
+
+        // Refused without queueing, exactly like every other synchronous command: an operation
+        // or an abandoned dialog already holds the STA, and nothing here may save or exit.
+        if (_operations.HasActiveOperation)
+        {
+            return Result.Fail(
+                "A daemon operation is active; save-and-exit is unavailable until it completes. " +
+                "Nothing was saved and ETABS was not exited.");
+        }
+
+        if (_watchdog.IsBlocked)
+        {
+            return _watchdog.BlockedFailure();
+        }
+
+        var requestId = ServeRequestContext.Current?.Id ?? 0;
+        var work = _pendingWork.Value;
+        return await _saveAndExit.RunAsync(
+            req,
+            requestId,
+            body => RunSynchronousAsync(() => _envelope.RunUncertifiedAsync(work, body)));
     }
 
     private async Task<object> DispatchUnlockModelAsync(

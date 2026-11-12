@@ -71,6 +71,15 @@ internal sealed class ProbeSession : IEtabsSession
 
     public bool UserVisible { get; set; }
 
+    /// <summary>The instance record's <c>document</c> (card v2.5a A1), as the session would read it back.</summary>
+    public EtabsDocumentRecord? RecordedDocument { get; set; }
+
+    /// <summary>What <c>RecordOpenedDocument</c> was asked to persist, in order.</summary>
+    public List<EtabsDocumentRecord> RecordedWrites { get; } = [];
+
+    /// <summary>When set, <c>RecordOpenedDocument</c> fails with this message (a record write that threw).</summary>
+    public string? RecordFailure { get; set; }
+
     public int? Pid { get; set; } = Kit.Identity.Pid;
 
     public EtabsDisposition DispositionValue { get; set; } = EtabsDisposition.None;
@@ -88,6 +97,22 @@ internal sealed class ProbeSession : IEtabsSession
     public Guid? LaunchRecordId => LaunchId;
 
     public ETABSApplication GetOrStart() => null!;
+
+    public Result RecordOpenedDocument(EtabsDocumentRecord document)
+    {
+        if (RecordFailure is not null)
+        {
+            return Result.Fail(RecordFailure);
+        }
+
+        RecordedWrites.Add(document);
+        RecordedDocument = document;
+        return Result.Ok();
+    }
+
+    public Result RefreshRecordedDocument(EtabsDocumentRecord document) => RecordOpenedDocument(document);
+
+    public EtabsDocumentRecord? ReadRecordedDocument() => RecordedDocument;
 
     public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();
 
@@ -333,14 +358,18 @@ internal static class DispatcherRig
         IOperationManager? operations = null,
         AbandonedRequests? abandoned = null,
         OrphanDispositionCell? orphan = null,
-        IProcessInspector? processes = null)
+        IProcessInspector? processes = null,
+        SaveAndExitService? saveAndExit = null,
+        SaveAndExitRegistry? c11 = null,
+        EtabExtension.CLI.Features.SaveModel.ISavedFileStampReader? stamps = null,
+        EtabExtension.CLI.Features.OpenModel.IOpenModelService? open = null)
     {
         var declared = new ManagedEtabsStartIntentScope();
         _ = declared.Publish(ManagedEtabsStartIntent.VisibleByConsent);
         return new ServeDispatcher(
             session,
             null!,
-            null!,
+            open!,
             null!,
             null!,
             null!,
@@ -362,7 +391,10 @@ internal static class DispatcherRig
             abandoned,
             orphan,
             service,
-            c10);
+            c10,
+            saveAndExit,
+            c11,
+            stamps);
     }
 }
 

@@ -237,7 +237,7 @@ public class SaveModelService : ISaveModelService
             $"not '{requestedFullPath}'. Saving would write one model over another.");
     }
 
-    private static bool IsLockSiblingOf(string currentFull, string requestedFullPath) =>
+    internal static bool IsLockSiblingOf(string currentFull, string requestedFullPath) =>
         string.Equals(Path.GetExtension(currentFull), ".$et", StringComparison.OrdinalIgnoreCase)
         && string.Equals(
             Path.ChangeExtension(currentFull, null),

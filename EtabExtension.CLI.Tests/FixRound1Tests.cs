@@ -218,7 +218,6 @@ public sealed class StartupBlockerAfterReadyTests
         foreach (var scenario in new (bool Armed, nint Main, int Pid)[]
         {
             (false, Main, 0),
-            (true, nint.Zero, 0),
             (true, Main, 1)
         })
         {
@@ -238,9 +237,14 @@ public sealed class StartupBlockerAfterReadyTests
     [Fact]
     public void ACommittedSessionArmsTheStartupBlockerAndAFailedLaunchDoesNot()
     {
-        var ready = new SessionRig();
+        var launcher = new LauncherRig();
+        launcher.Windows.Windows.Add((Identity.Pid, new StartupWindow(0x100, "ETABS", "HwndWrapper")));
+        var ready = new SessionRig(launcher);
         ready.Session.GetOrStartOwned();
         Assert.True(ready.L.Cell.StartupBlockerArmed);
+
+        // Card v2.5a A3: the main window is CAPTURED by the rule from the visible windows, not
+        // taken from Process.MainWindowHandle.
         Assert.Equal(0x100, (int)ready.L.Cell.MainWindow);
 
         var failing = new SessionRig();
