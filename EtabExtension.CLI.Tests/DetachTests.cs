@@ -189,7 +189,7 @@ public sealed class DetachTests
 
         release.Set();
         WaitFor(
-            () => rig.L.Records.Record?.Phase == ManagedEtabsRecordPhase.Detached,
+            () => rig.L.Records.Writes.ToArray().Any(r => r.Phase == ManagedEtabsRecordPhase.Detached),
             "the stalled write to land");
 
         Assert.Equal(LaunchLifecycle.DetachUncertain, Launch(rig).Lifecycle);

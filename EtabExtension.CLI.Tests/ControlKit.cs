@@ -138,7 +138,7 @@ internal sealed class ProbeWorker(bool busy) : IStaExecutionWorker
     public Task<T> ExecuteAsync<T>(Func<Task<T>> action) =>
         busy
             ? new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously).Task
-            : Task.Run(action);
+            : Kit.OnDedicatedThread(() => action().GetAwaiter().GetResult());
 
     public void Dispose() => Interlocked.Increment(ref _disposed);
 }

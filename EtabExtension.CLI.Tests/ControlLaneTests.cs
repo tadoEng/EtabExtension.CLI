@@ -310,15 +310,15 @@ public sealed class CoordinatorControlTests
         var envelope = TimeSpan.FromMilliseconds(800);
         var clock = Stopwatch.StartNew();
 
-        var result = Coordinator(session, new ProbeWorker(busy: true), envelope: envelope, busyWait: TimeSpan.FromMilliseconds(300))
+        var result = Coordinator(session, new ProbeWorker(busy: true), envelope: envelope, busyWait: TimeSpan.FromMilliseconds(600))
             .ShutdownAsync()
             .Within("the bounded shutdown");
 
         Assert.False(result.Success);
         Assert.Equal(ManagedEtabsShutdownState.ProcessExitUnconfirmed, result.Data!.State);
         Assert.True(
-            clock.Elapsed < envelope + TimeSpan.FromMilliseconds(250),
-            $"took {clock.Elapsed}: the 300 ms busy wait was added on top of the {envelope} envelope");
+            clock.Elapsed < envelope + TimeSpan.FromMilliseconds(400),
+            $"took {clock.Elapsed}: the 600 ms busy wait was added on top of the {envelope} envelope");
     }
 
     [Fact]
