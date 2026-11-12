@@ -365,3 +365,41 @@ internal static class DispatcherRig
             c10);
     }
 }
+
+/// <summary>
+/// Synchronous work runs one item at a time, like the single STA: an item behind a blocked one
+/// never starts. It is what makes "get-status never queues behind a running command" provable.
+/// </summary>
+internal sealed class SerialOperations : IOperationManager
+{
+    private readonly SemaphoreSlim _sta = new(1, 1);
+
+    public bool HasActiveOperation => false;
+
+    public Result<StartOperationData> Start(string kind, JsonElement payload) => throw new NotSupportedException();
+
+    public Result<OperationStatusData> GetStatus(string operationId) => throw new NotSupportedException();
+
+    public Result<GetOperationEventsData> GetEvents(string operationId, long sinceSequence) =>
+        throw new NotSupportedException();
+
+    public Result<CancelOperationData> Cancel(string operationId) => throw new NotSupportedException();
+
+    public Task<object> WaitAsync(string operationId, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException();
+
+    public async Task<T> ExecuteSynchronousAsync<T>(Func<Task<T>> action)
+    {
+        await _sta.WaitAsync();
+        try
+        {
+            return await action();
+        }
+        finally
+        {
+            _ = _sta.Release();
+        }
+    }
+
+    public void Dispose() => _sta.Dispose();
+}

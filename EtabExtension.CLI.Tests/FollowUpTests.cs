@@ -357,6 +357,31 @@ public sealed class StatusFactsTests
             "the abandoned work to finish");
     }
 
+    // C8: get-status is answered from the daemon's own state while a synchronous command holds
+    // the STA - it never queues behind the work it reports on.
+    [Fact]
+    public void GetStatusIsAnsweredWhileASynchronousCommandHoldsTheStaInsteadOfQueueingBehindIt()
+    {
+        var save = new BlockingSave();
+        var session = new ProbeSession { Started = true, DispositionValue = EtabsDisposition.Owned };
+        var dispatcher = DispatcherRig.Create(
+            session,
+            new ProbeWatchdog(),
+            save: save,
+            operations: new SerialOperations());
+        var saving = dispatcher.DispatchAsync(
+            "save-model",
+            JsonSerializer.SerializeToElement(new { filePath = @"D:\p\model.edb" }),
+            CancellationToken.None);
+        Assert.False(saving.IsCompleted);
+
+        var status = Status(dispatcher);
+
+        Assert.Equal(EtabsDisposition.Owned, status.Disposition);
+        save.Release.SetResult(Result.Ok(new SaveModelData()));
+        _ = saving.Within("the save");
+    }
+
     // Test 47 (daemon part): a missing disposition is how an older daemon reads, and the daemon
     // itself always sends one - so "unknown" can only come from the older side.
     [Fact]
