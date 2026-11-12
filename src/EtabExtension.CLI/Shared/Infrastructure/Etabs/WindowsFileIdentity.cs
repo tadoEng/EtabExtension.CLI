@@ -77,6 +77,32 @@ internal static class WindowsFileIdentity
     private const uint OpenExisting = 3;
 
     /// <summary>
+    /// The file's identity as a stable string (<c>volume-index</c>, hex), or null when it
+    /// cannot be identified. Two paths to the same file give the same string; a replacement
+    /// file at the same path gives a different one.
+    /// </summary>
+    internal static string? ReadFileId(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !OperatingSystem.IsWindows())
+        {
+            return null;
+        }
+
+        try
+        {
+            var (identity, _) = TryReadIdentity(path);
+            return identity is { } id
+                ? $"{id.Volume:x8}-{id.IndexHigh:x8}{id.IndexLow:x8}"
+                : null;
+        }
+        catch (Exception exception) when (
+            exception is DllNotFoundException or EntryPointNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Compares two paths by file identity.
     ///
     /// <para>Never guesses. A path that cannot be identified — missing, a folder, an

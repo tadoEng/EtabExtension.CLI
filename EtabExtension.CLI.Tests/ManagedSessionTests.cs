@@ -162,8 +162,16 @@ public sealed class ManagedSessionTests
 
         fixture.Session.RevealForExplicitUserRequest();
 
+        // The first step is the durable userVisible record (card C3): it precedes the
+        // reveal, so a failed write reveals nothing.
         Assert.Equal(
-            ["window-guard-release", "csi-unhide", "confirm-windows-revealed", "enter-user-visible"],
+            [
+                "record-write",
+                "window-guard-release",
+                "csi-unhide",
+                "confirm-windows-revealed",
+                "enter-user-visible"
+            ],
             fixture.Events);
         Assert.Equal(1, fixture.Managed.WindowGuardReleaseCalls);
     }

@@ -105,20 +105,23 @@ public interface IManagedEtabsStartIntentScope
 /// <inheritdoc />
 public sealed class ManagedEtabsStartIntentScope : IManagedEtabsStartIntentScope
 {
-    private ManagedEtabsStartIntent _current = ManagedEtabsStartIntent.Unspecified;
+    // Per logical call, not per scope object (card C8): the serve loop now has a control
+    // request and an ordinary one in flight at the same time, and one shared field would let
+    // either clobber the other's declaration between its Publish and its capture.
+    private readonly AsyncLocal<ManagedEtabsStartIntent> _current = new();
 
     /// <inheritdoc />
-    public ManagedEtabsStartIntent Current => _current;
+    public ManagedEtabsStartIntent Current => _current.Value;
 
     /// <inheritdoc />
     public IDisposable Publish(ManagedEtabsStartIntent intent)
     {
-        _current = intent;
+        _current.Value = intent;
         return new Reset(this);
     }
 
     private sealed class Reset(ManagedEtabsStartIntentScope owner) : IDisposable
     {
-        public void Dispose() => owner._current = ManagedEtabsStartIntent.Unspecified;
+        public void Dispose() => owner._current.Value = ManagedEtabsStartIntent.Unspecified;
     }
 }

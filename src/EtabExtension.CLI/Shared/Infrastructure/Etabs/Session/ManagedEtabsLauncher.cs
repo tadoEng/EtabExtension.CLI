@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using Microsoft.Extensions.Configuration;
 
@@ -30,6 +31,14 @@ public sealed record ManagedEtabsLauncherOptions
     /// <summary>Bounded wait for our own handle to confirm exit after a kill.</summary>
     public TimeSpan ForcedExitTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// How long the TERMINATOR (a shutdown, the supervisor or a failed start) waits for the
+    /// startup worker's kill to be confirmed (review P3-F). It is one second longer than the
+    /// worker's own <see cref="ForcedExitTimeout"/>, so a kill the worker confirms right at its
+    /// limit is never reported unconfirmed by a terminator that gave up a moment earlier.
+    /// </summary>
+    public TimeSpan TerminatorExitTimeout => ForcedExitTimeout + ManagedEtabsLauncher.TerminatorMargin;
+
     /// <summary>Bounded wait after a raw <c>ApplicationExit</c> request before the kill.</summary>
     public TimeSpan GracefulCleanupWait { get; init; } = TimeSpan.FromSeconds(2);
 }
@@ -55,6 +64,12 @@ public sealed record ManagedEtabsLauncherOptions
 public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
 {
     public static readonly TimeSpan ForcedExitTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>The terminator's extra second over the worker's kill wait (review P3-F).</summary>
+    public static readonly TimeSpan TerminatorMargin = TimeSpan.FromSeconds(1);
+
+    /// <summary>The terminator's kill-confirmation wait: 11 s (review P3-F).</summary>
+    public static readonly TimeSpan TerminatorExitTimeout = ForcedExitTimeout + TerminatorMargin;
 
     private static readonly JsonSerializerOptions DetailJson = new()
     {
@@ -194,18 +209,33 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 ? StripCode(original)
                 : failure.Message;
 
-            throw new EtabsLaunchException(
-                code,
-                cleanup is { Success: true }
-                    ? message
-                    : EtabsApiDiagnosticFormatter.AppendTerminalFacts(
-                        message,
-                        $"cleanup={cleanup?.Data.State}; " +
-                        $"processExitConfirmed={cleanup?.Data.ProcessExitConfirmed}; " +
-                        $"forced={cleanup?.Data.Forced}; " +
-                        $"recordRetained={cleanup?.Data.RecordRetained}; " +
-                        $"ownedPid={cleanup?.Data.OwnedPid?.ToString() ?? "unknown"}"),
-                failure.InnerException ?? failure)
+            string FactsOf(string text) => cleanup is { Success: true }
+                ? text
+                : EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    text,
+                    $"cleanup={cleanup?.Data.State}; " +
+                    $"processExitConfirmed={cleanup?.Data.ProcessExitConfirmed}; " +
+                    $"forced={cleanup?.Data.Forced}; " +
+                    $"recordRetained={cleanup?.Data.RecordRetained}; " +
+                    $"ownedPid={cleanup?.Data.OwnedPid?.ToString() ?? "unknown"}");
+
+            string finalMessage;
+            if (code is EtabsLaunchErrorCodes.StartBlocked or EtabsLaunchErrorCodes.StartTimeout)
+            {
+                // Card C4: the typed detail is ONE json object that runs to the end of the
+                // string, and it says whether this launch's own process is gone and whether a
+                // record is still retained, so the host can tell "retry" from "reconcile".
+                var (prose, detail) = SplitDetail(message);
+                finalMessage = FactsOf(prose)
+                    + EtabsTypedFailureCodes.DetailMarker
+                    + StartDetail(code, detail, state.BlockerEvidence, cleanup).ToJsonString(DetailJson);
+            }
+            else
+            {
+                finalMessage = FactsOf(message);
+            }
+
+            throw new EtabsLaunchException(code, finalMessage, failure.InnerException ?? failure)
             {
                 Cleanup = cleanup
             };
@@ -403,7 +433,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 $"⚠ {EtabsLaunchErrorCodes.StartTimeout}: the ETABS start did not commit within " +
                 $"{_options.StartupDeadline.TotalSeconds:0.###}s; ending the process this attempt created.");
             _ = state.TerminateLaunch(
-                _options.ForcedExitTimeout,
+                _options.TerminatorExitTimeout,
                 TimeSpan.Zero,
                 timedOut: true);
         }
@@ -447,6 +477,90 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         }
     }
 
+    /// <summary>
+    /// Splits a message into its prose and its trailing <c> detail={json}</c> object. Text after
+    /// the first complete object (a diagnostic appended later) stays with the prose.
+    /// </summary>
+    private static (string Prose, JsonObject? Detail) SplitDetail(string message)
+    {
+        var marker = EtabsTypedFailureCodes.DetailMarker;
+        var at = message.IndexOf(marker, StringComparison.Ordinal);
+        if (at < 0)
+        {
+            return (message, null);
+        }
+
+        var start = at + marker.Length;
+        var depth = 0;
+        var inString = false;
+        for (var index = start; index < message.Length; index++)
+        {
+            var c = message[index];
+            if (inString)
+            {
+                if (c == '\\')
+                {
+                    index++;
+                }
+                else if (c == '"')
+                {
+                    inString = false;
+                }
+
+                continue;
+            }
+
+            if (c == '"')
+            {
+                inString = true;
+            }
+            else if (c == '{')
+            {
+                depth++;
+            }
+            else if (c == '}' && --depth == 0)
+            {
+                var json = message[start..(index + 1)];
+                var rest = message[(index + 1)..];
+                try
+                {
+                    return (message[..at] + rest, JsonNode.Parse(json) as JsonObject);
+                }
+                catch (JsonException)
+                {
+                    return (message[..at] + rest, null);
+                }
+            }
+        }
+
+        return (message[..at], null);
+    }
+
+    private static JsonObject StartDetail(
+        string code,
+        JsonObject? existing,
+        StartupBlockerEvidence? evidence,
+        ManagedEtabsShutdownResult? cleanup)
+    {
+        var detail = existing ?? new JsonObject();
+        if (code == EtabsLaunchErrorCodes.StartBlocked)
+        {
+            if (!detail.ContainsKey("title") && evidence is not null)
+            {
+                detail["title"] = EtabsApiDiagnosticFormatter.Bounded(evidence.Title);
+                detail["class"] = EtabsApiDiagnosticFormatter.Bounded(evidence.ClassName);
+            }
+
+            detail["dismissed"] = false;
+            detail["phase"] = StartBlockerPhases.Launch;
+        }
+
+        // An unknown cleanup is never read as confirmed: the process may still be alive.
+        detail["ownedExitConfirmed"] = cleanup?.Data.ProcessExitConfirmed ?? false;
+        detail["recordRetained"] = cleanup?.Data.RecordRetained ?? true;
+        return detail;
+    }
+
     private static EtabsLaunchException StartBlocked(string title, string windowClass)
     {
         var boundedTitle = EtabsApiDiagnosticFormatter.Bounded(title);
@@ -468,7 +582,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             $"⚠ {EtabsLaunchErrorCodes.StartTimeout}: the ETABS start did not commit within " +
             $"{_options.StartupDeadline.TotalSeconds:0.###}s.");
         var cleanup = state.TerminateLaunch(
-            _options.ForcedExitTimeout,
+            _options.TerminatorExitTimeout,
             TimeSpan.Zero,
             timedOut: true);
         if (state.BlockerEvidence is { } evidence)
@@ -497,7 +611,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 EtabsLaunchErrorCodes.LaunchAborted,
                 "The ETABS launch was ended by a shutdown before it committed.")
             {
-                Cleanup = state.TerminateLaunch(_options.ForcedExitTimeout)
+                Cleanup = state.TerminateLaunch(_options.TerminatorExitTimeout)
             };
 
     private void RequireStillLaunching(EtabsLaunchState state)
@@ -795,7 +909,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         var graceful = applicationExitReturnCode == 0
             ? _options.GracefulCleanupWait
             : TimeSpan.Zero;
-        var result = state.TerminateLaunch(_options.ForcedExitTimeout, graceful, timedOut)
+        var result = state.TerminateLaunch(_options.TerminatorExitTimeout, graceful, timedOut)
             ?? EtabsLaunchState.Succeeded(null, forced: false, recordRetained: false);
         var reported = result with
         {

@@ -113,7 +113,8 @@ public sealed class SaveModelServiceTests
         FakeModelFileApi api) => SaveModelService.SaveOnApi(
             api,
             filePath,
-            (_, _) => new FileIdentityResult(FileIdentityMatch.Different, 0));
+            (_, _) => new FileIdentityResult(FileIdentityMatch.Different, 0),
+            new ChangingFileStamps());
 
     private sealed class FakeModelFileApi : IEtabsModelFileApi
     {

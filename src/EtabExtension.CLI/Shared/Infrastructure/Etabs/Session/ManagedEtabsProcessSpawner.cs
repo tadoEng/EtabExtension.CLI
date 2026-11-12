@@ -123,10 +123,16 @@ public sealed class WindowsSpawnedEtabsProcess(Process process) : ISpawnedEtabsP
 }
 
 /// <summary>One visible top-level window of the launching process.</summary>
-public sealed record StartupWindow(nint Handle, string Title, string ClassName);
+public sealed record StartupWindow(nint Handle, string Title, string ClassName, nint Owner = 0);
 
 /// <summary>The window-station boundary of the startup-blocker rule (card Z2).</summary>
 public interface IEtabsStartupWindowSource
 {
     IReadOnlyList<StartupWindow> VisibleTopLevelWindows(int pid);
+
+    /// <summary>
+    /// Whether <paramref name="window"/> accepts input. The post-Ready blocker rule asks it
+    /// of the MAIN window (review P2-A): a main window that is still enabled cannot be held up.
+    /// </summary>
+    bool IsWindowEnabled(nint window);
 }

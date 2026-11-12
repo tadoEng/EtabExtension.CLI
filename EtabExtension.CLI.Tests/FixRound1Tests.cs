@@ -169,7 +169,7 @@ public sealed class StartupBlockerAfterReadyTests
         Assert.StartsWith($"[{EtabsLaunchErrorCodes.StartBlocked}]", failure.Error, StringComparison.Ordinal);
         Assert.Contains("Sign in", failure.Error, StringComparison.Ordinal);
         Assert.Contains(
-            "detail={\"title\":\"Sign in\",\"class\":\"AuthenticationView\",\"dismissed\":false}",
+            "detail={\"title\":\"Sign in\",\"class\":\"AuthenticationView\",\"dismissed\":false,\"phase\":\"postReady\"}",
             failure.Error,
             StringComparison.Ordinal);
         Assert.True(watchdog.IsBlocked);

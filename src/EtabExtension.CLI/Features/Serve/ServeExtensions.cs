@@ -1,4 +1,6 @@
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
+using EtabExtension.CLI.Features.SaveModel;
 using EtabExtension.CLI.Features.ReadModelMetadata;
 using EtabExtension.CLI.Features.Serve.Operations;
 using EtabExtension.CLI.Features.Serve.Inspection;
@@ -8,6 +10,15 @@ namespace EtabExtension.CLI.Features.Serve;
 
 public static class ServeExtensions
 {
+    /// <summary>
+    /// The daemon's record store. The trusted anchor (review P3-H) is passed THROUGH: a role
+    /// record that lives outside <c>%LOCALAPPDATA%</c> (the B1 host's own record root) has no
+    /// default anchor, and without this it would be checked from its root and refuse a
+    /// legitimate redirected profile.
+    /// </summary>
+    public static JsonSessionRecordStore CreateRecordStore(ServeSessionPaths paths) =>
+        new(paths.SessionRecordPath, lockWait: null, trustedAnchor: paths.TrustedAnchor);
+
     public static IServiceCollection AddServeFeature(this IServiceCollection services)
     {
         // Scoped: the serve command creates one scope for the daemon's lifetime,
@@ -15,8 +26,15 @@ public static class ServeExtensions
         // dispatcher can depend on the scoped feature services.
         services.AddScoped<ServeSessionPaths>();
         services.AddScoped<LaunchPublicationCell>();
-        services.AddScoped<ISessionRecordStore>(provider => new JsonSessionRecordStore(
-            provider.GetRequiredService<ServeSessionPaths>().SessionRecordPath));
+        services.AddScoped<ISessionRecordStore>(provider =>
+            CreateRecordStore(provider.GetRequiredService<ServeSessionPaths>()));
+        services.AddScoped<OrphanDispositionCell>();
+        services.AddScoped<AbandonedRequests>();
+        services.AddScoped<ShutdownIfUnchangedRegistry>();
+        services.AddScoped<IEtabsChangeSignalSource, UnsupportedChangeSignalSource>();
+        services.AddScoped<ISavedFileStampReader, DiskSavedFileStampReader>();
+        services.AddScoped<IShutdownIfUnchangedApiFactory, SessionShutdownIfUnchangedApiFactory>();
+        services.AddScoped<ShutdownIfUnchangedService>();
         services.AddScoped<IProcessInspector>(provider => new SiblingAwareProcessInspector(
             new WindowsProcessInspector(),
             provider.GetRequiredService<ServeSessionPaths>().SiblingRecordPath is { } sibling
@@ -59,4 +77,31 @@ public sealed class ServeSessionPaths
 
     /// <summary>The other daemon's record; null when this daemon runs alone.</summary>
     public string? SiblingRecordPath { get; set; }
+
+    /// <summary>
+    /// The root the record directory is trusted under (<c>--record-anchor</c>, review P3-H). A
+    /// reparse point ABOVE it is the user's own layout; one below it is refused. Null keeps the
+    /// default (<c>%LOCALAPPDATA%</c>).
+    /// </summary>
+    public string? TrustedAnchor { get; set; }
+
+    /// <summary>What a daemon does when stdin ends (<c>--on-eof</c>, card C2).</summary>
+    public ServeEofPolicy EofPolicy { get; set; } = ServeEofPolicy.Exit;
+
+    /// <summary>True for <c>serve --recover</c>: recovery only, no command may start ETABS (card v2.3 §4).</summary>
+    public bool RecoveryOnly { get; set; }
+}
+
+/// <summary>Reads the document and change signal of the ETABS the session holds.</summary>
+public sealed class SessionShutdownIfUnchangedApiFactory(IEtabsChangeSignalSource changeSignal)
+    : IShutdownIfUnchangedApiFactory
+{
+    public IEtabsModelFileApi Create(IEtabsSession session)
+    {
+        // Never GetOrStart(): its verification-failure cleanup ends the instance, and a check
+        // that precedes the exit decision must not (review round 2, P1-2).
+        var owned = session.InspectExisting(out var refusal)
+            ?? throw new InvalidOperationException(refusal ?? "No instance to inspect.");
+        return new EtabsModelFileApi(owned.Application, changeSignal);
+    }
 }

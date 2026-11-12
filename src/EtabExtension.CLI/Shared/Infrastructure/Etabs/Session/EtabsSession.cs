@@ -1,4 +1,5 @@
 using System.Diagnostics.CodeAnalysis;
+using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Shared.Common;
 using EtabSharp.Core;
 
@@ -41,10 +42,88 @@ public interface IEtabsSession : IDisposable
     /// exact owned process is killed through its authoritative handle.
     /// </summary>
     ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked();
+
+    /// <summary>
+    /// <see cref="ShutdownWhileWorkerBlocked()"/> after the caller already spent
+    /// <paramref name="gateWait"/> waiting for a busy STA (card C7a): the session's own gate
+    /// wait is that same wait, not a second one on top of it.
+    /// </summary>
+    ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(TimeSpan gateWait) => ShutdownWhileWorkerBlocked();
+
+    /// <summary>
+    /// Hands the instance to the user (card C1). Bounded, never needs the STA, never exits and
+    /// never kills.
+    /// </summary>
+    DetachResult Detach() => DetachResult.Failed(
+        ManagedEtabsShutdownErrorCodes.DetachFailed,
+        "This session does not support detach.");
+
+    /// <summary>
+    /// The existing, identity-verified instance, or null with the reason (review round 2, P1-2).
+    /// NEVER starts, shuts down or ends anything; the read-only path for commands that must not
+    /// destroy what they inspect.
+    /// </summary>
+    IManagedEtabsApplication? InspectExisting(out string? refusal)
+    {
+        refusal = "This session cannot inspect an existing instance.";
+        return null;
+    }
+
+    /// <summary>
+    /// After a failed EOF detach left ETABS running on purpose: no later exit, kill or disposal
+    /// of this session may end it (review P1-1).
+    /// </summary>
+    void SuppressFurtherExit()
+    {
+    }
+
+    /// <summary>True once the user was shown ETABS and this daemon still owns it (card C2).</summary>
+    bool IsUserVisible => false;
+
+    /// <summary>Who holds the instance (card C5).</summary>
+    EtabsDisposition Disposition => EtabsDisposition.None;
+
+    /// <summary>The launch generation of the instance this daemon holds, or null (card C5).</summary>
+    Guid? LaunchRecordId => null;
+}
+
+/// <summary>How a detach ended (card v2.3 §3).</summary>
+public enum DetachOutcome
+{
+    /// <summary>The durable detach write committed; the user owns the instance.</summary>
+    Detached,
+
+    /// <summary>Failed before the durable write started and rolled back: still owned, nothing destroyed.</summary>
+    Failed,
+
+    /// <summary>The write started and its outcome is unknown: no rollback, nothing destructive.</summary>
+    Uncertain
+}
+
+public sealed record DetachResult(
+    DetachOutcome Outcome,
+    string? ErrorCode,
+    string? Error,
+    ManagedProcessIdentity? Identity,
+    Guid? LaunchRecordId)
+{
+    public bool Success => Outcome == DetachOutcome.Detached;
+
+    public static DetachResult Failed(string code, string error) =>
+        new(DetachOutcome.Failed, code, error, null, null);
 }
 
 public sealed class EtabsSession : IEtabsSession
 {
+    /// <summary>
+    /// A detach is bounded to this end to end (card C1): it never needs the STA, so nothing
+    /// outside its own steps can stretch it.
+    /// </summary>
+    public static readonly TimeSpan DetachBudgetDefault = TimeSpan.FromSeconds(5);
+
+    /// <summary>A concurrent shutdown or EOF waits at most this long for a Detaching outcome.</summary>
+    public static readonly TimeSpan DetachSettleWaitDefault = TimeSpan.FromSeconds(5);
+
     /// <summary>How long a blocked-worker shutdown waits for the session gate (card I6).</summary>
     public static readonly TimeSpan BlockedShutdownGateWait = TimeSpan.FromSeconds(2);
 
@@ -94,6 +173,21 @@ public sealed class EtabsSession : IEtabsSession
 
     // The current attempt's shared state. Written under the gate, read lock-free.
     private EtabsLaunchState? _launch;
+
+    // Lock-free: set once the explicit reveal committed (card C2).
+    private int _userVisible;
+
+    /// <summary>Total bound of one detach. Tests shorten it.</summary>
+    internal TimeSpan DetachBudget { get; set; } = DetachBudgetDefault;
+
+    /// <summary>How long a shutdown waits for a Detaching outcome. Tests shorten it.</summary>
+    internal TimeSpan DetachSettleWait { get; set; } = DetachSettleWaitDefault;
+
+    /// <summary>Test seam: runs on the detach worker BEFORE its durable write is claimed.</summary>
+    internal Action? BeforeDetachWrite { get; set; }
+
+    /// <summary>Test seam: runs on the detach worker right after the durable write returned.</summary>
+    internal Action? AfterDetachWrite { get; set; }
 
     public EtabsSession(
         IManagedEtabsLauncher launcher,
@@ -188,12 +282,173 @@ public sealed class EtabsSession : IEtabsSession
     /// </summary>
     public int? ProcessId => _cell.Identity?.Pid;
 
+    /// <inheritdoc />
+    public bool IsUserVisible =>
+        Volatile.Read(ref _userVisible) == 1 && Disposition == EtabsDisposition.Owned;
+
+    /// <inheritdoc />
+    public EtabsDisposition Disposition
+    {
+        get
+        {
+            var launch = Volatile.Read(ref _launch);
+            if (launch is null || !launch.Began)
+            {
+                return EtabsDisposition.None;
+            }
+
+            return launch.Lifecycle switch
+            {
+                LaunchLifecycle.Detached => EtabsDisposition.Detached,
+                LaunchLifecycle.Detaching or LaunchLifecycle.DetachUncertain => EtabsDisposition.Detaching,
+                LaunchLifecycle.Ended => EtabsDisposition.None,
+                _ => EtabsDisposition.Owned
+            };
+        }
+    }
+
+    /// <inheritdoc />
+    public Guid? LaunchRecordId =>
+        Disposition == EtabsDisposition.None ? null : Volatile.Read(ref _launch)?.LaunchRecordId;
+
+    /// <summary>
+    /// After the terminal fence is attempted, may this path go on to end the process? False
+    /// only when a detach won: the instance is then the user's, and no rival path may exit or
+    /// kill it (card C1, I11).
+    /// </summary>
+    private bool MayTerminate(EtabsLaunchState? launch)
+    {
+        if (launch is null)
+        {
+            return true;
+        }
+
+        // A CAS loop over EXPLICIT states (review P1-4). Observing Ready is never enough: the
+        // path must WIN Ready -> Terminating, or it learns that something else owns the
+        // instance. A detach that rolled back and a retried detach can both pass through Ready
+        // in between, so the decision is re-made from the live state every time.
+        while (true)
+        {
+            var observed = launch.Lifecycle;
+            BetweenFenceObservationAndCas?.Invoke();
+            switch (observed)
+            {
+                case LaunchLifecycle.Ready:
+                    if (launch.TryBeginReadyTermination())
+                    {
+                        return true;
+                    }
+
+                    continue;
+                case LaunchLifecycle.Detaching:
+                case LaunchLifecycle.Detached:
+                case LaunchLifecycle.DetachUncertain:
+                case LaunchLifecycle.Suppressed:
+                    // Suppressed is decided by the SAME CAS word (review round 3, P1): a path
+                    // that lost Ready -> Terminating to Ready -> Suppressed learns it here.
+                    return false;
+                default:
+                    // Launching, Committing, Terminating, Ended: the termination fence is
+                    // already owned elsewhere (or never applied), and nothing detached.
+                    return true;
+            }
+        }
+    }
+
+    /// <summary>Test seam: runs between observing the lifecycle and the fence CAS (review P1-4).</summary>
+    internal Action? BetweenFenceObservationAndCas { get; set; }
+
+    // Set by the EOF path once a detach-visible detach failed and left ETABS running on purpose
+    // (review P1-1): nothing - including disposal of this session - may then exit or kill it.
+    /// <inheritdoc />
+    public void SuppressFurtherExit()
+    {
+        var launch = Volatile.Read(ref _launch);
+        if (launch is null)
+        {
+            return;
+        }
+
+        // ONE atomic decision (review round 3, P1): Ready -> Suppressed competes with
+        // Ready -> Terminating on the same CAS. Any other state means a rival already owns the
+        // instance (detach states, Terminating, Ended) and there is nothing to suppress.
+        while (true)
+        {
+            if (launch.Lifecycle != LaunchLifecycle.Ready || launch.TrySuppress())
+            {
+                return;
+            }
+        }
+    }
+
+    private ManagedEtabsShutdownResult SuppressedAnswer() => new(
+        false,
+        ManagedEtabsShutdownErrorCodes.DetachFailed,
+        "ETABS was deliberately left running (a failed detach on EOF); nothing was exited or killed.",
+        new(
+            ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+            ProcessExitConfirmed: false,
+            Forced: false,
+            RecordRetained: true,
+            ApplicationExitReturnCode: null,
+            OwnedPid: _cell.Identity?.Pid)
+        {
+            Disposition = EtabsDisposition.Owned
+        });
+
     public ETABSApplication GetOrStart() => GetOrStartOwned().Application;
+
+    /// <inheritdoc />
+    public IManagedEtabsApplication? InspectExisting(out string? refusal)
+    {
+        refusal = null;
+        var launch = Volatile.Read(ref _launch);
+        var owned = Volatile.Read(ref _owned);
+        if (launch is not { Lifecycle: LaunchLifecycle.Ready } || owned is null)
+        {
+            refusal = "No ready, owned ETABS instance exists to inspect.";
+            return null;
+        }
+
+        // The same identity proof GetOrStartOwned makes, but a failure only REFUSES: it starts
+        // nothing, shuts nothing down and latches nothing (review round 2, P1-2).
+        try
+        {
+            var record = _records.Read();
+            var live = _processes.Find(owned.Identity.Pid);
+            if (record is null || live is null
+                || record.ManagedLaunchRecordId != owned.ManagedLaunchRecordId
+                || !OrphanSessionCleaner.IdentityMatches(record, live)
+                || live != owned.Identity)
+            {
+                refusal = "The instance's process identity could not be verified; nothing was started or ended.";
+                return null;
+            }
+        }
+#pragma warning disable CA1031 // an unreadable identity is a refusal, never a cleanup
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            refusal = "The instance's process identity could not be read: " +
+                EtabsApiDiagnosticFormatter.Bounded(exception.Message);
+            return null;
+        }
+
+        return owned;
+    }
 
     public IManagedEtabsApplication GetOrStartOwned()
     {
         lock (_gate)
         {
+            if (Volatile.Read(ref _launch) is { IsDetachDisposition: true })
+            {
+                // Typed, non-latching and non-destructive: the instance is the user's now.
+                throw new EtabsLaunchException(
+                    EtabsLaunchErrorCodes.SessionDetached,
+                    "This daemon handed its ETABS to the user; it will not start, use or end it.");
+            }
+
             if (_launchFailure is not null)
             {
                 throw _launchFailure;
@@ -289,7 +544,13 @@ public sealed class EtabsSession : IEtabsSession
             }
             catch
             {
-                _ = current?.TryBeginReadyTermination();
+                if (!MayTerminate(current))
+                {
+                    // A detach won between the check above and here: the instance is the
+                    // user's. Fail this request and touch nothing.
+                    throw;
+                }
+
                 var cleanup = _shutdownMachine.Shutdown(_owned);
                 _shutdownResult = cleanup;
                 if (current is not null)
@@ -365,7 +626,7 @@ public sealed class EtabsSession : IEtabsSession
     private EtabsLaunchException AbortedWhileLaunching(EtabsLaunchState state)
     {
         var result = state.TerminationResult
-            ?? state.TerminateLaunch(ManagedEtabsLauncher.ForcedExitTimeout)
+            ?? state.TerminateLaunch(ManagedEtabsLauncher.TerminatorExitTimeout)
             ?? EtabsLaunchState.Failed(
                 ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
                 "The launch was ended before it committed.",
@@ -413,7 +674,11 @@ public sealed class EtabsSession : IEtabsSession
     private Result EndUncertainSession(IManagedEtabsApplication owned, string diagnostic)
     {
         var current = Volatile.Read(ref _launch);
-        _ = current?.TryBeginReadyTermination();
+        if (!MayTerminate(current))
+        {
+            return Result.Fail(diagnostic + "; the instance was handed to the user, so it was not ended");
+        }
+
         var cleanup = _shutdownMachine.Shutdown(owned);
         _shutdownResult = cleanup;
         if (current is not null)
@@ -739,6 +1004,40 @@ public sealed class EtabsSession : IEtabsSession
         {
             var owned = GetOrStartOwned();
 
+            // C3: userVisible is durable BEFORE anything is revealed. A failed write means
+            // nothing reaches the screen and the request fails typed; the session itself is
+            // untouched, still hidden and still usable.
+            var launch = Volatile.Read(ref _launch);
+            if (launch is not null)
+            {
+                var persisted = false;
+                string? writeFailure = null;
+                try
+                {
+                    persisted = launch.WriteUserVisibleRecord(owned.Identity);
+                }
+#pragma warning disable CA1031 // any failure to persist means no reveal
+                catch (Exception exception)
+#pragma warning restore CA1031
+                {
+                    writeFailure = EtabsApiDiagnosticFormatter.InfrastructureException(
+                        "ManagedEtabsSessionRecord.Write(userVisible)",
+                        exception);
+                }
+
+                if (!persisted)
+                {
+                    return Result.Fail(EtabsApiDiagnosticFormatter.Bounded(
+                        $"[{EtabsLaunchErrorCodes.RecoveryRecordWriteFailed}] " +
+                        "The userVisible evidence could not be written, so ETABS was not revealed. " +
+                        (writeFailure ?? "The recovery record is not this launch's.")));
+                }
+
+                // The user is about to be shown ETABS: its floating tool windows and progress
+                // forms are no startup blocker (review P2-A).
+                launch.DisarmStartupBlocker();
+            }
+
             // Order is the contract, and every step of it is load bearing.
             //
             // The caller has already confirmed the requested model is open. The protected
@@ -783,13 +1082,14 @@ public sealed class EtabsSession : IEtabsSession
             // Only now is the session UserVisible. Later background work reuses it as-is
             // and must never quietly take the screen back.
             owned.EnterUserVisible();
+            Volatile.Write(ref _userVisible, 1);
 
             _diagnostics.WriteLine(
                 $"✓ ETABS shown (PID {owned.Identity.Pid}; " +
                 $"visibleOwnedWindows={windows.ObservedWindows.Count}, " +
                 $"csiReturnCode={csi.ReturnCode}, state={owned.VisibilityState})");
 
-                        return Result.Ok();
+            return Result.Ok();
         }
     }
 
@@ -800,11 +1100,321 @@ public sealed class EtabsSession : IEtabsSession
     public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked() =>
         ShutdownWith(_shutdownMachine.ShutdownWhileWorkerBlocked, workerBlocked: true);
 
-    private ManagedEtabsShutdownResult ShutdownWith(
-        Func<IManagedEtabsApplication, TimeSpan, ManagedEtabsShutdownResult> shutdownWithin,
-        bool workerBlocked)
+    /// <inheritdoc />
+    public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(TimeSpan gateWait) =>
+        ShutdownWith(_shutdownMachine.ShutdownWhileWorkerBlocked, workerBlocked: true, gateWait);
+
+    // ── detach (card C1, v2.3 §3) ───────────────────────────────────────────
+
+    private ManagedEtabsShutdownResult DetachedAnswer(EtabsLaunchState launch) => new(
+        true,
+        null,
+        null,
+        new(
+            ManagedEtabsShutdownState.Succeeded,
+            ProcessExitConfirmed: false,
+            Forced: false,
+            RecordRetained: false,
+            ApplicationExitReturnCode: null,
+            OwnedPid: launch.DetachedIdentity?.Pid)
+        {
+            Disposition = EtabsDisposition.Detached
+        });
+
+    private ManagedEtabsShutdownResult DetachUncertainAnswer(EtabsLaunchState launch) => new(
+        false,
+        ManagedEtabsShutdownErrorCodes.DetachUncertain,
+        "A detach is unresolved: its durable write started and its outcome is unknown. Nothing " +
+        "was exited or killed; the recovery record is the evidence.",
+        new(
+            ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+            ProcessExitConfirmed: false,
+            Forced: false,
+            RecordRetained: true,
+            ApplicationExitReturnCode: null,
+            OwnedPid: launch.Publication.Identity?.Pid ?? launch.DetachedIdentity?.Pid)
+        {
+            Disposition = EtabsDisposition.Detaching
+        });
+
+    /// <summary>
+    /// What a shutdown or EOF answers when a detach holds the instance (card C1): Detached →
+    /// nothing to do; Uncertain (or still unresolved after the settle wait) → nothing
+    /// destructive; a rollback to Ready → null, and the caller proceeds under its own
+    /// disposition.
+    /// </summary>
+    private ManagedEtabsShutdownResult? AnswerForDetachDisposition(EtabsLaunchState launch)
+    {
+        var settled = launch.Lifecycle == LaunchLifecycle.Detaching
+            ? launch.WaitForDetachOutcome(DetachSettleWait)
+            : launch.Lifecycle;
+        return settled switch
+        {
+            LaunchLifecycle.Detached => DetachedAnswer(launch),
+            LaunchLifecycle.Detaching or LaunchLifecycle.DetachUncertain => DetachUncertainAnswer(launch),
+            _ => null
+        };
+    }
+
+    /// <inheritdoc />
+    public DetachResult Detach()
     {
         var launch = Volatile.Read(ref _launch);
+        if (launch is null || !launch.Began)
+        {
+            return DetachResult.Failed(
+                ManagedEtabsShutdownErrorCodes.DetachFailed,
+                "No managed ETABS instance is held, so there is nothing to detach.");
+        }
+
+        while (true)
+        {
+            switch (launch.Lifecycle)
+            {
+                case LaunchLifecycle.Detached:
+                    return new(DetachOutcome.Detached, null, null, launch.DetachedIdentity, launch.LaunchRecordId);
+                case LaunchLifecycle.DetachUncertain:
+                    return UncertainResult(launch);
+                case LaunchLifecycle.Detaching:
+                    if (launch.WaitForDetachOutcome(DetachSettleWait) == LaunchLifecycle.Detaching)
+                    {
+                        return UncertainResult(launch);
+                    }
+
+                    continue;
+                case LaunchLifecycle.Ready:
+                    if (!launch.TryBeginDetach())
+                    {
+                        continue;
+                    }
+
+                    return RunDetach(launch);
+                default:
+                    return DetachResult.Failed(
+                        ManagedEtabsShutdownErrorCodes.DetachFailed,
+                        $"The instance is not ready to be detached (lifecycle {launch.Lifecycle}).");
+            }
+        }
+    }
+
+    private static DetachResult UncertainResult(EtabsLaunchState launch) => new(
+        DetachOutcome.Uncertain,
+        ManagedEtabsShutdownErrorCodes.DetachUncertain,
+        "The detach's durable write started and its outcome is unknown. Nothing was exited or killed.",
+        launch.Publication.Identity ?? launch.DetachedIdentity,
+        launch.LaunchRecordId);
+
+    /// <summary>
+    /// The detach after it won <c>Ready → Detaching</c>. The body runs on its own thread and
+    /// this method waits at most <see cref="DetachBudget"/> for it: a timeout BEFORE the
+    /// durable write started rolls back, a timeout once it started is Uncertain, and a
+    /// completed write is Detached (card v2.3 §3). It never needs the STA and never exits or
+    /// kills.
+    /// </summary>
+    private DetachResult RunDetach(EtabsLaunchState launch)
+    {
+        var identity = launch.Publication.Identity;
+        var owned = Volatile.Read(ref _owned);
+        if (identity is null || owned is null)
+        {
+            _ = launch.TryTransition(LaunchLifecycle.Detaching, LaunchLifecycle.Ready);
+            return DetachResult.Failed(
+                ManagedEtabsShutdownErrorCodes.DetachFailed,
+                "The instance's identity or handle is unavailable; the detach was rolled back.");
+        }
+
+        var attempt = new DetachAttempt();
+        var body = Task.Factory.StartNew(
+            () => DetachBody(launch, attempt, identity, owned),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+        if (body.Wait(DetachBudget))
+        {
+            return body.Result;
+        }
+
+        if (attempt.TryChooseRollback())
+        {
+            // The write never started and now never will: the instance is still owned.
+            _ = launch.TryTransition(LaunchLifecycle.Detaching, LaunchLifecycle.Ready);
+            return DetachResult.Failed(
+                ManagedEtabsShutdownErrorCodes.DetachFailed,
+                $"The detach did not reach its durable write within {DetachBudget.TotalSeconds:0.###}s; " +
+                "it was rolled back and nothing was exited or killed.");
+        }
+
+        if (attempt.Committed)
+        {
+            // After the commit point the detach IS done (card v2.3 §3): what is left (the guard,
+            // the COM release, the lease) is best effort and keeps running on the worker.
+            launch.DetachedIdentity = identity;
+            _ = launch.TryTransition(LaunchLifecycle.Detaching, LaunchLifecycle.Detached);
+            return new(DetachOutcome.Detached, null, null, identity, launch.LaunchRecordId);
+        }
+
+        // The write started and has not returned: no rollback. It may still land, so the state
+        // is Uncertain (or already Detached if the worker finished in the same instant).
+        _ = launch.TryTransition(LaunchLifecycle.Detaching, LaunchLifecycle.DetachUncertain);
+        return launch.Lifecycle == LaunchLifecycle.Detached
+            ? new(DetachOutcome.Detached, null, null, launch.DetachedIdentity, launch.LaunchRecordId)
+            : UncertainResult(launch);
+    }
+
+    private DetachResult DetachBody(
+        EtabsLaunchState launch,
+        DetachAttempt attempt,
+        ManagedProcessIdentity identity,
+        IManagedEtabsApplication owned)
+    {
+        bool? userVisible;
+        try
+        {
+            BeforeDetachWrite?.Invoke();
+
+            // Everything that can fail BEFORE the commit point rolls the detach back.
+            if (!launch.OwnsTheRecord())
+            {
+                return RollBack(
+                    launch,
+                    attempt,
+                    "The recovery record is no longer this launch's, so a detached record cannot replace it.");
+            }
+
+            userVisible = launch.ReadUserVisible();
+        }
+#pragma warning disable CA1031 // any pre-commit failure is a rollback, never a half-step
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            return RollBack(
+                launch,
+                attempt,
+                EtabsApiDiagnosticFormatter.InfrastructureException("detach (before the write)", exception));
+        }
+
+        if (!attempt.TryStartWrite())
+        {
+            // The supervisor chose the rollback while this worker was delayed: it answers,
+            // and this worker writes nothing.
+            return DetachResult.Failed(
+                ManagedEtabsShutdownErrorCodes.DetachFailed,
+                "The detach was rolled back before its durable write started.");
+        }
+
+        try
+        {
+            launch.WriteDetachedRecord(identity, userVisible);
+        }
+#pragma warning disable CA1031 // the write may or may not have landed: uncertain, never a rollback
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            _diagnostics.WriteLine(EtabsApiDiagnosticFormatter.InfrastructureException(
+                "ManagedEtabsSessionRecord.Write(detached)",
+                exception));
+            _ = launch.TryTransition(LaunchLifecycle.Detaching, LaunchLifecycle.DetachUncertain);
+            return UncertainResult(launch);
+        }
+
+        // ── committed: from here only logging, never a rollback ──
+        launch.DetachedIdentity = identity;
+        attempt.MarkCommitted();
+        AfterDetachWrite?.Invoke();
+        Quietly("window guard", owned.DisposeWindowGuard);
+        Quietly("COM release", () =>
+        {
+            // Skipped when a stuck command holds the gate: the worker is inside a COM call.
+            if (!Monitor.TryEnter(_gate, TimeSpan.Zero))
+            {
+                _diagnostics.WriteLine("ℹ Detach: COM release skipped (the session worker is busy).");
+                return;
+            }
+
+            try
+            {
+                owned.ReleaseApiReferences();
+            }
+            finally
+            {
+                Monitor.Exit(_gate);
+            }
+        });
+        Quietly("process handle hand-off", owned.ReleaseOwnedProcessHandleForHandoff);
+        Quietly("record clear", launch.ClearRecordAfterHandoff);
+        Quietly("publication clear", launch.ClearPublication);
+        // A write that landed AFTER the supervisor gave up (Uncertain) is committed handoff
+        // evidence now (review P2-8): publish it, or status would strand at "detaching" with
+        // the record already cleared.
+        if (!launch.TryTransition(LaunchLifecycle.Detaching, LaunchLifecycle.Detached))
+        {
+            _ = launch.TryTransition(LaunchLifecycle.DetachUncertain, LaunchLifecycle.Detached);
+        }
+
+        _diagnostics.WriteLine($"✓ ETABS handed to the user (PID {identity.Pid}); this daemon no longer owns it.");
+        return launch.Lifecycle == LaunchLifecycle.Detached
+            ? new(DetachOutcome.Detached, null, null, identity, launch.LaunchRecordId)
+            : UncertainResult(launch);
+    }
+
+    private DetachResult RollBack(EtabsLaunchState launch, DetachAttempt attempt, string reason)
+    {
+        if (attempt.TryChooseRollback())
+        {
+            _ = launch.TryTransition(LaunchLifecycle.Detaching, LaunchLifecycle.Ready);
+        }
+
+        return DetachResult.Failed(
+            ManagedEtabsShutdownErrorCodes.DetachFailed,
+            EtabsApiDiagnosticFormatter.Bounded(reason + " Nothing was exited or killed."));
+    }
+
+    private void Quietly(string step, Action action)
+    {
+        try
+        {
+            action();
+        }
+#pragma warning disable CA1031 // after the commit point a failing step is only logged (card v2.3 §3)
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            _diagnostics.WriteLine(EtabsApiDiagnosticFormatter.InfrastructureException(
+                $"detach after commit: {step}",
+                exception));
+        }
+    }
+
+    private ManagedEtabsShutdownResult ShutdownWith(
+        Func<IManagedEtabsApplication, TimeSpan, ManagedEtabsShutdownResult> shutdownWithin,
+        bool workerBlocked,
+        TimeSpan? gateWaitOverride = null)
+    {
+        var result = ShutdownWithCore(shutdownWithin, workerBlocked, gateWaitOverride);
+        Volatile.Write(ref _releaseAttempted, 1);
+        return result;
+    }
+
+    private ManagedEtabsShutdownResult ShutdownWithCore(
+        Func<IManagedEtabsApplication, TimeSpan, ManagedEtabsShutdownResult> shutdownWithin,
+        bool workerBlocked,
+        TimeSpan? gateWaitOverride)
+    {
+        var launch = Volatile.Read(ref _launch);
+
+        // -1. The EOF path chose to leave a visible instance running (review P1-1). Disposal of
+        //     the DI scope lands here too, and must not take the gate or end anything.
+        if (launch is { Lifecycle: LaunchLifecycle.Suppressed })
+        {
+            return SuppressedAnswer();
+        }
+
+        // 0. A detach holds the instance: shutdown and EOF take NO destructive step and
+        //    answer the detach's own disposition (card C1, I11).
+        if (launch is { IsDetachDisposition: true } && AnswerForDetachDisposition(launch) is { } detachAnswer)
+        {
+            return detachAnswer;
+        }
 
         // ONE shared deadline for a blocked shutdown (card P3-D): every phase is capped by
         // what is left of it. The normal path keeps its per-phase bounds.
@@ -830,7 +1440,7 @@ public sealed class EtabsSession : IEtabsSession
 
             if (launch.Lifecycle is LaunchLifecycle.Launching or LaunchLifecycle.Committing)
             {
-                var early = launch.TerminateLaunch(Left(ManagedEtabsLauncher.ForcedExitTimeout));
+                var early = launch.TerminateLaunch(Left(ManagedEtabsLauncher.TerminatorExitTimeout));
                 if (early is not null)
                 {
                     _diagnostics.WriteLine("ℹ Shared ETABS session shut down during its launch.");
@@ -843,7 +1453,7 @@ public sealed class EtabsSession : IEtabsSession
         if (workerBlocked)
         {
             // Never wait on a gate a stuck command may hold for ever (card I6).
-            if (!Monitor.TryEnter(_gate, Left(_gateWait)))
+            if (!Monitor.TryEnter(_gate, Left(gateWaitOverride ?? _gateWait)))
             {
                 return ShutdownThroughTheHandle(launch, Left(ManagedEtabsShutdownMachine.ForcedExitTimeout));
             }
@@ -891,8 +1501,13 @@ public sealed class EtabsSession : IEtabsSession
             return _shutdownResult;
         }
 
-        // The terminal fence goes up BEFORE the shutdown acts (card W1).
-        _ = launch?.TryBeginReadyTermination();
+        // The terminal fence goes up BEFORE the shutdown acts (card W1). If a detach won the
+        // arbiter in the meantime, this path acts on nothing (card C1).
+        if (!MayTerminate(launch))
+        {
+            return AnswerForDetachDisposition(launch!) ?? DetachUncertainAnswer(launch!);
+        }
+
         _shutdownResult = shutdown(_owned);
         if (launch is not null)
         {
@@ -914,7 +1529,11 @@ public sealed class EtabsSession : IEtabsSession
     /// </summary>
     private ManagedEtabsShutdownResult ShutdownThroughTheHandle(EtabsLaunchState? launch, TimeSpan killWait)
     {
-        _ = launch?.TryBeginReadyTermination();
+        if (!MayTerminate(launch))
+        {
+            return AnswerForDetachDisposition(launch!) ?? DetachUncertainAnswer(launch!);
+        }
+
         var owned = Volatile.Read(ref _owned);
         var pid = _cell.Identity?.Pid;
         if (owned is null || launch is null)
@@ -985,10 +1604,58 @@ public sealed class EtabsSession : IEtabsSession
         }
     }
 
+    // Set once a shutdown attempt COMPLETED with an answer (review round 2, P2-3). Disposal then
+    // has nothing left to do: re-entering the shutdown would wait for a gate a stuck exit may
+    // hold for ever, and the unconfirmed evidence and the recovery record must stay as they are.
+    private int _releaseAttempted;
+
     public void Dispose()
     {
-        _ = Shutdown();
+        if (Volatile.Read(ref _releaseAttempted) == 1
+            || Volatile.Read(ref _launch) is { Lifecycle: LaunchLifecycle.Suppressed })
+        {
+            return;
+        }
+
+        // Disposal NEVER enters the unsupervised ordinary shutdown (review round 3, P2): that one
+        // takes the gate without a bound and calls ExitWithoutSaving synchronously. It runs the
+        // bounded, supervised sequence (a bounded gate wait, a bounded graceful exit on a
+        // dedicated STA, a bounded kill of the owned handle) on its own thread under ONE overall
+        // deadline. An answer that did not confirm keeps its evidence and the recovery record.
+        var cleanup = new Thread(() =>
+        {
+            try
+            {
+                _ = ShutdownWith(_shutdownMachine.ShutdownWhileWorkerBlocked, workerBlocked: true);
+            }
+#pragma warning disable CA1031 // disposal must not throw
+            catch (Exception exception)
+#pragma warning restore CA1031
+            {
+                _diagnostics.WriteLine(EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "EtabsSession.Dispose", exception));
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "etab-cli-session-dispose"
+        };
+        if (OperatingSystem.IsWindows())
+        {
+            cleanup.SetApartmentState(ApartmentState.STA);
+        }
+
+        cleanup.Start();
+        if (!cleanup.Join(DisposeBudget))
+        {
+            _diagnostics.WriteLine(
+                $"⚠ Session disposal did not finish within {DisposeBudget.TotalSeconds:0.###}s; " +
+                "the instance and its recovery record are left as they are.");
+        }
     }
+
+    /// <summary>The one overall deadline of disposal. Tests shorten it.</summary>
+    internal TimeSpan DisposeBudget { get; set; } = BlockedShutdownBudget;
 
     private static ManagedEtabsShutdownResult NoOwnedProcessSuccess() => new(
         true,

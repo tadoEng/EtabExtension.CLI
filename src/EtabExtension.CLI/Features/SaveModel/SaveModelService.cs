@@ -27,6 +27,29 @@ public class SaveModelService : ISaveModelService
 {
     public const string SaveOperation = "cFile.Save";
 
+    /// <summary>
+    /// The save did not change the file on disk, so it cannot be reported as a save (card
+    /// v2.3 §2): the stamp would describe a file this call did not write.
+    /// </summary>
+    public const string SaveNotObservedCode = "ETABS_SAVE_NOT_OBSERVED";
+
+    /// <summary>
+    /// The requested file is not the document the caller expected (<c>expectedDocument</c>),
+    /// so nothing was saved.
+    /// </summary>
+    public const string DocumentMismatchCode = "ETABS_DOCUMENT_MISMATCH";
+
+    private readonly IEtabsChangeSignalSource _changeSignal;
+    private readonly ISavedFileStampReader _stamps;
+
+    public SaveModelService(
+        IEtabsChangeSignalSource? changeSignal = null,
+        ISavedFileStampReader? stamps = null)
+    {
+        _changeSignal = changeSignal ?? new UnsupportedChangeSignalSource();
+        _stamps = stamps ?? new DiskSavedFileStampReader();
+    }
+
     public async Task<Result<SaveModelData>> SaveModelAsync(string filePath)
     {
         await Task.CompletedTask;
@@ -40,7 +63,7 @@ public class SaveModelService : ISaveModelService
                 return Result.Fail<SaveModelData>("ETABS is not running.");
             }
 
-            return SaveOnApp(app, filePath);
+            return SaveOnApp(app, filePath, null);
         }
         catch (Exception ex)
         {
@@ -52,28 +75,50 @@ public class SaveModelService : ISaveModelService
         }
     }
 
-    public Task<Result<SaveModelData>> SaveModelOnAppAsync(ETABSApplication app, string filePath)
+    public Task<Result<SaveModelData>> SaveModelOnAppAsync(ETABSApplication app, string filePath) =>
+        SaveModelOnAppAsync(app, filePath, expectedFileId: null);
+
+    public Task<Result<SaveModelData>> SaveModelOnAppAsync(
+        ETABSApplication app,
+        string filePath,
+        string? expectedFileId)
     {
-        try { return Task.FromResult(SaveOnApp(app, filePath)); }
+        try { return Task.FromResult(SaveOnApp(app, filePath, expectedFileId)); }
         catch (Exception ex) { return Task.FromResult(Result.Fail<SaveModelData>($"ETABS COM error: {ex.Message}")); }
     }
 
-    private static Result<SaveModelData> SaveOnApp(ETABSApplication app, string filePath)
+    private Result<SaveModelData> SaveOnApp(ETABSApplication app, string filePath, string? expectedFileId)
     {
         ArgumentNullException.ThrowIfNull(app);
 
         var validation = EtabsModelOpen.ValidateModelPath(filePath);
         return validation is not null
             ? Result.Fail<SaveModelData>(validation)
-            : SaveOnApi(new EtabsModelFileApi(app), filePath);
+            : SaveOnApi(
+                new EtabsModelFileApi(app, _changeSignal),
+                filePath,
+                compareIdentity: null,
+                _stamps,
+                expectedFileId);
     }
 
-    /// <summary>The save sequence over the named CSI seam, provable without ETABS.</summary>
+    /// <summary>
+    /// The save sequence over the named CSI seam, provable without ETABS.
+    ///
+    /// <para><b>The stamp.</b> The change signal is read in the call RIGHT AFTER
+    /// <c>SaveFile</c> returned 0 (card v2.4 §1): COM calls run on the ETABS UI thread, so no
+    /// user edit is processed between the two, and a flag that reads dirty there means the
+    /// baseline cannot be trusted. <c>verified</c> is true only for a clean read of a qualifying
+    /// signal; a dirty, unsupported or incomplete signal leaves it false.</para>
+    /// </summary>
     internal static Result<SaveModelData> SaveOnApi(
         IEtabsModelFileApi api,
         string filePath,
-        Func<string, string, FileIdentityResult>? compareIdentity = null)
+        Func<string, string, FileIdentityResult>? compareIdentity = null,
+        ISavedFileStampReader? stamps = null,
+        string? expectedFileId = null)
     {
+        stamps ??= new DiskSavedFileStampReader();
         string requested;
         try
         {
@@ -98,6 +143,15 @@ public class SaveModelService : ISaveModelService
                 return Result.Fail<SaveModelData>(refusal);
             }
 
+            var fileBefore = stamps.Read(requested);
+            if (expectedFileId is not null
+                && !string.Equals(fileBefore?.FileId, expectedFileId, StringComparison.Ordinal))
+            {
+                return Result.Fail<SaveModelData>(EtabsApiDiagnosticFormatter.Bounded(
+                    $"[{DocumentMismatchCode}] The requested file is not the expected document " +
+                    $"(expected fileId '{expectedFileId}', found '{fileBefore?.FileId ?? "none"}'); nothing was saved."));
+            }
+
             Console.Error.WriteLine($"ℹ Saving to: {requested}");
             activeOperation = SaveOperation;
             var saveReturnCode = api.SaveFile(requested);
@@ -105,6 +159,20 @@ public class SaveModelService : ISaveModelService
             {
                 return Result.Fail<SaveModelData>(
                     EtabsApiDiagnosticFormatter.ApiReturn(activeOperation, saveReturnCode));
+            }
+
+            // IMMEDIATELY after SaveFile returned 0, in this same call: the flag is read
+            // before anything else runs (card v2.4 §1).
+            var signal = ReadSignal(api);
+            var fileAfter = stamps.Read(requested);
+            if (fileAfter is null
+                || (fileBefore is not null
+                    && fileBefore.Size == fileAfter.Size
+                    && fileBefore.MtimeUtc == fileAfter.MtimeUtc))
+            {
+                return Result.Fail<SaveModelData>(EtabsApiDiagnosticFormatter.Bounded(
+                    $"[{SaveNotObservedCode}] cFile.Save returned 0 but the file on disk did not change, " +
+                    "so the save is not reported as done."));
             }
 
             activeOperation = EtabsModelOpen.ReadCurrentPathOperation;
@@ -115,6 +183,12 @@ public class SaveModelService : ISaveModelService
                 FilePath = requested,
                 ReportedBefore = Blank(before),
                 ReportedAfter = Blank(after),
+                SavedStamp = new SavedStamp(
+                    fileAfter.FileId,
+                    fileAfter.Size,
+                    fileAfter.MtimeUtc,
+                    ChangeSignalName(signal.State),
+                    signal.IsVerifiedClean),
             });
         }
         catch (Exception exception)
@@ -169,6 +243,34 @@ public class SaveModelService : ISaveModelService
             Path.ChangeExtension(currentFull, null),
             Path.ChangeExtension(requestedFullPath, null),
             StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A signal that throws is not "clean": it is an incomplete signal, so the stamp is
+    /// unverified. Nothing about a failed read may be spent as an assurance.
+    /// </summary>
+    private static ChangeSignalReading ReadSignal(IEtabsModelFileApi api)
+    {
+        try
+        {
+            return api.ReadChangeSignal();
+        }
+#pragma warning disable CA1031 // an unreadable signal is an unverified stamp, never a failed save
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            Console.Error.WriteLine(
+                $"⚠ The change signal could not be read: {EtabsApiDiagnosticFormatter.Bounded(exception.Message)}");
+            return new ChangeSignalReading(ChangeSignalState.Incomplete, "read failed");
+        }
+    }
+
+    internal static string ChangeSignalName(ChangeSignalState state) => state switch
+    {
+        ChangeSignalState.Clean => "clean",
+        ChangeSignalState.Dirty => "dirty",
+        ChangeSignalState.Incomplete => "incomplete",
+        _ => "unsupported"
+    };
 
     private static string? Blank(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Trim();

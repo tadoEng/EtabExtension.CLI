@@ -40,14 +40,25 @@ public interface IEtabsModelFileApi
 
     /// <summary><c>cFile.OpenFile</c> — zero on success.</summary>
     int OpenFile(string filePath);
+
+    /// <summary>
+    /// ETABS's own "unsaved changes" state (card v2.4 §1). The default reports no qualifying
+    /// signal; L7' plugs the real one in through <see cref="IEtabsChangeSignalSource"/>.
+    /// </summary>
+    ChangeSignalReading ReadChangeSignal() => ChangeSignalReading.Unsupported;
 }
 
 /// <summary>
 /// The only production implementation of <see cref="IEtabsModelFileApi"/>: three
-/// one-line adapters onto the caller-owned application's CSI surface.
+/// one-line adapters onto the caller-owned application's CSI surface, plus the change signal.
 /// </summary>
-internal sealed class EtabsModelFileApi(ETABSApplication application) : IEtabsModelFileApi
+internal sealed class EtabsModelFileApi(
+    ETABSApplication application,
+    IEtabsChangeSignalSource? changeSignal = null) : IEtabsModelFileApi
 {
+    public ChangeSignalReading ReadChangeSignal() =>
+        (changeSignal ?? new UnsupportedChangeSignalSource()).Read(application);
+
     /// <summary>
     /// Reads the current model with GetModelFilename, NOT the folder-returning call.
     ///

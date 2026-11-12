@@ -41,8 +41,29 @@ public static class ServeCommand
                 "Path of the OTHER daemon's managed-session record. Its ETABS (exact pid, " +
                 "start time and executable match) is a sibling, never external or managed."
         };
+        var onEofOption = new Option<string?>("--on-eof")
+        {
+            Description =
+                "What the daemon does when stdin ends with no prior shutdown: 'exit' (default; the " +
+                "bounded exit) or 'detach-visible' (hand a user-visible ETABS to the user instead)."
+        };
+        var recoverOption = new Option<string?>("--recover")
+        {
+            Description =
+                "Recovery-only daemon for this role record: takes the role lock first (5 s), then " +
+                "recovers the orphan, and serves only get-status/shutdown. Never starts ETABS."
+        };
+        var recordAnchorOption = new Option<string?>("--record-anchor")
+        {
+            Description =
+                "The root the record directory is trusted under. A reparse point above it is " +
+                "accepted; one below it is refused. Default: the per-user app-data folder."
+        };
         command.Options.Add(sessionRecordOption);
         command.Options.Add(siblingRecordOption);
+        command.Options.Add(onEofOption);
+        command.Options.Add(recoverOption);
+        command.Options.Add(recordAnchorOption);
 
         command.SetAction(async parseResult =>
         {
@@ -53,7 +74,19 @@ public static class ServeCommand
 
             // First, before anything resolves a record store or a census.
             var paths = provider.GetRequiredService<ServeSessionPaths>();
-            paths.SessionRecordPath = FullPathOrNull(parseResult.GetValue(sessionRecordOption));
+            var recoverPath = FullPathOrNull(parseResult.GetValue(recoverOption));
+            paths.SessionRecordPath = recoverPath
+                ?? FullPathOrNull(parseResult.GetValue(sessionRecordOption));
+            paths.RecoveryOnly = recoverPath is not null;
+            paths.TrustedAnchor = FullPathOrNull(parseResult.GetValue(recordAnchorOption));
+            if (!ServeEofPolicies.TryParse(parseResult.GetValue(onEofOption), out var eofPolicy))
+            {
+                Console.Error.WriteLine(
+                    $"✗ --on-eof must be '{ServeEofPolicies.ExitWire}' or '{ServeEofPolicies.DetachVisibleWire}'.");
+                Environment.Exit(StartupRefusedExitCode);
+            }
+
+            paths.EofPolicy = eofPolicy;
             paths.SiblingRecordPath = FullPathOrNull(parseResult.GetValue(siblingRecordOption));
             if (string.Equals(
                     paths.SiblingRecordPath,
@@ -83,6 +116,26 @@ public static class ServeCommand
             };
             using var stdin = new StreamReader(Console.OpenStandardInput());
 
+            if (paths.RecoveryOnly)
+            {
+                // Card v2.3 §4 stage 2: the role lock FIRST, before the record is read or any
+                // process is touched. RecordInUse or a timeout ends this daemon with that
+                // code; the host goes to Quarantined and neither retries nor kills.
+                var locked = await RunRecoveryLockAsync(
+                    records,
+                    RecoveryLockWait,
+                    stdout,
+                    Console.Error,
+                    recovery => ServeStartupRefusal.Current(recovery, records.FilePath));
+                if (locked != 0)
+                {
+                    await stdout.FlushAsync();
+                    Environment.Exit(locked);
+                }
+
+                dispatcher = new RecoveryOnlyDispatcher(dispatcher);
+            }
+
             var outcome = await RunLifecycleAsync(
                 orphanCleaner,
                 shutdown,
@@ -94,7 +147,8 @@ public static class ServeCommand
                     {
                         RecordPath = records.FilePath
                     },
-                    Console.Error).RunAsync(stdin, stdout),
+                    Console.Error,
+                    paths.EofPolicy).RunAsync(stdin, stdout),
                 stdout,
                 Console.Error,
                 recovery => ServeStartupRefusal.Current(recovery, records.FilePath));
@@ -111,6 +165,55 @@ public static class ServeCommand
 
     private static string? FullPathOrNull(string? path) =>
         string.IsNullOrWhiteSpace(path) ? null : Path.GetFullPath(path);
+
+    /// <summary>The bounded try-acquire of the role lock by a recovery daemon (card v2.3 §4).</summary>
+    public static readonly TimeSpan RecoveryLockWait = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Stage 2 of recovery (card v2.3 §4): the recovery daemon's FIRST action. It try-acquires
+    /// the role lock for at most <paramref name="wait"/> BEFORE the record is read or any
+    /// process is touched. Returns 0 when the lock is held; otherwise the refusal frame was
+    /// written and the exit code to end with is returned (<see cref="ServeRecoveryExitCodes"/>):
+    /// no retry loop, no kill, no read of the record.
+    /// </summary>
+    internal static async Task<int> RunRecoveryLockAsync(
+        ISessionRecordStore records,
+        TimeSpan wait,
+        TextWriter output,
+        TextWriter diagnostics,
+        Func<ManagedEtabsShutdownResult, ServeStartupRefusal> refusalFactory)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(diagnostics);
+        ArgumentNullException.ThrowIfNull(refusalFactory);
+
+        string code;
+        string message;
+        int exitCode;
+        try
+        {
+            records.AcquireExclusive(wait);
+            return 0;
+        }
+        catch (RecordInUseException ex)
+        {
+            (code, message, exitCode) = (EtabsRecordErrorCodes.RecordInUse, ex.Message, ServeRecoveryExitCodes.RecordInUse);
+        }
+        catch (RecordPathUnsafeException ex)
+        {
+            (code, message, exitCode) = (EtabsRecordErrorCodes.RecordPathUnsafe, ex.Message, ServeRecoveryExitCodes.RecordPathUnsafe);
+        }
+
+        var refusal = refusalFactory(OrphanSessionCleaner.LockFailed(code, message));
+        await output.WriteLineAsync(JsonSerializer.Serialize(refusal, ServeJson.Options));
+        await output.FlushAsync();
+        await diagnostics.WriteLineAsync(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+            refusal.Error,
+            $"startup=refused; recovery=lock-not-taken; code={refusal.ErrorCode}"));
+        await diagnostics.FlushAsync();
+        return exitCode;
+    }
 
     /// <summary>
     /// Runs orphan recovery, then the request loop, then converges on the one

@@ -190,6 +190,14 @@ internal sealed class FakeStartupWindows : IEtabsStartupWindowSource
 
     public Exception? Failure { get; set; }
 
+    /// <summary>
+    /// Whether the main window accepts input. Disabled by default: a window that holds a
+    /// startup up does so while the main window cannot be used (review P2-A).
+    /// </summary>
+    public bool MainEnabled { get; set; }
+
+    public bool IsWindowEnabled(nint window) => MainEnabled;
+
     public IReadOnlyList<StartupWindow> VisibleTopLevelWindows(int pid)
     {
         if (Failure is not null)
@@ -471,8 +479,15 @@ internal sealed class FakeRawApi : IEtabsRawApi
         return 0;
     }
 
+    public Exception? UnhideException { get; set; }
+
     public int Unhide()
     {
+        if (UnhideException is not null)
+        {
+            throw UnhideException;
+        }
+
         Events.Add("unhide");
         UnhideCalls++;
         IsVisible = true;
@@ -569,4 +584,18 @@ internal sealed class LauncherRig
     }
 
     public EtabsLaunchState NewState() => new(Records, Cell);
+}
+
+/// <summary>A stamp reader whose file did not exist before the save and exists after it.</summary>
+internal sealed class ChangingFileStamps : EtabExtension.CLI.Features.SaveModel.ISavedFileStampReader
+{
+    private int _reads;
+
+    public EtabExtension.CLI.Features.SaveModel.SavedFileStamp? Read(string path) =>
+        Interlocked.Increment(ref _reads) == 1
+            ? null
+            : new EtabExtension.CLI.Features.SaveModel.SavedFileStamp(
+                "0000abcd-0000000000001234",
+                4096,
+                new DateTimeOffset(2026, 11, 12, 9, 0, 0, TimeSpan.Zero));
 }

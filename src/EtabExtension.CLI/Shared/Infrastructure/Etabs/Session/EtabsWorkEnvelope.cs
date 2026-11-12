@@ -94,6 +94,15 @@ public interface IEtabsWorkEnvelope
     /// </para>
     /// </summary>
     Task<object> RunAsync(EtabsWorkContext context, Func<Task<object>> work);
+
+    /// <summary>
+    /// <see cref="RunAsync"/> WITHOUT the completion certification. For a command whose refusal
+    /// paths must be non-destructive end to end (<c>shutdown-if-unchanged</c>, review P2-5): the
+    /// certification can end an uncertain session, which would exit ETABS independently of the
+    /// command's own exit arbiter. The command either refuses (nothing happened to certify) or
+    /// exits (nothing is left to certify).
+    /// </summary>
+    Task<object> RunUncertifiedAsync(EtabsWorkContext context, Func<Task<object>> work) => RunAsync(context, work);
 }
 
 /// <inheritdoc />
@@ -104,6 +113,14 @@ public sealed class EtabsWorkEnvelope(
 {
     /// <inheritdoc />
     public EtabsWorkContext Capture(string stage) => new(declared.Current, stage);
+
+    /// <inheritdoc />
+    public async Task<object> RunUncertifiedAsync(EtabsWorkContext context, Func<Task<object>> work)
+    {
+        using var entered = scope.Enter(context);
+        session.MarkVisibilityStage(context.Stage);
+        return await work();
+    }
 
     /// <inheritdoc />
     public async Task<object> RunAsync(EtabsWorkContext context, Func<Task<object>> work)
