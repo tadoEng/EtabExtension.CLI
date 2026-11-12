@@ -495,6 +495,7 @@ public sealed class EtabsLaunchState
     /// </summary>
     public void WriteDetachedRecord(ManagedProcessIdentity identity, bool? userVisible)
     {
+        BeforeDetachRecordGate?.Invoke();
         lock (_recordGate)
         {
             _records.Write(ToRecord(identity, ManagedEtabsRecordPhase.Detached) with { UserVisible = userVisible });
@@ -507,6 +508,9 @@ public sealed class EtabsLaunchState
     private readonly object _recordGate = new();
 
     internal static readonly TimeSpan RecordGateWait = TimeSpan.FromSeconds(2);
+
+    /// <summary>Test seam: runs on the thread that writes the detach record, just before it takes the record gate.</summary>
+    internal Action? BeforeDetachRecordGate { get; set; }
 
     /// <summary>Test seam: runs inside the record gate right after the document writer's read.</summary>
     internal Action? AfterDocumentRead { get; set; }

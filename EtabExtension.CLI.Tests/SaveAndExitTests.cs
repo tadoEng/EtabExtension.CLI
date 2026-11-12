@@ -1703,16 +1703,27 @@ public sealed class SaveAndExitFixRound1Tests
         paused.Signalled("the writer to pause after its read");
         var writesBeforeDetach = rig.L.Records.Writes.Count;
 
+        // Observe the thread that ACTUALLY writes the detach record (the detach's worker, not the
+        // supervisor that waits on it): the seam captures it just before it takes the record gate.
+        Thread? recordThread = null;
+        using var atGate = new ManualResetEventSlim(false);
+        launch.BeforeDetachRecordGate = () =>
+        {
+            recordThread = Thread.CurrentThread;
+            atGate.Set();
+        };
         DetachResult? detached = null;
         var detachThread = new Thread(() => detached = rig.Session.Detach()) { IsBackground = true };
         detachThread.Start();
+        atGate.Signalled("the detach's record writer to reach the record gate");
 
-        // Contention is PROVEN, not slept for: the detach thread is blocked (waiting on the gate
-        // the paused writer holds) and has not finished. Without the gate it would complete here.
+        // Contention is PROVEN, not slept for: the record writer is blocked on the gate the paused
+        // writer holds, and the detach has not finished. Without the gate the writer never blocks.
         Kit.WaitUntil(
-            () => detachThread.ThreadState.HasFlag(ThreadState.WaitSleepJoin) || !detachThread.IsAlive,
-            "the detach to reach the record gate");
-        Assert.True(detachThread.IsAlive, "the detach must be waiting behind the writer, not finished");
+            () => recordThread!.ThreadState.HasFlag(ThreadState.WaitSleepJoin) || !recordThread.IsAlive,
+            "the record writer to block on the record gate");
+        Assert.True(recordThread!.IsAlive, "the record writer must be waiting behind the paused writer");
+        Assert.True(recordThread.ThreadState.HasFlag(ThreadState.WaitSleepJoin));
         Assert.Null(detached);
 
         resume.Set();
