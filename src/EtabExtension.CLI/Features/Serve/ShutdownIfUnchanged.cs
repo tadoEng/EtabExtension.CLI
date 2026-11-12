@@ -495,7 +495,7 @@ public sealed class ShutdownIfUnchangedService
         return null;
     }
 
-    private static object Refuse(
+    private static Result Refuse(
         ShutdownIfUnchangedOperation operation,
         string code,
         string prose,
@@ -503,7 +503,7 @@ public sealed class ShutdownIfUnchangedService
             ? Result.Fail(EtabsTypedFailureCodes.Format(code, prose, detail))
             : Abandoned();
 
-    private static object Abandoned() => Fail(
+    private static Result Abandoned() => Fail(
         ShutdownIfUnchangedCodes.Abandoned,
         "A cancel, a detach, a shutdown or a timeout took this command first; ETABS was not exited by it.");
 

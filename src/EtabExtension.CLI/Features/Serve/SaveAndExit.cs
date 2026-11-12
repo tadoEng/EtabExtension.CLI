@@ -816,19 +816,19 @@ public sealed class SaveAndExitService
         }
     }
 
-    private static object Unverified(SaveAndExitOperation operation, string reason) => Refuse(
+    private static Result Unverified(SaveAndExitOperation operation, string reason) => Refuse(
         operation,
         SaveAndExitCodes.DocumentUnverified,
         $"The open document could not be verified as the recorded model ({reason}); nothing was saved " +
         "and ETABS was not exited.",
         new { stage = "refused", saved = false, exited = false, reason });
 
-    private static object Refuse(SaveAndExitOperation operation, string code, string prose, object detail) =>
+    private static Result Refuse(SaveAndExitOperation operation, string code, string prose, object detail) =>
         operation.TryRefuse()
             ? Result.Fail(EtabsTypedFailureCodes.Format(code, prose, detail))
             : AbandonedAnswer();
 
-    private static object AbandonedAnswer() => Fail(
+    private static Result AbandonedAnswer() => Fail(
         SaveAndExitCodes.Abandoned,
         "A cancel, a detach, EOF suppression or a shutdown took this command first; ETABS was not exited by it. " +
         "Whether the file was saved is unknown.",

@@ -1203,7 +1203,7 @@ public sealed class EtabsSession : IEtabsSession
 
     // ── detach (card C1, v2.3 §3) ───────────────────────────────────────────
 
-    private ManagedEtabsShutdownResult DetachedAnswer(EtabsLaunchState launch) => new(
+    private static ManagedEtabsShutdownResult DetachedAnswer(EtabsLaunchState launch) => new(
         true,
         null,
         null,
@@ -1218,7 +1218,7 @@ public sealed class EtabsSession : IEtabsSession
             Disposition = EtabsDisposition.Detached
         });
 
-    private ManagedEtabsShutdownResult DetachUncertainAnswer(EtabsLaunchState launch) => new(
+    private static ManagedEtabsShutdownResult DetachUncertainAnswer(EtabsLaunchState launch) => new(
         false,
         ManagedEtabsShutdownErrorCodes.DetachUncertain,
         "A detach is unresolved: its durable write started and its outcome is unknown. Nothing " +
@@ -1454,7 +1454,7 @@ public sealed class EtabsSession : IEtabsSession
             : UncertainResult(launch);
     }
 
-    private DetachResult RollBack(EtabsLaunchState launch, DetachAttempt attempt, string reason)
+    private static DetachResult RollBack(EtabsLaunchState launch, DetachAttempt attempt, string reason)
     {
         if (attempt.TryChooseRollback())
         {
