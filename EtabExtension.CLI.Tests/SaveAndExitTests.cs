@@ -60,13 +60,19 @@ internal sealed class SaveAndExitRig
 
     public static readonly DateTimeOffset Saved = new(2026, 11, 12, 9, 0, 0, TimeSpan.Zero);
 
-    public SaveAndExitRig(TimeSpan? savingBudget = null, TimeSpan? exitBudget = null)
+    public SaveAndExitRig(
+        TimeSpan? savingBudget = null,
+        TimeSpan? exitBudget = null,
+        ISavedFileStampReader? reader = null,
+        IEtabsSession? session = null,
+        TimeSpan? exitGrace = null)
     {
         Session = new ProbeSession
         {
             Started = true,
             RecordedDocument = new EtabsDocumentRecord(Edb, FileId)
         };
+        Target = session ?? Session;
         Api = new SaveApi(Events) { CurrentPath = Edb };
         Stamps = new FixedStamps(new SavedFileStamp(FileId, 100, Saved));
 
@@ -77,18 +83,22 @@ internal sealed class SaveAndExitRig
             return 0;
         };
         Service = new SaveAndExitService(
-            Session,
+            Target,
             Watchdog,
             new FixedApiFactory(Api),
             Registry,
-            Stamps,
+            reader ?? Stamps,
             savingBudget ?? TimeSpan.FromSeconds(20),
-            exitBudget ?? TimeSpan.FromSeconds(20));
+            exitBudget ?? TimeSpan.FromSeconds(20),
+            exitGrace);
     }
 
     public List<string> Events { get; } = [];
 
     public ProbeSession Session { get; }
+
+    /// <summary>The session the service runs against: the probe, or a real one.</summary>
+    public IEtabsSession Target { get; }
 
     public ProbeWatchdog Watchdog { get; } = new();
 
@@ -216,20 +226,6 @@ public sealed class SaveAndExitDocumentTests
         var result = rig.Run().Within("the command");
 
         Assert.Contains(SaveAndExitCodes.DocumentUnverified, Error(result), StringComparison.Ordinal);
-        rig.AssertUntouched();
-    }
-
-    // The EDB was replaced on disk (a new file id). Mutation: skip the file-id comparison.
-    [Fact]
-    public void AnEdbReplacedOnDiskWithANewFileIdRefuses()
-    {
-        var rig = new SaveAndExitRig();
-        rig.Stamps.Current = new SavedFileStamp("0000abcd-0000000000009999", 100, SaveAndExitRig.Saved);
-
-        var result = rig.Run().Within("the command");
-
-        Assert.Contains(SaveAndExitCodes.DocumentUnverified, Error(result), StringComparison.Ordinal);
-        Assert.Contains("replaced", Error(result), StringComparison.Ordinal);
         rig.AssertUntouched();
     }
 
@@ -426,9 +422,14 @@ public sealed class SaveAndExitDocumentTests
     [Fact]
     public void AnExitThatNeverReturnsIsAnsweredUnconfirmedWithinItsBudgetAsSavedTrueExitedUnknown()
     {
-        var rig = new SaveAndExitRig(exitBudget: TimeSpan.FromMilliseconds(400));
+        var rig = new SaveAndExitRig(exitBudget: TimeSpan.FromMilliseconds(600));
         using var never = new ManualResetEventSlim(false);
         rig.Session.NormalShutdown = () =>
+        {
+            never.Wait(TimeSpan.FromSeconds(30));
+            return Shutdowns.Ok();
+        };
+        rig.Session.BlockedShutdown = () =>
         {
             never.Wait(TimeSpan.FromSeconds(30));
             return Shutdowns.Ok();
@@ -1424,5 +1425,373 @@ public sealed class StartupBlockerRuleTests
         public IReadOnlyList<EtabsDialogWindow> FindModalDialogs(int pid) => [];
 
         public bool TryDismiss(EtabsDialogWindow dialog) => false;
+    }
+}
+
+/// <summary>A stamp reader keyed by path, so the EDB and its .$et can differ.</summary>
+internal sealed class PathStamps : ISavedFileStampReader
+{
+    private readonly Dictionary<string, SavedFileStamp?> _map = new(StringComparer.OrdinalIgnoreCase);
+
+    public Exception? FailEdbReadsAfterSave { get; set; }
+
+    public bool Saved { get; set; }
+
+    public void Set(string path, SavedFileStamp? stamp)
+    {
+        lock (_map)
+        {
+            _map[Path.GetFullPath(path)] = stamp;
+        }
+    }
+
+    public SavedFileStamp? Read(string path)
+    {
+        if (Saved && FailEdbReadsAfterSave is not null)
+        {
+            throw FailEdbReadsAfterSave;
+        }
+
+        lock (_map)
+        {
+            return _map.GetValueOrDefault(Path.GetFullPath(path));
+        }
+    }
+}
+
+/// <summary>Live 13 Nov: ETABS replaces the EDB on every save; a changed id needs ETABS-save evidence.</summary>
+public sealed class SaveAndExitFileIdTests
+{
+    private const string NewId = "00020000-000000000000338a";
+    private const string NextId = "00020000-000000000000339e";
+    private static readonly DateTimeOffset T = SaveAndExitRig.Saved;
+
+    private static string Error(object result) =>
+        Assert.IsType<Result>(result, exactMatch: false).Error ?? string.Empty;
+
+    private static (SaveAndExitRig Rig, PathStamps Stamps) Build(double? etOffsetMs, string edbId = NewId, int saveReturn = 0)
+    {
+        var stamps = new PathStamps();
+        stamps.Set(SaveAndExitRig.Edb, new SavedFileStamp(edbId, 100, T));
+        if (etOffsetMs is { } offset)
+        {
+            stamps.Set(SaveAndExitRig.Et, new SavedFileStamp("et", 50, T.AddMilliseconds(offset)));
+        }
+
+        var rig = new SaveAndExitRig(reader: stamps);
+        rig.Api.OnSave = () =>
+        {
+            stamps.Set(SaveAndExitRig.Edb, new SavedFileStamp(NextId, 120, T.AddSeconds(30)));
+            return saveReturn;
+        };
+        return (rig, stamps);
+    }
+
+    // The EDB replaced with a matching fresh .$et is ETABS's own save: accepted, reported, refreshed.
+    // Mutation: refuse any changed file id.
+    [Fact]
+    public void ANewFileIdWithAMatchingFreshEtIsAcceptedAndReportedAndTheRecordRefreshed()
+    {
+        var (rig, _) = Build(etOffsetMs: 15);
+
+        var result = rig.Run().Within("the command");
+
+        var data = Assert.IsType<Result<SaveAndExitData>>(result).Data!;
+        Assert.True(data.FileIdChanged);
+        Assert.Equal("etabs-save", data.FileIdChangeEvidence);
+        Assert.Equal(NextId, rig.Session.RecordedWrites.Last().FileId);
+        Assert.Equal(1, rig.Api.SaveCalls);
+    }
+
+    // An external replacement does not touch the .$et. Mutation: accept without the evidence.
+    [Theory]
+    [InlineData(null)] // no .$et at all
+    [InlineData(-3600000.0)] // an old .$et
+    [InlineData(-600.0)] // just before the window
+    [InlineData(5100.0)] // just after the window
+    public void ANewFileIdWithoutEtabsSaveEvidenceRefusesNothingSavedNothingExited(double? etOffsetMs)
+    {
+        var (rig, _) = Build(etOffsetMs);
+
+        var result = rig.Run().Within("the command");
+
+        Assert.Contains(SaveAndExitCodes.DocumentUnverified, Error(result), StringComparison.Ordinal);
+        rig.AssertUntouched();
+    }
+
+    [Theory]
+    [InlineData(-400.0)]
+    [InlineData(4900.0)]
+    public void TheEvidenceWindowEdgesAreNamedAndAccepted(double etOffsetMs)
+    {
+        Assert.Equal(TimeSpan.FromMilliseconds(500), SaveAndExitService.EtEvidenceBefore);
+        Assert.Equal(TimeSpan.FromSeconds(5), SaveAndExitService.EtEvidenceAfter);
+        var (rig, _) = Build(etOffsetMs);
+
+        var result = rig.Run().Within("the command");
+
+        Assert.True(Assert.IsType<Result<SaveAndExitData>>(result).Success);
+    }
+
+    // The unchanged id needs no evidence and reports no change.
+    [Fact]
+    public void AnUnchangedFileIdNeedsNoEvidenceAndReportsNoChange()
+    {
+        var (rig, _) = Build(etOffsetMs: null, edbId: SaveAndExitRig.FileId);
+
+        var result = rig.Run().Within("the command");
+
+        var data = Assert.IsType<Result<SaveAndExitData>>(result).Data!;
+        Assert.False(data.FileIdChanged);
+        Assert.Null(data.FileIdChangeEvidence);
+    }
+
+    // A different observed path still refuses, evidence or not.
+    [Fact]
+    public void ADifferentObservedPathStillRefusesEvenWithEvidence()
+    {
+        var (rig, _) = Build(etOffsetMs: 15);
+        rig.Api.CurrentPath = @"D:\Project\.etabs-ext\main\working\other.edb";
+
+        var result = rig.Run().Within("the command");
+
+        Assert.Contains(SaveAndExitCodes.DocumentUnverified, Error(result), StringComparison.Ordinal);
+        rig.AssertUntouched();
+    }
+
+    // Never adopt a new file id after a failed save. Mutation: adopt before checking the save.
+    [Fact]
+    public void AFailedSaveDoesNotAdoptTheNewFileId()
+    {
+        var (rig, _) = Build(etOffsetMs: 15, saveReturn: 7);
+
+        var result = rig.Run().Within("the command");
+
+        Assert.Contains(SaveAndExitCodes.SaveFailed, Error(result), StringComparison.Ordinal);
+        Assert.Empty(rig.Session.RecordedWrites);
+        Assert.Equal(SaveAndExitRig.FileId, rig.Session.RecordedDocument!.FileId);
+    }
+
+    // save-model: after a CONFIRMED save of the recorded document the file id is refreshed.
+    // Mutation: no refresh.
+    [Fact]
+    public void ASuccessfulSaveModelOfTheRecordedDocumentRefreshesTheRecordedFileId()
+    {
+        var session = new ProbeSession
+        {
+            Started = true,
+            RecordedDocument = new EtabsDocumentRecord(Path.GetFullPath(SaveAndExitRig.Edb), SaveAndExitRig.FileId)
+        };
+        var dispatcher = DispatcherRig.Create(session, new ProbeWatchdog(), save: new FixedSaveModel(
+            Result.Ok(new SaveModelData
+            {
+                FilePath = SaveAndExitRig.Edb,
+                SavedStamp = new SavedStamp(NewId, 1, T, "unsupported", false)
+            })));
+
+        _ = dispatcher.DispatchAsync(
+            "save-model",
+            JsonSerializer.SerializeToElement(new { filePath = SaveAndExitRig.Edb }),
+            CancellationToken.None).Within("save-model");
+
+        Assert.Equal(NewId, Assert.Single(session.RecordedWrites).FileId);
+    }
+
+    [Fact]
+    public void AFailedOrForeignSaveModelNeverTouchesTheRecordedFileId()
+    {
+        foreach (var answer in new[]
+        {
+            Result.Fail<SaveModelData>("failed"),
+            Result.Ok(new SaveModelData
+            {
+                FilePath = @"D:\elsewhere\other.edb",
+                SavedStamp = new SavedStamp(NewId, 1, T, "unsupported", false)
+            })
+        })
+        {
+            var session = new ProbeSession
+            {
+                Started = true,
+                RecordedDocument = new EtabsDocumentRecord(Path.GetFullPath(SaveAndExitRig.Edb), SaveAndExitRig.FileId)
+            };
+            var dispatcher = DispatcherRig.Create(session, new ProbeWatchdog(), save: new FixedSaveModel(answer));
+
+            _ = dispatcher.DispatchAsync(
+                "save-model",
+                JsonSerializer.SerializeToElement(new { filePath = SaveAndExitRig.Edb }),
+                CancellationToken.None).Within("save-model");
+
+            Assert.Empty(session.RecordedWrites);
+        }
+    }
+
+    private sealed class FixedSaveModel(Result<SaveModelData> answer) : ISaveModelService
+    {
+        public Task<Result<SaveModelData>> SaveModelAsync(string filePath) => Task.FromResult(answer);
+
+        public Task<Result<SaveModelData>> SaveModelOnAppAsync(ETABSApplication app, string filePath) =>
+            Task.FromResult(answer);
+    }
+}
+
+/// <summary>Fix round 1 (Codex review of C11): containment, supervision, detach and record races.</summary>
+public sealed class SaveAndExitFixRound1Tests
+{
+    private static string Error(object result) =>
+        Assert.IsType<Result>(result, exactMatch: false).Error ?? string.Empty;
+
+    // P1: a document writer that read Ready must not restore phase:ready after a detach committed
+    // and cleared. Deterministic: pause inside the writer right after its read, run a detach, resume.
+    // Mutation: no record gate.
+    [Fact]
+    public void AStaleDocumentWriteCanNeverRestoreAnOwnedRecordAfterDetachCommitted()
+    {
+        var rig = new SessionRig();
+        _ = rig.Session.GetOrStartOwned();
+        var launch = (EtabsLaunchState)rig.Field("_launch")!;
+        using var paused = new ManualResetEventSlim(false);
+        using var resume = new ManualResetEventSlim(false);
+        launch.AfterDocumentRead = () =>
+        {
+            paused.Set();
+            resume.Signalled("the test to resume the stale writer");
+        };
+
+        var write = Kit.OnDedicatedThread(() => rig.Session.RecordOpenedDocument(
+            new EtabsDocumentRecord(Path.GetFullPath(SaveAndExitRig.Edb), SaveAndExitRig.FileId)));
+        paused.Signalled("the writer to pause after its read");
+        var detach = Kit.OnDedicatedThread(rig.Session.Detach);
+        Thread.Sleep(300);
+        resume.Set();
+        _ = write.Within("the writer");
+        var detached = detach.Within("the detach");
+
+        Assert.Equal(DetachOutcome.Detached, detached.Outcome);
+        Assert.Null(rig.L.Records.Record);
+        Assert.Equal(0, rig.L.Process.KillCount);
+    }
+
+    // The same writer arriving AFTER the detach committed (record gone) writes nothing.
+    [Fact]
+    public void ADocumentWriteAfterTheDetachWritesNothingAndRestoresNothing()
+    {
+        var rig = new SessionRig();
+        _ = rig.Session.GetOrStartOwned();
+        var launch = (EtabsLaunchState)rig.Field("_launch")!;
+        Assert.Equal(DetachOutcome.Detached, rig.Session.Detach().Outcome);
+
+        var written = launch.WriteDocumentRecord(Kit.Identity, new EtabsDocumentRecord(@"D:\m.edb", "id"));
+
+        Assert.False(written);
+        Assert.Null(rig.L.Records.Record);
+    }
+
+    // P2-2: a hung ApplicationExit is taken over by the bounded cleanup, and the STA is freed.
+    // Mutation: no supervision (the grace is never followed by the cleanup).
+    [Fact]
+    public void AHungApplicationExitIsTakenOverByTheBoundedCleanupAndTheStaIsFreed()
+    {
+        var sessionRig = new SessionRig(processExitsOnApplicationExit: false, graceful: TimeSpan.FromMilliseconds(300));
+        _ = sessionRig.Session.GetOrStartOwned();
+        Assert.True(sessionRig.Session.RecordOpenedDocument(new EtabsDocumentRecord(Path.GetFullPath(SaveAndExitRig.Edb), SaveAndExitRig.FileId)).Success);
+        sessionRig.L.Api.OnExit = () => sessionRig.L.Process.Killed.Wait(TimeSpan.FromSeconds(20));
+        var rig = new SaveAndExitRig(
+            exitBudget: TimeSpan.FromSeconds(6),
+            session: sessionRig.Session,
+            exitGrace: TimeSpan.FromMilliseconds(500));
+        Task<object>? sta = null;
+        var running = rig.Service.RunAsync(
+            SaveAndExitRig.Request(),
+            1,
+            body => sta = Kit.OnDedicatedThread(() => body().GetAwaiter().GetResult()));
+
+        var answer = running.Within("the supervised exit", TimeSpan.FromSeconds(20));
+
+        Assert.Equal(1, sessionRig.L.Process.KillCount);
+        Assert.NotNull(sta);
+        _ = sta!.Within("the STA body to be freed by the kill");
+        Assert.True(Assert.IsAssignableFrom<Result>(answer).Success
+            || Error(answer).Contains(SaveAndExitCodes.ExitUnconfirmed, StringComparison.Ordinal));
+    }
+
+    // P2-3: a detach that wins between the exit CAS and the termination is reported as the
+    // detach, never as exited:true. Mutation: exited:true on any successful shutdown answer.
+    [Fact]
+    public void ADetachBetweenTheExitCasAndTheTerminationIsNotReportedAsExited()
+    {
+        var sessionRig = new SessionRig();
+        _ = sessionRig.Session.GetOrStartOwned();
+        Assert.True(sessionRig.Session.RecordOpenedDocument(new EtabsDocumentRecord(Path.GetFullPath(SaveAndExitRig.Edb), SaveAndExitRig.FileId)).Success);
+        var rig = new SaveAndExitRig(session: sessionRig.Session);
+        rig.Service.AfterExitCasBeforeShutdown = () =>
+            Assert.Equal(DetachOutcome.Detached, sessionRig.Session.Detach().Outcome);
+
+        var answer = rig.Run().Within("the command");
+
+        var error = Error(answer);
+        Assert.Contains(SaveAndExitCodes.Detached, error, StringComparison.Ordinal);
+        Assert.Contains("\"saved\":true", error, StringComparison.Ordinal);
+        Assert.Contains("\"exited\":false", error, StringComparison.Ordinal);
+        Assert.Equal(0, sessionRig.L.Api.ExitCount);
+        Assert.Equal(0, sessionRig.L.Process.KillCount);
+    }
+
+    // P2-3: a successful shutdown answer WITHOUT a confirmed process exit is unknown.
+    [Fact]
+    public void ASuccessfulShutdownAnswerWithoutAConfirmedExitIsUnknownNotExited()
+    {
+        var rig = new SaveAndExitRig();
+        rig.Session.NormalShutdown = () =>
+        {
+            var ok = Shutdowns.Ok();
+            return ok with { Data = ok.Data with { ProcessExitConfirmed = false } };
+        };
+
+        var answer = rig.Run().Within("the command");
+
+        Assert.Contains("\"exited\":\"unknown\"", Error(answer), StringComparison.Ordinal);
+    }
+
+    // P2-4: a post-save stamp read that throws is Unknown: no exit, typed, and the operation left Saving.
+    // Mutation: the read is not contained.
+    [Fact]
+    public void APostSaveStampReadFailureIsUnknownNoExitAndTheOperationLeavesSaving()
+    {
+        var stamps = new PathStamps();
+        stamps.Set(SaveAndExitRig.Edb, new SavedFileStamp(SaveAndExitRig.FileId, 100, SaveAndExitRig.Saved));
+        var rig = new SaveAndExitRig(reader: stamps);
+        rig.Api.OnSave = () =>
+        {
+            stamps.Saved = true;
+            stamps.FailEdbReadsAfterSave = new IOException("disk gone");
+            return 0;
+        };
+
+        var answer = rig.Run().Within("the command");
+
+        var error = Error(answer);
+        Assert.Contains(SaveAndExitCodes.SaveUnknown, error, StringComparison.Ordinal);
+        Assert.Contains("\"saved\":\"unknown\"", error, StringComparison.Ordinal);
+        Assert.Contains("\"exited\":false", error, StringComparison.Ordinal);
+        rig.AssertNeverExited();
+        Assert.False(rig.Registry.Begin(2) is null, "the operation left Saving");
+    }
+
+    // P2-4: a Shutdown() that throws after the exit was initiated is {saved:true, exited:"unknown"}.
+    // Mutation: the throw escapes.
+    [Fact]
+    public void AShutdownThatThrowsAfterTheExitWasInitiatedIsSavedTrueExitedUnknown()
+    {
+        var rig = new SaveAndExitRig();
+        rig.Session.NormalShutdown = () => throw new InvalidOperationException("COM exploded");
+
+        var answer = rig.Run().Within("the command");
+
+        var error = Error(answer);
+        Assert.Contains(SaveAndExitCodes.ExitUnconfirmed, error, StringComparison.Ordinal);
+        Assert.Contains("\"saved\":true", error, StringComparison.Ordinal);
+        Assert.Contains("\"exited\":\"unknown\"", error, StringComparison.Ordinal);
+        Assert.False(rig.Registry.Begin(2) is null, "the operation ended");
     }
 }

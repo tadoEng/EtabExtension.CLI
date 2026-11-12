@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Features.SaveModel;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
@@ -35,6 +36,12 @@ public static class SaveAndExitCodes
 
     /// <summary>The file was saved and the exit was initiated, but it could not be confirmed.</summary>
     public const string ExitUnconfirmed = "ETABS_SAVE_AND_EXIT_EXIT_UNCONFIRMED";
+
+    /// <summary>
+    /// The file was saved, but a detach won the instance before the exit was carried out: ETABS
+    /// is the user's now and was NOT exited by this command.
+    /// </summary>
+    public const string Detached = "ETABS_SAVE_AND_EXIT_DETACHED";
 }
 
 /// <summary>The lifecycle of one <c>save-and-exit</c> (card v2.5a A4).</summary>
@@ -102,6 +109,12 @@ public sealed class SaveAndExitOperation(long requestId)
 
         return won;
     }
+
+    /// <summary>The saved file's identity, set before the exit CAS (what the exit answer reports).</summary>
+    public EtabsDocumentRecord? SavedDocument { get; set; }
+
+    /// <summary>True when the file id on disk differed from the record at verification (a user save replaced it).</summary>
+    public bool FileIdChanged { get; set; }
 
     public bool TryRefuse() => Move(SaveAndExitState.Saving, SaveAndExitState.Refused);
 
@@ -185,6 +198,18 @@ public sealed record SaveAndExitData(
     [property: JsonPropertyName("document")] EtabsDocumentRecord? Document,
     [property: JsonPropertyName("shutdown")] ManagedEtabsShutdownData? Shutdown)
 {
+    /// <summary>
+    /// True when the EDB file id differed from the recorded one at verification. ETABS replaces
+    /// the file on every save (live, 13 Nov), so this is normal after a save by the user.
+    /// </summary>
+    [JsonPropertyName("fileIdChanged")]
+    public bool FileIdChanged { get; init; }
+
+    /// <summary>Why a changed file id was accepted: <c>etabs-save</c> (the sibling .$et was written with the EDB), else null.</summary>
+    [JsonPropertyName("fileIdChangeEvidence")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? FileIdChangeEvidence { get; init; }
+
     /// <summary>The approved residual wording (card v2.5a A2), for the host to show as it is.</summary>
     [JsonPropertyName("residual")]
     public string Residual { get; init; } = SaveAndExitService.ResidualDisclosure;
@@ -225,6 +250,19 @@ public sealed class SaveAndExitService
     public const string ResidualDisclosure =
         "Edits not included in the saved state, accepted before closing takes effect, may be lost.";
 
+    /// <summary>The evidence name reported when a changed file id was accepted.</summary>
+    public const string EtabsSaveEvidence = "etabs-save";
+
+    /// <summary>
+    /// ETABS-save evidence window (live 13 Nov: every ETABS Save writes the .$et about 10-15 ms
+    /// AFTER the EDB; an external replacement does not touch it): the sibling .$et last-write
+    /// time must be at least this long BEFORE the EDB last-write time...
+    /// </summary>
+    public static readonly TimeSpan EtEvidenceBefore = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>...and at most this long AFTER it.</summary>
+    public static readonly TimeSpan EtEvidenceAfter = TimeSpan.FromSeconds(5);
+
     /// <summary>The STA lock wait (queueing behind earlier work), part of the 331 s policy.</summary>
     public static readonly TimeSpan LockWait = TimeSpan.FromSeconds(2);
 
@@ -253,6 +291,7 @@ public sealed class SaveAndExitService
     private readonly ISavedFileStampReader _stamps;
     private readonly TimeSpan _savingBudget;
     private readonly TimeSpan _exitBudget;
+    private readonly TimeSpan _exitGrace;
 
     public SaveAndExitService(
         IEtabsSession session,
@@ -271,7 +310,8 @@ public sealed class SaveAndExitService
         SaveAndExitRegistry registry,
         ISavedFileStampReader? stamps,
         TimeSpan? savingBudget,
-        TimeSpan? exitBudget)
+        TimeSpan? exitBudget,
+        TimeSpan? exitGrace = null)
     {
         _session = session;
         _watchdog = watchdog;
@@ -280,10 +320,20 @@ public sealed class SaveAndExitService
         _stamps = stamps ?? new DiskSavedFileStampReader();
         _savingBudget = savingBudget ?? DefaultSavingBudget;
         _exitBudget = exitBudget ?? DefaultExitBudget;
+
+        // The ordinary exit keeps its graceful interval (10 s, as in C7a); then the bounded
+        // cleanup takes the rest of the budget. A shortened test budget scales the grace.
+        _exitGrace = exitGrace
+            ?? (_exitBudget == DefaultExitBudget
+                ? ManagedEtabsShutdownMachine.GracefulExitTimeout
+                : TimeSpan.FromTicks(_exitBudget.Ticks / 2));
     }
 
     /// <summary>Test seam: runs on the STA right at the start of the body.</summary>
     internal Action? BeforeCheck { get; set; }
+
+    /// <summary>Test seam: runs on the STA right after the exit CAS was won, before the session is asked to exit.</summary>
+    internal Action? AfterExitCasBeforeShutdown { get; set; }
 
     /// <summary>Test seam: runs on the STA after the save returned and before the exit CAS.</summary>
     internal Action? AfterSaveBeforeExitCas { get; set; }
@@ -346,17 +396,108 @@ public sealed class SaveAndExitService
             }
         }
 
-        // Exiting was won (or the body is finishing a refusal): wait for it, but only within the
-        // exit's own bound, never for ever.
-        if (await Task.WhenAny(body, Task.Delay(_exitBudget)).ConfigureAwait(false) == body)
+        return await SuperviseExitAsync(operation, body).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A won exit is SUPERVISED like C7a (review P2-2): the ordinary exit on the STA keeps its
+    /// graceful interval; past it the bounded cleanup (the session blocked sequence, on its own
+    /// STA thread, which respects a detach and the Suppressed state) takes over, so a hung
+    /// ApplicationExit neither holds the STA nor the licence. The whole exit is answered
+    /// within <see cref="DefaultExitBudget"/>.
+    /// </summary>
+    private async Task<object> SuperviseExitAsync(SaveAndExitOperation operation, Task<object> body)
+    {
+        if (await Task.WhenAny(body, Task.Delay(_exitGrace)).ConfigureAwait(false) == body)
         {
             return await body.ConfigureAwait(false);
         }
 
-        // The exit was INITIATED and may even have completed: only its confirmation is unknown.
-        return UnconfirmedExit(
-            $"The exit did not return within {_exitBudget.TotalSeconds:0.###}s; its outcome is unconfirmed. " +
-            "Observe the instance; an explicit shutdown may now end it.");
+        _ = body.ContinueWith(
+            static task => _ = task.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted,
+            TaskScheduler.Default);
+        Console.Error.WriteLine(
+            "⚠ The ordinary ETABS exit did not return within its grace; taking the bounded cleanup.");
+        var completion = new TaskCompletionSource<ManagedEtabsShutdownResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                completion.TrySetResult(_session.ShutdownWhileWorkerBlocked());
+            }
+#pragma warning disable CA1031 // surfaced to the supervisor through the completion
+            catch (Exception exception)
+#pragma warning restore CA1031
+            {
+                completion.TrySetException(exception);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "etab-cli-save-and-exit-cleanup"
+        };
+        if (OperatingSystem.IsWindows())
+        {
+            thread.SetApartmentState(ApartmentState.STA);
+        }
+
+        thread.Start();
+        var remaining = _exitBudget - _exitGrace;
+        try
+        {
+            var terminal = await completion.Task
+                .WaitAsync(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero)
+                .ConfigureAwait(false);
+            return ExitAnswer(operation, terminal);
+        }
+#pragma warning disable CA1031 // a failing cleanup is an unconfirmed exit, never a thrown answer
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            // The exit was INITIATED and may even have completed: only its confirmation is unknown.
+            return UnconfirmedExit(
+                $"The exit did not return within {_exitBudget.TotalSeconds:0.###}s; its outcome is unconfirmed. " +
+                "Observe the instance; an explicit shutdown may now end it.");
+        }
+    }
+
+    /// <summary>
+    /// exited:true ONLY for a confirmed process exit (review P2-3). A detach that won the
+    /// instance between the exit CAS and the termination is reported as the detach it is; anything
+    /// else is unknown.
+    /// </summary>
+    private static object ExitAnswer(SaveAndExitOperation operation, ManagedEtabsShutdownResult terminal)
+    {
+        var shutdown = ServeShutdownWire.ToResult(terminal);
+        if (shutdown.Success && shutdown.Data is { ProcessExitConfirmed: true })
+        {
+            return Result.Ok(new SaveAndExitData(
+                "ended",
+                Saved: true,
+                Exited: true,
+                operation.SavedDocument,
+                shutdown.Data)
+            {
+                FileIdChanged = operation.FileIdChanged,
+                FileIdChangeEvidence = operation.FileIdChanged ? EtabsSaveEvidence : null
+            });
+        }
+
+        if (shutdown.Success && shutdown.Data is { Disposition: EtabsDisposition.Detached })
+        {
+            return Fail(
+                SaveAndExitCodes.Detached,
+                "The file was saved, but the instance was handed to the user by a detach before the exit " +
+                "ran; ETABS was not exited by this command.",
+                "exiting",
+                saved: true,
+                exited: false);
+        }
+
+        return UnconfirmedExit(shutdown.Error ?? "The exit could not be confirmed.");
     }
 
     private object Run(SaveAndExitOperation operation, SaveAndExitRequest request)
@@ -403,7 +544,7 @@ public sealed class SaveAndExitService
             return Unverified(operation, $"the open document could not be read: {EtabsApiDiagnosticFormatter.Bounded(exception.Message)}");
         }
 
-        var unverified = VerifyDocument(request, recorded, observed, out var destination, out var before);
+        var unverified = VerifyDocument(request, recorded, observed, out var destination, out var before, out var fileIdChanged);
         if (unverified is not null)
         {
             return Unverified(operation, unverified);
@@ -445,7 +586,25 @@ public sealed class SaveAndExitService
                 new { stage = "saving", saved = false, exited = false, returnCode });
         }
 
-        var after = _stamps.Read(destination);
+        SavedFileStamp? after;
+        try
+        {
+            after = _stamps.Read(destination);
+        }
+#pragma warning disable CA1031 // an unreadable file after the save leaves its outcome unknown: never an exit
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            return operation.TryMarkUnknown()
+                ? Fail(
+                    SaveAndExitCodes.SaveUnknown,
+                    "The saved file could not be read back, so the save is not confirmed; ETABS was not exited. " +
+                    EtabsApiDiagnosticFormatter.Bounded(exception.Message),
+                    "saving",
+                    saved: "unknown")
+                : AbandonedAnswer();
+        }
+
         if (after is null || (before is not null && before.Size == after.Size && before.MtimeUtc == after.MtimeUtc))
         {
             return Refuse(
@@ -456,6 +615,23 @@ public sealed class SaveAndExitService
                 new { stage = "saving", saved = false, exited = false });
         }
 
+        // ETABS replaces the EDB on every save, so its file id is new: keep the record current
+        // (live, 13 Nov). Best effort: the record is about to be retired by the exit, and a stale
+        // id is accepted at the next verification anyway (the path is the identity).
+        var saved = new EtabsDocumentRecord(destination, after.FileId);
+        try
+        {
+            _ = _session.RecordOpenedDocument(saved);
+        }
+#pragma warning disable CA1031 // the exit does not depend on refreshing a record it is about to end
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            Console.Error.WriteLine($"⚠ The saved document could not be re-recorded: {exception.Message}");
+        }
+
+        operation.SavedDocument = saved;
+        operation.FileIdChanged = fileIdChanged;
         AfterSaveBeforeExitCas?.Invoke();
 
         // THE irreversible boundary. A cancel, a detach, EOF suppression, a shutdown or the
@@ -469,22 +645,22 @@ public sealed class SaveAndExitService
         ManagedEtabsShutdownResult terminal;
         try
         {
+            AfterExitCasBeforeShutdown?.Invoke();
             terminal = _session.Shutdown();
+        }
+#pragma warning disable CA1031 // the exit was initiated: a throw is an unconfirmed exit, never a lost answer
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            return UnconfirmedExit(
+                "The exit was initiated but faulted: " + EtabsApiDiagnosticFormatter.Bounded(exception.Message));
         }
         finally
         {
             operation.MarkEnded();
         }
 
-        var shutdown = ServeShutdownWire.ToResult(terminal);
-        return shutdown.Success
-            ? Result.Ok(new SaveAndExitData(
-                "ended",
-                Saved: true,
-                Exited: true,
-                new EtabsDocumentRecord(destination, after.FileId),
-                shutdown.Data))
-            : UnconfirmedExit(shutdown.Error ?? "The exit could not be confirmed.");
+        return ExitAnswer(operation, terminal);
     }
 
     /// <summary>
@@ -497,10 +673,12 @@ public sealed class SaveAndExitService
         EtabsDocumentRecord? recorded,
         string? observedFilename,
         out string destination,
-        out SavedFileStamp? before)
+        out SavedFileStamp? before,
+        out bool fileIdChanged)
     {
         destination = string.Empty;
         before = null;
+        fileIdChanged = false;
         if (recorded is null || string.IsNullOrWhiteSpace(recorded.Path))
         {
             return "no opened document is recorded for this instance";
@@ -586,9 +764,36 @@ public sealed class SaveAndExitService
             return "the recorded file is gone";
         }
 
-        if (!string.Equals(onDisk.FileId, recorded.FileId, StringComparison.Ordinal))
+        // ETABS replaces the EDB on every save (live, 13 Nov), so a new file id is normal after
+        // the user's own Ctrl+S - but an EXTERNAL replacement looks the same. A changed id is
+        // accepted ONLY with ETABS-save evidence: the same-stem .$et beside the EDB was written
+        // within [EDB - EtEvidenceBefore, EDB + EtEvidenceAfter]. An unreadable id refuses.
+        if (string.IsNullOrEmpty(onDisk.FileId))
         {
-            return "the recorded file was replaced or moved (its file id changed)";
+            return "the recorded file's identity could not be read";
+        }
+
+        fileIdChanged = !string.Equals(onDisk.FileId, recorded.FileId, StringComparison.Ordinal);
+        if (fileIdChanged)
+        {
+            SavedFileStamp? et;
+            try
+            {
+                et = _stamps.Read(Path.ChangeExtension(recordedFull, ".$et"));
+            }
+#pragma warning disable CA1031 // unreadable evidence is no evidence
+            catch (Exception)
+#pragma warning restore CA1031
+            {
+                et = null;
+            }
+
+            if (et is null
+                || et.MtimeUtc < onDisk.MtimeUtc - EtEvidenceBefore
+                || et.MtimeUtc > onDisk.MtimeUtc + EtEvidenceAfter)
+            {
+                return "the recorded file was replaced or moved (its file id changed) without ETABS-save evidence";
+            }
         }
 
         destination = recordedFull;

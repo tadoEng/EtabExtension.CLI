@@ -524,8 +524,45 @@ public sealed class ServeDispatcher : IServeDispatcher
         // An ordinary request: its answer is written when the save returns, and NOTHING is
         // chained to that answer. A reply that lands after the host stopped waiting is dropped
         // by the host and can never cause an exit (card v2.3 §2, I13').
-        return await ExecuteWatchedComAsync(async () => await _save.SaveModelOnAppAsync(
-            _session.GetOrStart(), req.FilePath, req.ExpectedDocument?.FileId));
+        return await ExecuteWatchedComAsync(async () => RecordSavedDocument(await _save.SaveModelOnAppAsync(
+            _session.GetOrStart(), req.FilePath, req.ExpectedDocument?.FileId)));
+    }
+
+    /// <summary>
+    /// ETABS replaces the EDB on every save, so its file id changes (live, 13 Nov): after a
+    /// successful daemon save of the RECORDED document, the record's file id is refreshed. A
+    /// failed refresh never fails the save: the next save-and-exit accepts a changed id anyway.
+    /// </summary>
+    private Result<SaveModelData> RecordSavedDocument(Result<SaveModelData> saved)
+    {
+        if (!saved.Success || saved.Data?.SavedStamp?.FileId is not { } fileId)
+        {
+            return saved;
+        }
+
+        try
+        {
+            if (_session.ReadRecordedDocument() is { } recorded
+                && string.Equals(
+                    Path.GetFullPath(recorded.Path),
+                    Path.GetFullPath(saved.Data.FilePath),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                var refreshed = _session.RecordOpenedDocument(recorded with { FileId = fileId });
+                if (!refreshed.Success)
+                {
+                    Console.Error.WriteLine($"⚠ The saved document's file id could not be re-recorded: {refreshed.Error}");
+                }
+            }
+        }
+#pragma warning disable CA1031 // refreshing the record never fails a save that already happened
+        catch (Exception exception)
+#pragma warning restore CA1031
+        {
+            Console.Error.WriteLine($"⚠ The saved document's file id could not be re-recorded: {exception.Message}");
+        }
+
+        return saved;
     }
 
     /// <summary>
