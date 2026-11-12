@@ -148,11 +148,12 @@ public sealed class ModalDialogAndVersionTests
     }
 
     /// <summary>
-    /// P3-4(a): a fault in the window source itself must never fault the watch or fail the
-    /// command it guards. The work's own result passes through untouched.
+    /// Card W3 (replaces P3-4(a)'s "pass through"): a fault in the window source never faults
+    /// the watch, but it is not "nothing found" either. The command is failed typed and
+    /// retryable - success is never answered over a scan that could not be taken.
     /// </summary>
     [Fact]
-    public async Task AThrowingWindowSourceLetsTheWorkResultPassThrough()
+    public async Task InconclusiveScanNeverAnswersSuccess()
     {
         var windows = new FakeDialogs { ThrowOnFind = true };
         var expected = Result.Ok();
@@ -166,8 +167,69 @@ public sealed class ModalDialogAndVersionTests
             },
             TestContext.Current.CancellationToken);
 
-        Assert.Same(expected, result);
+        var failure = Assert.IsType<Result>(result);
+        Assert.False(failure.Success);
+        Assert.NotSame(expected, result);
+        Assert.StartsWith(
+            $"[{EtabsTypedFailureCodes.DialogScanInconclusive}]",
+            failure.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("detail={\"reason\":", failure.Error, StringComparison.Ordinal);
         Assert.NotEmpty(windows.ScannedPids);
+    }
+
+    /// <summary>A scan that hangs is bounded by the scan timeout and is inconclusive too.</summary>
+    [Fact]
+    public async Task AScanThatNeverReturnsIsInconclusiveWithinTheScanTimeout()
+    {
+        using var release = new ManualResetEventSlim(false);
+        var windows = new FakeDialogs { BlockOnFind = release };
+        var watchdog = new EtabsModalDialogWatchdog(
+            windows,
+            TimeSpan.FromMilliseconds(10),
+            TimeSpan.FromMilliseconds(10),
+            TimeSpan.FromMilliseconds(100));
+
+        try
+        {
+            var guarded = watchdog.GuardAsync(
+                () => 4242,
+                async () =>
+                {
+                    await Task.Delay(30);
+                    return Result.Ok();
+                },
+                TestContext.Current.CancellationToken);
+            var result = await guarded.WaitAsync(Kit.TestDeadline);
+
+            Assert.False(Assert.IsType<Result>(result).Success);
+            Assert.Contains(
+                EtabsTypedFailureCodes.DialogScanInconclusive,
+                ((Result)result).Error!,
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            release.Set();
+        }
+    }
+
+    /// <summary>The scan being clean on the final look still answers the work's result.</summary>
+    [Fact]
+    public async Task ACleanFinalScanStillPassesTheWorkResultThrough()
+    {
+        var expected = Result.Ok();
+
+        var result = await Watchdog(new FakeDialogs()).GuardAsync(
+            () => 4242,
+            async () =>
+            {
+                await Task.Delay(30);
+                return expected;
+            },
+            TestContext.Current.CancellationToken);
+
+        Assert.Same(expected, result);
     }
 
     /// <summary>
@@ -321,6 +383,7 @@ public sealed class ModalDialogAndVersionTests
         public Action? OnDismiss { get; init; }
         public bool ThrowOnFind { get; init; }
         public bool ThrowOnDismiss { get; init; }
+        public ManualResetEventSlim? BlockOnFind { get; init; }
 
         /// <summary>False models a dismiss that did not take: the window is still there.</summary>
         public bool DismissResult { get; init; } = true;
@@ -340,6 +403,7 @@ public sealed class ModalDialogAndVersionTests
 
         public IReadOnlyList<EtabsDialogWindow> FindModalDialogs(int pid)
         {
+            BlockOnFind?.Wait(TimeSpan.FromSeconds(30));
             lock (_gate)
             {
                 _scanned.Add(pid);

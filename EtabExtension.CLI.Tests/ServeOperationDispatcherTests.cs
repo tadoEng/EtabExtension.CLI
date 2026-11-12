@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Channels;
@@ -1432,7 +1432,9 @@ esults"
         IEtabsModalDialogWatchdog? watchdog = null,
         IEtabsInstalledVersion? installedVersion = null,
         ManagedEtabsStartIntent declaredIntent = ManagedEtabsStartIntent.VisibleByConsent) => new(
-            session ?? null!,
+            // A real double, not null: the watchdog reads the pid from it, and a fault in that
+            // read is now an INCONCLUSIVE scan (card W3) rather than silently "nothing found".
+            session ?? new FakeSession(),
             null!,
             open ?? null!,
             snapshot ?? null!,

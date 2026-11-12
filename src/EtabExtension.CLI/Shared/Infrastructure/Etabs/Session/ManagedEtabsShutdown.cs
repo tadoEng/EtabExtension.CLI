@@ -46,26 +46,58 @@ public interface IManagedEtabsShutdownMachine
     /// is then killed through its authoritative handle.
     /// </summary>
     ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(IManagedEtabsApplication owned);
+
+    /// <summary>
+    /// <see cref="ShutdownWhileWorkerBlocked(IManagedEtabsApplication)"/> held to ONE shared
+    /// deadline: the graceful and forced waits are capped by what is left of
+    /// <paramref name="budget"/>, never added on top of the phases that came before it.
+    /// </summary>
+    ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(
+        IManagedEtabsApplication owned,
+        TimeSpan budget);
 }
 
 public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
 {
+    /// <summary>
+    /// The normal path always asks ETABS to exit (<c>ApplicationExit(false)</c>) and waits
+    /// this long BEFORE any kill: a killed ETABS may not release its licence seat. The Rust
+    /// client's 20 s <c>CLI_SHUTDOWN_ENVELOPE</c> assumes this value.
+    /// </summary>
     public static readonly TimeSpan GracefulExitTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// The graceful bound when the worker is stuck behind a dialog (card I5): the exit
+    /// request is made on a dedicated STA thread and abandoned after this long, because an
+    /// ETABS in a modal loop may never answer it. Keeps the blocked worst case at 22 s.
+    /// </summary>
+    public static readonly TimeSpan BlockedGracefulExitTimeout = TimeSpan.FromSeconds(5);
+
     public static readonly TimeSpan ForcedExitTimeout = TimeSpan.FromSeconds(10);
 
     private readonly ISessionRecordStore _records;
     private readonly TimeSpan _gracefulExitTimeout;
+    private readonly TimeSpan _blockedGracefulExitTimeout;
 
     public ManagedEtabsShutdownMachine(ISessionRecordStore records)
-        : this(records, GracefulExitTimeout)
+        : this(records, GracefulExitTimeout, BlockedGracefulExitTimeout)
     {
     }
 
-    /// <summary>Tests shorten the graceful bound; production always uses the default.</summary>
+    /// <summary>Tests shorten the graceful bound; production always uses the defaults.</summary>
     internal ManagedEtabsShutdownMachine(ISessionRecordStore records, TimeSpan gracefulExitTimeout)
+        : this(records, gracefulExitTimeout, BlockedGracefulExitTimeout)
+    {
+    }
+
+    internal ManagedEtabsShutdownMachine(
+        ISessionRecordStore records,
+        TimeSpan gracefulExitTimeout,
+        TimeSpan blockedGracefulExitTimeout)
     {
         _records = records;
         _gracefulExitTimeout = gracefulExitTimeout;
+        _blockedGracefulExitTimeout = blockedGracefulExitTimeout;
     }
 
     public ManagedEtabsShutdownResult Shutdown(IManagedEtabsApplication owned)
@@ -78,12 +110,30 @@ public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
     public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(IManagedEtabsApplication owned)
         => ShutdownCore(owned, ShutdownAuthority.RequireMatchingRecoveryRecord, ExitAttempt.BoundedOnDedicatedSta);
 
+    public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(
+        IManagedEtabsApplication owned,
+        TimeSpan budget)
+        => ShutdownCore(
+            owned,
+            ShutdownAuthority.RequireMatchingRecoveryRecord,
+            ExitAttempt.BoundedOnDedicatedSta,
+            budget);
+
     private ManagedEtabsShutdownResult ShutdownCore(
         IManagedEtabsApplication owned,
         ShutdownAuthority authority,
-        ExitAttempt exitAttempt)
+        ExitAttempt exitAttempt,
+        TimeSpan? budget = null)
     {
         ArgumentNullException.ThrowIfNull(owned);
+        var budgetClock = System.Diagnostics.Stopwatch.StartNew();
+
+        // One shared deadline: a phase gets at most what is left of the budget.
+        TimeSpan Cap(TimeSpan phase) => budget is null
+            ? phase
+            : TimeSpan.FromTicks(Math.Min(
+                phase.Ticks,
+                Math.Max(0, (budget.Value - budgetClock.Elapsed).Ticks)));
 
         // Deterministic, unconditional, and first. Every route into shutdown — graceful,
         // forced, identity-mismatched, or a session that had already exited — retires the
@@ -131,14 +181,14 @@ public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
         if (exitAttempt == ExitAttempt.BoundedOnDedicatedSta)
         {
             var started = System.Diagnostics.Stopwatch.StartNew();
-            var attempt = AttemptExitOnDedicatedSta(owned, _gracefulExitTimeout);
+            var attempt = AttemptExitOnDedicatedSta(owned, Cap(_blockedGracefulExitTimeout));
             if (attempt.Returned && attempt.Failure is null)
             {
                 applicationExitReturnCode = attempt.ReturnCode;
                 applicationExitError = applicationExitReturnCode is { } code and not 0
                     ? EtabsApiDiagnosticFormatter.ApiReturn("cOAPI.ApplicationExit(false)", code)
                     : null;
-                var remaining = _gracefulExitTimeout - started.Elapsed;
+                var remaining = Cap(_blockedGracefulExitTimeout) - started.Elapsed;
                 gracefulWait = remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
             }
             else if (attempt.Failure is not null)
@@ -160,7 +210,7 @@ public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
                 // exactly as it does when an answered exit does not end the process in time.
                 Console.Error.WriteLine(
                     "⚠ cOAPI.ApplicationExit(false) did not return within " +
-                    $"{_gracefulExitTimeout.TotalSeconds:0.###}s while the session was blocked; " +
+                    $"{_blockedGracefulExitTimeout.TotalSeconds:0.###}s while the session was blocked; " +
                     $"killing the exact owned ETABS (PID {owned.Identity.Pid}).");
                 // The graceful bound is already spent on the unanswered request.
                 gracefulWait = null;
@@ -203,7 +253,7 @@ public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
                     exception);
             }
 
-            processExitConfirmed = TryWait(owned, ForcedExitTimeout);
+            processExitConfirmed = TryWait(owned, Cap(ForcedExitTimeout));
         }
 
         if (!processExitConfirmed)

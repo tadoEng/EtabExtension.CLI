@@ -50,6 +50,27 @@ public static class EtabsLaunchErrorCodes
     /// </summary>
     public const string WindowSuppressionUnavailable = "ETABS_WINDOW_SUPPRESSION_UNAVAILABLE";
     public const string RecoveryRecordWriteFailed = "ETABS_RECOVERY_RECORD_WRITE_FAILED";
+
+    /// <summary><c>Process.Start</c> produced no process.</summary>
+    public const string ProcessStartFailed = "ETABS_PROCESS_START_FAILED";
+
+    /// <summary>
+    /// The 60 s <c>StartupDeadline</c> expired before the session was committed (card W2).
+    /// Retryable. Our own handle was killed; no pid was guessed.
+    /// </summary>
+    public const string StartTimeout = "ETABS_START_TIMEOUT";
+
+    /// <summary>
+    /// A visible top-level window other than the main window (for example the licence
+    /// sign-in) is holding the startup (card Z2). Typed with <c>{title, class, dismissed}</c>.
+    /// </summary>
+    public const string StartBlocked = "ETABS_START_BLOCKED";
+
+    /// <summary>A shutdown took the launch before it could commit.</summary>
+    public const string LaunchAborted = "ETABS_LAUNCH_ABORTED";
+
+    /// <summary>A launch failed with an untyped exception.</summary>
+    public const string LaunchFailed = "ETABS_LAUNCH_FAILED";
 }
 
 public sealed class EtabsLaunchException : InvalidOperationException
@@ -254,12 +275,9 @@ public sealed class WindowsEtabsInstallDiscovery : IEtabsInstallDiscovery
     private sealed record RegistryCandidate(string Path, Version Version);
 }
 
-public interface IOwnedEtabsProcess : IDisposable
+public interface IOwnedEtabsProcess : IProcessHandle
 {
     ManagedProcessIdentity Identity { get; }
-    bool HasExited { get; }
-    void Kill();
-    bool WaitForExit(TimeSpan timeout);
 }
 
 /// <summary>
@@ -280,9 +298,6 @@ public interface IOwnedEtabsProcess : IDisposable
 /// </summary>
 public interface IEtabsRawApi : IEtabsVisibilityApi
 {
-    /// <summary>Raw <c>cOAPI.ApplicationStart()</c>. Zero means started.</summary>
-    int ApplicationStart();
-
     /// <summary>Raw <c>cHelper.GetOAPIVersionNumber()</c>, used only as wrap metadata.</summary>
     double GetOapiVersionNumber();
 
@@ -314,10 +329,12 @@ public interface IEtabsRawApi : IEtabsVisibilityApi
 public interface IEtabsRawApiFactory
 {
     /// <summary>
-    /// Raw <c>cHelper.CreateObject(executablePath)</c>, which starts that program. A
-    /// null return is the documented failure mode and becomes a typed launch failure.
+    /// Raw <c>cHelper.GetObjectProcess("CSI.ETABS.API.ETABSObject", pid)</c>: attaches to
+    /// the instance WE started, by the pid of the handle we hold. Null while the instance is
+    /// not attachable yet. Never starts a process, and never calls <c>ApplicationStart</c>
+    /// (the L5 live run proved the attached object is already started).
     /// </summary>
-    IEtabsRawApi CreateFromExecutable(string executablePath);
+    IEtabsRawApi? TryAttach(int pid);
 }
 
 /// <summary>Reads ETABS version metadata from the executable — no COM, no model.</summary>
@@ -339,36 +356,20 @@ public sealed class FileEtabsVersionProbe : IEtabsVersionProbe
 
 public sealed class EtabsRawApiFactory : IEtabsRawApiFactory
 {
-    public IEtabsRawApi CreateFromExecutable(string executablePath)
-    {
-        cOAPI api;
-        cHelper helper = new Helper();
-        try
-        {
-            api = helper.CreateObject(executablePath);
-        }
-        catch (Exception ex)
-        {
-            throw new EtabsLaunchException(
-                EtabsLaunchErrorCodes.ApiObjectCreationFailed,
-                EtabsApiDiagnosticFormatter.Exception("cHelper.CreateObject", ex),
-                ex);
-        }
+    /// <summary>The ProgID documented for ETABS 23.3 attach-by-pid.</summary>
+    public const string ProgId = "CSI.ETABS.API.ETABSObject";
 
-        // Documented failure mode: "An instance of cOAPI if successful, nothing otherwise."
-        return api is null
-            ? throw new EtabsLaunchException(
-                EtabsLaunchErrorCodes.ApiObjectCreationFailed,
-                $"cHelper.CreateObject returned no API object for '{executablePath}'.")
-            : new EtabsRawApi(api, helper);
+    public IEtabsRawApi? TryAttach(int pid)
+    {
+        cHelper helper = new Helper();
+        var api = helper.GetObjectProcess(ProgId, pid);
+        return api is null ? null : new EtabsRawApi(api, helper);
     }
 }
 
 public sealed class EtabsRawApi(cOAPI api, cHelper helper) : IEtabsRawApi
 {
     private ETABSApplication? _wrapper;
-
-    public int ApplicationStart() => api.ApplicationStart();
 
     /// <summary>
     /// Raw <c>cOAPI.Visible()</c> — the CSI read, not a cached flag of our own. Cardex:
@@ -518,14 +519,25 @@ public sealed class ManagedEtabsApplication(
     IEtabsRawApi rawApi,
     ManagedProcessIdentity identity,
     Guid launchRecordId,
-    IOwnedEtabsProcess ownedProcess,
+    HandleLease lease,
     IManagedEtabsWindowGuard windowGuard,
     ManagedEtabsApiVersion version) : IManagedEtabsApplication
 {
+    public ManagedEtabsApplication(
+        IEtabsRawApi rawApi,
+        ManagedProcessIdentity identity,
+        Guid launchRecordId,
+        IOwnedEtabsProcess ownedProcess,
+        IManagedEtabsWindowGuard windowGuard,
+        ManagedEtabsApiVersion version)
+        : this(rawApi, identity, launchRecordId, new HandleLease(ownedProcess), windowGuard, version)
+    {
+    }
+
     public ETABSApplication Application => rawApi.Application;
     public ManagedProcessIdentity Identity { get; } = identity;
     public Guid ManagedLaunchRecordId { get; } = launchRecordId;
-    public bool HasExited => ownedProcess.HasExited;
+    public bool HasExited => lease.HasExited;
 
     public int InitializeNewModel() => rawApi.InitializeNewModel();
 
@@ -582,11 +594,11 @@ public sealed class ManagedEtabsApplication(
         version.ApiVersion,
         version.FullVersion);
 
-    public bool WaitForExit(TimeSpan timeout) => ownedProcess.WaitForExit(timeout);
+    public bool WaitForExit(TimeSpan timeout) => lease.WaitForExit(timeout);
 
-    public void Kill() => ownedProcess.Kill();
+    public void Kill() => lease.Kill();
 
-    public void ReleaseOwnedProcessHandle() => ownedProcess.Dispose();
+    public void ReleaseOwnedProcessHandle() => lease.ReleaseOwner();
 
     public void ReleaseApiReferences() => rawApi.ReleaseApiReferences();
 }

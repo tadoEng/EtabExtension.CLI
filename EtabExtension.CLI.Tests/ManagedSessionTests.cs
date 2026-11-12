@@ -1,4 +1,4 @@
-﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
@@ -20,7 +20,8 @@ public sealed class ManagedSessionTests
         var path = Path.Combine(directory, "record.json");
         try
         {
-            var store = new JsonSessionRecordStore(path);
+            using var store = new JsonSessionRecordStore(path);
+            store.AcquireExclusive();
             var record = Record(Guid.NewGuid());
             store.Write(record);
             Assert.Equal(record, store.Read());
@@ -51,7 +52,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void SessionWritesRecoveryRecordBeforeExactOnceInitializationAndReusesReadySession()
+    public void SessionWritesTheProvisionalRecordBeforeInitializationAndTheFinalRecordAtCommitAndReusesReadySession()
     {
         var events = new List<string>();
         var launchId = Guid.NewGuid();
@@ -86,6 +87,9 @@ public sealed class ManagedSessionTests
                 // the application at all.
                 "confirm-windows-suppressed",
                 "enter-background-hidden",
+                // The provisional record: written at process start by the real launcher
+                // (this double does not), so the session guarantees it exists before
+                // anything can fail.
                 "record-write",
                 "initialize",
                 "wrap-existing",
@@ -93,7 +97,9 @@ public sealed class ManagedSessionTests
                 // blank (Untitled) model behind the window — and still before the session
                 // is handed to any command. The proof is the exact-owned Windows census,
                 // not cOAPI.Visible(), which #20 showed never clears.
-                "confirm-windows-suppressed"
+                "confirm-windows-suppressed",
+                // The final record, at the commit point (Launching -> Committing -> Ready).
+                "record-write"
             ],
             events);
     }
@@ -390,6 +396,9 @@ public sealed class ManagedSessionTests
                 // the application at all.
                 "confirm-windows-suppressed",
                 "enter-background-hidden",
+                // The provisional record: written at process start by the real launcher
+                // (this double does not), so the session guarantees it exists before
+                // anything can fail.
                 "record-write",
                 "initialize",
                 // Shutdown retires the window guard first, on every route in.
@@ -715,7 +724,7 @@ public sealed class ManagedSessionTests
         var fixture = ShutdownFixture.Create(waitResults: [true]);
         using var unanswered = new ManualResetEventSlim();
         fixture.Managed.ExitGate = unanswered;
-        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromMilliseconds(200));
+        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(200));
         var clock = System.Diagnostics.Stopwatch.StartNew();
 
         try
@@ -747,7 +756,7 @@ public sealed class ManagedSessionTests
     public void BlockedShutdownWithAnAnsweredExitNeedsNoKill()
     {
         var fixture = ShutdownFixture.Create(waitResults: [true]);
-        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromSeconds(5));
+        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
 
         var result = machine.ShutdownWhileWorkerBlocked(fixture.Managed);
 
@@ -773,7 +782,7 @@ public sealed class ManagedSessionTests
                 "The application called an interface that was marshalled for a different thread.",
                 unchecked((int)0x8001010E)),
             waitResults: [true]);
-        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromSeconds(5));
+        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
 
         var result = machine.ShutdownWhileWorkerBlocked(fixture.Managed);
 
@@ -797,7 +806,7 @@ public sealed class ManagedSessionTests
     public void BlockedShutdownWithANonzeroExitReturnStaysApplicationExitFailed()
     {
         var fixture = ShutdownFixture.Create(exitReturnCode: 7, waitResults: [false, true]);
-        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromMilliseconds(200));
+        var machine = new ManagedEtabsShutdownMachine(fixture.Store, TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(200));
 
         var result = machine.ShutdownWhileWorkerBlocked(fixture.Managed);
 
@@ -1358,7 +1367,7 @@ public sealed class ManagedSessionTests
         public int LaunchCount { get; private set; }
         public EtabsLaunchException? Failure { get; set; }
 
-        public IManagedEtabsApplication Launch()
+        public IManagedEtabsApplication Launch(EtabsLaunchState state)
         {
             LaunchCount++;
             events.Add("launch");
