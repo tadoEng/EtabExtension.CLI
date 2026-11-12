@@ -16,7 +16,8 @@ internal sealed class SessionRig
         TimeSpan? gateWait = null,
         TimeSpan? graceful = null,
         bool processExitsOnApplicationExit = true,
-        Func<ISessionRecordStore, IManagedEtabsShutdownMachine>? machine = null)
+        Func<ISessionRecordStore, IManagedEtabsShutdownMachine>? machine = null,
+        TimeSpan? blockedBudget = null)
     {
         L = launcher ?? new LauncherRig();
         L.Census.Live = Kit.Identity;
@@ -36,7 +37,8 @@ internal sealed class SessionRig
             work,
             TextWriter.Null,
             L.Cell,
-            gateWait ?? TimeSpan.FromMilliseconds(100));
+            gateWait ?? TimeSpan.FromMilliseconds(100),
+            blockedBudget);
     }
 
     /// <summary>The session's own gate, for a test that has to hold it the way a stuck command does.</summary>
@@ -552,19 +554,54 @@ public sealed class ManagedEtabsOwnershipTests
     }
 
     [Fact]
-    public void ALeaseUsedAfterDisposalIsAHarmlessNoOp()
+    public void ALeaseUsedAfterDisposalIsAHarmlessNoOpAndNeverClaimsAnExit()
     {
-        var process = new FakeSpawnedProcess(Identity);
+        var process = new FakeSpawnedProcess(Identity) { RefusesToExit = true };
         var lease = new HandleLease(process);
         lease.ReleaseOwner();
 
         Assert.False(lease.TryAcquire());
         lease.Kill();
+        Assert.Equal(0, process.KillCount);
+
+        // Disposal is NOT evidence of an exit (card P3-C): only an observed exit is.
+        Assert.False(lease.HasExited);
+        Assert.False(lease.WaitForExit(TimeSpan.Zero));
+        Assert.False(lease.ExitConfirmed);
+        Assert.True(process.Disposed);
+    }
+
+    [Fact]
+    public void ExitConfirmedIsSetOnlyByAnObservedExitAndSurvivesDisposal()
+    {
+        var process = new FakeSpawnedProcess(Identity);
+        var lease = new HandleLease(process);
+        Assert.False(lease.ExitConfirmed);
+
+        lease.Kill();
+        Assert.False(lease.ExitConfirmed, "a kill request is not an observed exit");
+        Assert.True(lease.HasExited);
+        Assert.True(lease.ExitConfirmed);
+
+        lease.ReleaseOwner();
         Assert.True(lease.HasExited);
         Assert.True(lease.WaitForExit(TimeSpan.Zero));
-        Assert.Equal(0, process.KillCount);
+    }
+
+    [Fact]
+    public void ARecordIsRetainedForADisposedLeaseWhoseExitWasNeverObserved()
+    {
+        var records = new MemoryRecordStore();
+        var state = new EtabsLaunchState(records, new LaunchPublicationCell());
+        state.WriteProvisionalRecord(Identity);
+        var lease = new HandleLease(new FakeSpawnedProcess(Identity) { RefusesToExit = true });
         lease.ReleaseOwner();
-        Assert.True(process.Disposed);
+
+        var retained = state.ClearRecordAfterConfirmedExit(lease);
+
+        Assert.True(retained);
+        Assert.NotNull(records.Record);
+        Assert.Equal(0, records.ClearCount);
     }
 
     [Fact]

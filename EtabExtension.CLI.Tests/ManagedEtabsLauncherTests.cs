@@ -600,24 +600,88 @@ public sealed class ManagedEtabsLauncherTests
         Assert.Empty(rig.Records.Writes);
     }
 
-    // X2 test 4 / Y2 explicit order: the terminator wins Terminating and CLOSES THE EMPTY
-    // SLOT, THEN the worker stores and sees CLOSED -> exactly one kill, by the worker.
+    // X2 test 4 / Y2 explicit order, with the CONTENT of the answer asserted (card P2-1):
+    // the terminator wins Terminating and CLOSES THE EMPTY SLOT, THEN the worker stores and
+    // sees CLOSED -> exactly one kill, by the worker, and the terminator learns it was confirmed.
     [Fact]
-    public void ACloseOfTheEmptySlotBeforeTheLateStoreMakesTheWorkerTheOnlyKiller()
+    public void ACloseOfTheEmptySlotBeforeTheLateStoreMakesTheWorkerTheOnlyKillerAndTheAnswerSaysSo()
     {
         var rig = new LauncherRig();
         var state = rig.NewState();
-        ManagedEtabsShutdownResult? terminatorAnswer = null;
-        rig.Spawner.BeforeReturn = () => terminatorAnswer = state.TerminateLaunch(TimeSpan.FromSeconds(5));
+        var slotClosed = new ManualResetEventSlim(false);
+        state.SlotClosedHook = slotClosed.Set;
+        rig.Spawner.BeforeReturn = () => slotClosed.Signalled("the terminator to close the empty slot");
+        var launching = Task.Run(() => Record.Exception(() => rig.Launcher.Launch(state)));
+        Assert.True(SpinWait.SpinUntil(() => rig.Spawner.StartCount == 1, Kit.TestDeadline));
 
-        var error = Assert.Throws<EtabsLaunchException>(() => rig.Launcher.Launch(state));
+        var answer = Task.Run(() => state.TerminateLaunch(TimeSpan.FromSeconds(5)))
+            .Within("the terminator to hear from the worker");
 
-        Assert.NotNull(terminatorAnswer);
+        Assert.NotNull(answer);
+        Assert.True(answer!.Success, answer.Error);
+        Assert.True(answer.Data.ProcessExitConfirmed);
+        Assert.True(answer.Data.Forced);
+        var error = Assert.IsType<EtabsLaunchException>(launching.Within("the launch to end"));
         Assert.Equal(EtabsLaunchErrorCodes.LaunchAborted, error.Code);
         Assert.Equal(1, rig.Process.KillCount);
         Assert.Null(rig.Cell.Identity);
         Assert.Empty(rig.Records.Writes);
         Assert.Equal(0, rig.Attach.AttachCalls);
+    }
+
+    // P2-1: the late kill is NOT confirmed -> the answer is UNCONFIRMED and the worker has
+    // written the provisional record (the creation proof) so the orphan stays described.
+    [Fact]
+    public void AnUnconfirmedLateKillAnswersUnconfirmedAndWritesTheProvisionalRecord()
+    {
+        var process = new FakeSpawnedProcess(Identity) { RefusesToExit = true };
+        var rig = new LauncherRig(process: process);
+        var state = rig.NewState();
+        var slotClosed = new ManualResetEventSlim(false);
+        state.SlotClosedHook = slotClosed.Set;
+        rig.Spawner.BeforeReturn = () => slotClosed.Signalled("the terminator to close the empty slot");
+        var launching = Task.Run(() => Record.Exception(() => rig.Launcher.Launch(state)));
+        Assert.True(SpinWait.SpinUntil(() => rig.Spawner.StartCount == 1, Kit.TestDeadline));
+
+        var answer = Task.Run(() => state.TerminateLaunch(TimeSpan.FromSeconds(5)))
+            .Within("the terminator to hear from the worker");
+        _ = launching.Within("the launch to end");
+
+        Assert.False(answer!.Success);
+        Assert.False(answer.Data.ProcessExitConfirmed);
+        Assert.Equal(ManagedEtabsShutdownState.ProcessExitUnconfirmed, answer.Data.State);
+        Assert.True(answer.Data.RecordRetained);
+        Assert.Equal(1, process.KillCount);
+        var record = Assert.Single(rig.Records.Writes);
+        Assert.Equal(ManagedEtabsRecordPhase.Provisional, record.Phase);
+        Assert.Equal(Identity.Pid, record.Pid);
+        Assert.NotNull(rig.Records.Record);
+    }
+
+    // P2-1: the worker is still inside Process.Start - there is no proof either way, so the
+    // answer within the bound is UNCONFIRMED, never "confirmed".
+    [Fact]
+    public void ATerminationWhileProcessStartIsStillRunningAnswersUnconfirmedWithinTheBound()
+    {
+        var rig = new LauncherRig();
+        var state = rig.NewState();
+        var release = new ManualResetEventSlim(false);
+        rig.Spawner.BeforeReturn = () => release.Signalled("the test to release Process.Start");
+        var launching = Task.Run(() => Record.Exception(() => rig.Launcher.Launch(state)));
+        Assert.True(SpinWait.SpinUntil(() => rig.Spawner.StartCount == 1, Kit.TestDeadline));
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+
+        var answer = Task.Run(() => state.TerminateLaunch(TimeSpan.FromMilliseconds(300)))
+            .Within("the terminator to give up on the worker");
+        watch.Stop();
+        release.Set();
+        _ = launching.Within("the launch to end");
+
+        Assert.False(answer!.Success);
+        Assert.False(answer.Data.ProcessExitConfirmed);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(3), $"took {watch.Elapsed}");
+        // The late worker still kills its own handle afterwards.
+        Assert.True(SpinWait.SpinUntil(() => rig.Process.KillCount == 1, Kit.TestDeadline));
     }
 
     // X2 test 5b: the expiry meets a launch that is already Ready - it finished in time.

@@ -13,10 +13,10 @@ public interface IServeShutdownCoordinator : IAsyncDisposable
 public sealed class ServeShutdownCoordinator : IServeShutdownCoordinator
 {
     /// <summary>Window-guard teardown joins its monitor for at most this long.</summary>
-    public static readonly TimeSpan GuardTeardownBudget = TimeSpan.FromSeconds(2);
+    public static readonly TimeSpan GuardTeardownBudget = EtabsSession.GuardTeardownBudget;
 
     /// <summary>Record operations and reference cleanup inside the blocked sequence.</summary>
-    public static readonly TimeSpan BlockedRecordOperationsMargin = TimeSpan.FromMilliseconds(500);
+    public static readonly TimeSpan BlockedRecordOperationsMargin = EtabsSession.BlockedRecordOperationsMargin;
 
     /// <summary>
     /// The backstop on the session's own bounded blocked sequence: the gate wait, the

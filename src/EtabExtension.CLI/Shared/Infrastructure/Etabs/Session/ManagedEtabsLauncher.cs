@@ -184,7 +184,9 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 : CleanUpFailedStart(state, rawApi, timedOut);
 
             var code = timedOut
-                ? EtabsLaunchErrorCodes.StartTimeout
+                ? (state.BlockerEvidence is not null
+                    ? EtabsLaunchErrorCodes.StartBlocked
+                    : EtabsLaunchErrorCodes.StartTimeout)
                 : failure is EtabsLaunchException typed
                     ? typed.Code
                     : EtabsLaunchErrorCodes.LaunchFailed;
@@ -226,6 +228,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         string executablePath,
         long startedAt)
     {
+        state.MarkWorkerStarted();
         var worker = Task.Run(() => StartWorker(state, executablePath));
         var remaining = _options.StartupDeadline - _clock.ElapsedSince(startedAt);
         // WaitAny, not Wait: a faulted worker must surface its own typed exception below,
@@ -260,6 +263,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         }
         catch (Exception ex) when (ex is not EtabsLaunchException)
         {
+            state.ReportWorkerOutcome(EtabsLaunchState.WorkerOutcome.NoProcess);
             throw new EtabsLaunchException(
                 EtabsLaunchErrorCodes.ProcessStartFailed,
                 EtabsApiDiagnosticFormatter.InfrastructureException("Process.Start", ex),
@@ -272,9 +276,33 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         {
             // CLOSED: a supervisor or shutdown already took the launch. This worker owns
             // the cleanup of the handle it just created, and publishes nothing.
-            KillOwnHandle(lease);
-            lease.ReleaseOwner();
+            var confirmed = KillOwnHandle(lease);
+            if (!confirmed)
+            {
+                // The kill is not confirmed: an unrecorded orphan must not be possible, so
+                // the creation proof (the provisional record) is written now (card P2-1).
+                try
+                {
+                    state.WriteProvisionalRecord(process.ReadIdentity());
+                }
+#pragma warning disable CA1031 // best effort: the unconfirmed outcome is reported either way
+                catch (Exception ex)
+#pragma warning restore CA1031
+                {
+                    _diagnostics.WriteLine(EtabsApiDiagnosticFormatter.InfrastructureException(
+                        "ManagedEtabsSessionRecord.Write(provisional, late unconfirmed kill)",
+                        ex));
+                }
+            }
+            else
+            {
+                lease.ReleaseOwner();
+            }
+
             lease.Release();
+            state.ReportWorkerOutcome(confirmed
+                ? EtabsLaunchState.WorkerOutcome.KilledConfirmed
+                : EtabsLaunchState.WorkerOutcome.KillUnconfirmed);
             return null;
         }
 
@@ -331,12 +359,12 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         return new StartedProcess(identity, lease, process);
     }
 
-    private void KillOwnHandle(HandleLease lease)
+    private bool KillOwnHandle(HandleLease lease)
     {
         try
         {
             lease.Kill();
-            _ = lease.WaitForExit(_options.ForcedExitTimeout);
+            return lease.WaitForExit(_options.ForcedExitTimeout) || lease.ExitConfirmed;
         }
 #pragma warning disable CA1031 // an unconfirmed exit leaves nothing cleared and nothing guessed
         catch (Exception ex)
@@ -345,6 +373,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             _diagnostics.WriteLine(EtabsApiDiagnosticFormatter.InfrastructureException(
                 "Process.Kill(own late handle)",
                 ex));
+            return false;
         }
     }
 
@@ -369,6 +398,10 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 return;
             }
 
+            CaptureBlockerWithoutMainWindow(state);
+            _diagnostics.WriteLine(
+                $"⚠ {EtabsLaunchErrorCodes.StartTimeout}: the ETABS start did not commit within " +
+                $"{_options.StartupDeadline.TotalSeconds:0.###}s; ending the process this attempt created.");
             _ = state.TerminateLaunch(
                 _options.ForcedExitTimeout,
                 TimeSpan.Zero,
@@ -384,12 +417,69 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         }
     }
 
+    /// <summary>
+    /// Before an expiry kills the process, remember a visible window of it that held the
+    /// startup while no main window existed (card P3-B): after the kill the evidence is gone,
+    /// and the engineer needs "sign in" rather than "timeout".
+    /// </summary>
+    private void CaptureBlockerWithoutMainWindow(EtabsLaunchState state)
+    {
+        if (state.BlockerEvidence is not null
+            || state.MainWindow != nint.Zero
+            || state.Publication.Identity is not { } identity)
+        {
+            return;
+        }
+
+        try
+        {
+            var windows = _startupWindows.VisibleTopLevelWindows(identity.Pid);
+            if (windows.Count > 0)
+            {
+                state.RecordBlockerEvidence(new StartupBlockerEvidence(windows[0].Title, windows[0].ClassName));
+            }
+        }
+#pragma warning disable CA1031 // evidence only: a failed scan changes nothing
+        catch (Exception ex)
+#pragma warning restore CA1031
+        {
+            _diagnostics.WriteLine($"⚠ ETABS startup window scan at expiry failed: {ex.Message}");
+        }
+    }
+
+    private static EtabsLaunchException StartBlocked(string title, string windowClass)
+    {
+        var boundedTitle = EtabsApiDiagnosticFormatter.Bounded(title);
+        var boundedClass = EtabsApiDiagnosticFormatter.Bounded(windowClass);
+        var detail = JsonSerializer.Serialize(
+            new { title = boundedTitle, @class = boundedClass, dismissed = false },
+            DetailJson);
+        return new EtabsLaunchException(
+            EtabsLaunchErrorCodes.StartBlocked,
+            $"ETABS is waiting on a window it cannot continue past: title='{boundedTitle}', " +
+            $"class='{boundedClass}'. It was left alone and the process this attempt created was " +
+            $"ended. The engineer must act (for example sign in to the ETABS licence).{EtabsTypedFailureCodes.DetailMarker}{detail}");
+    }
+
     private EtabsLaunchException StartTimeout(EtabsLaunchState state)
     {
+        CaptureBlockerWithoutMainWindow(state);
+        _diagnostics.WriteLine(
+            $"⚠ {EtabsLaunchErrorCodes.StartTimeout}: the ETABS start did not commit within " +
+            $"{_options.StartupDeadline.TotalSeconds:0.###}s.");
         var cleanup = state.TerminateLaunch(
             _options.ForcedExitTimeout,
             TimeSpan.Zero,
             timedOut: true);
+        if (state.BlockerEvidence is { } evidence)
+        {
+            var blocked = StartBlocked(evidence.Title, evidence.ClassName);
+            return new EtabsLaunchException(blocked.Code, StripCode(blocked))
+            {
+                Cleanup = cleanup ?? EtabsLaunchState.Succeeded(null, forced: false, recordRetained: false)
+            };
+        }
+
         return new EtabsLaunchException(
             EtabsLaunchErrorCodes.StartTimeout,
             "ETABS did not become ready within " +
@@ -420,6 +510,14 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
 
     // ── attach (card Z1, Z2) ────────────────────────────────────────────────
 
+    /// <summary>
+    /// The attach loop. KNOWN RESIDUAL (card P3-A): <c>GetObjectProcess</c> runs on the
+    /// session STA thread because the RCW is apartment-bound, and the startup supervisor can
+    /// only release a hung call by ending the process. If that process cannot be killed
+    /// (an unkillable ETABS) the STA stays inside the call: the launch never returns, the
+    /// expiry is written to stderr, the answer to the request is unconfirmed, and the
+    /// blocked-shutdown path (a dedicated thread, never the worker) takes over.
+    /// </summary>
     private IEtabsRawApi Attach(EtabsLaunchState state, StartedProcess started, long startedAt)
     {
         Exception? lastFailure = null;
@@ -443,6 +541,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             var main = started.Process.RefreshMainWindowHandle();
             if (main != nint.Zero)
             {
+                state.SetMainWindow(main);
                 RequireNoStartupBlocker(started.Identity.Pid, main);
                 try
                 {
@@ -510,16 +609,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             return;
         }
 
-        var title = EtabsApiDiagnosticFormatter.Bounded(blocker.Title);
-        var windowClass = EtabsApiDiagnosticFormatter.Bounded(blocker.ClassName);
-        var detail = JsonSerializer.Serialize(
-            new { title, @class = windowClass, dismissed = false },
-            DetailJson);
-        throw new EtabsLaunchException(
-            EtabsLaunchErrorCodes.StartBlocked,
-            $"ETABS is waiting on a window it cannot continue past: title='{title}', " +
-            $"class='{windowClass}'. It was left alone and the process this attempt created was " +
-            $"ended. The engineer must act (for example sign in to the ETABS licence).{EtabsTypedFailureCodes.DetailMarker}{detail}");
+        throw StartBlocked(blocker.Title, blocker.ClassName);
     }
 
     // ── unchanged lifecycle steps ───────────────────────────────────────────

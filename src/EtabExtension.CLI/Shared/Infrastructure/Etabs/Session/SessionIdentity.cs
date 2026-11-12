@@ -121,11 +121,16 @@ public sealed class JsonSessionRecordStore : ISessionRecordStore, IDisposable
         "EtabExtension", "sidecar", "managed-etabs-session.json");
 
     private readonly TimeSpan _lockWait;
+    private readonly string? _trustedAnchor;
 
-    public JsonSessionRecordStore(string? path = null, TimeSpan? lockWait = null)
+    public JsonSessionRecordStore(
+        string? path = null,
+        TimeSpan? lockWait = null,
+        string? trustedAnchor = null)
     {
         FilePath = path ?? DefaultPath;
         _lockWait = lockWait ?? DaemonRecordLock.DefaultWait;
+        _trustedAnchor = trustedAnchor;
     }
 
     public string FilePath { get; }
@@ -148,7 +153,7 @@ public sealed class JsonSessionRecordStore : ISessionRecordStore, IDisposable
     {
         lock (_lockGate)
         {
-            _lock ??= DaemonRecordLock.Acquire(FilePath, wait);
+            _lock ??= DaemonRecordLock.Acquire(FilePath, wait, _trustedAnchor);
         }
     }
 

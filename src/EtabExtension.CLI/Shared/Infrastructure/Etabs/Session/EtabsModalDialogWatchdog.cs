@@ -53,7 +53,20 @@ public sealed record EtabsModalDialogObservation(
     [property: JsonPropertyName("text")] string Text,
     [property: JsonPropertyName("dismissed")] bool Dismissed)
 {
-    public string ToFailure() => EtabsTypedFailureCodes.Format(
+    /// <summary>
+    /// Set when this observation is the post-Ready startup blocker (card P2-3) rather than a
+    /// modal dialog: the window class that is holding the startup.
+    /// </summary>
+    [JsonIgnore]
+    public string? StartupBlockerClass { get; init; }
+
+    public string ToFailure() => StartupBlockerClass is { } windowClass
+        ? EtabsTypedFailureCodes.Format(
+            EtabsLaunchErrorCodes.StartBlocked,
+            $"ETABS is waiting on a window it cannot continue past: title='{Title}', class='{windowClass}'. " +
+            "It was left alone; the engineer must act (for example sign in to the ETABS licence).",
+            new { title = Title, @class = windowClass, dismissed = false })
+        : EtabsTypedFailureCodes.Format(
         EtabsTypedFailureCodes.ModalDialog,
         Dismissed
             ? "ETABS showed a modal dialog it cannot continue past; the dialog was closed and the command failed."
@@ -149,7 +162,9 @@ public sealed class EtabsModalDialogWatchdog(
     IEtabsDialogWindowSource windows,
     TimeSpan pollInterval,
     TimeSpan dismissedSettle,
-    TimeSpan? scanTimeout = null) : IEtabsModalDialogWatchdog
+    TimeSpan? scanTimeout = null,
+    LaunchPublicationCell? cell = null,
+    IEtabsStartupWindowSource? startupWindows = null) : IEtabsModalDialogWatchdog
 {
     public static readonly TimeSpan DefaultPollInterval = TimeSpan.FromMilliseconds(200);
     public static readonly TimeSpan DefaultDismissedSettle = TimeSpan.FromSeconds(30);
@@ -187,6 +202,18 @@ public sealed class EtabsModalDialogWatchdog(
 
     public EtabsModalDialogWatchdog()
         : this(PlatformWindows(), DefaultPollInterval, DefaultDismissedSettle)
+    {
+    }
+
+    /// <summary>The daemon's wiring: shares the session's publication cell (card P2-3).</summary>
+    public EtabsModalDialogWatchdog(LaunchPublicationCell cell)
+        : this(
+            PlatformWindows(),
+            DefaultPollInterval,
+            DefaultDismissedSettle,
+            null,
+            cell,
+            PlatformWindows())
     {
     }
 
@@ -229,9 +256,15 @@ public sealed class EtabsModalDialogWatchdog(
                 var last = Scan(ownedPid);
                 if (last.Found is null)
                 {
-                    return last.Inconclusive is null
-                        ? await workTask.ConfigureAwait(false)
-                        : Result.Fail(InconclusiveFailure(last.Inconclusive));
+                    if (last.Inconclusive is not null)
+                    {
+                        return Result.Fail(InconclusiveFailure(last.Inconclusive));
+                    }
+
+                    // The first watched command completed with no dialog and no startup
+                    // blocker: the post-Ready blocker watch has done its job.
+                    cell?.DisarmStartupBlocker();
+                    return await workTask.ConfigureAwait(false);
                 }
 
                 seen = last.Found;
@@ -314,6 +347,26 @@ public sealed class EtabsModalDialogWatchdog(
         }
     }
 
+    /// <summary>
+    /// The dialog scan, plus - only while the post-Ready startup blocker is armed and the
+    /// main window is known - the first visible top-level window of the pid that is not the
+    /// main window (card P2-3).
+    /// </summary>
+    private (IReadOnlyList<EtabsDialogWindow> Dialogs, StartupWindow? Blocker) FindDialogsOrBlocker(int pid)
+    {
+        var dialogs = windows.FindModalDialogs(pid);
+        if (dialogs.Count > 0
+            || cell is not { StartupBlockerArmed: true }
+            || startupWindows is null
+            || cell.MainWindow == nint.Zero)
+        {
+            return (dialogs, null);
+        }
+
+        var main = cell.MainWindow;
+        return (dialogs, startupWindows.VisibleTopLevelWindows(pid).FirstOrDefault(w => w.Handle != main));
+    }
+
     private ScanOutcome Scan(Func<int?> ownedPid)
     {
         // A fault in the watchdog itself must never fault the watch or the command it
@@ -330,7 +383,7 @@ public sealed class EtabsModalDialogWatchdog(
                 return ScanOutcome.Clean;
             }
 
-            var scan = Task.Run(() => windows.FindModalDialogs(pid));
+            var scan = Task.Run(() => FindDialogsOrBlocker(pid));
             if (!scan.Wait(_scanTimeout))
             {
                 Console.Error.WriteLine(
@@ -343,9 +396,24 @@ public sealed class EtabsModalDialogWatchdog(
                 return new(null, $"the dialog scan did not finish within {_scanTimeout.TotalSeconds:0.###}s");
             }
 
-            var dialogs = scan.GetAwaiter().GetResult();
+            var (dialogs, blocker) = scan.GetAwaiter().GetResult();
             if (dialogs.Count == 0)
             {
+                if (blocker is not null)
+                {
+                    Console.Error.WriteLine(
+                        $"⚠ ETABS startup blocker (PID {pid}): title='{blocker.Title}', class='{blocker.ClassName}'");
+                    return new(
+                        new EtabsModalDialogObservation(
+                            EtabsApiDiagnosticFormatter.Bounded(blocker.Title),
+                            string.Empty,
+                            false)
+                        {
+                            StartupBlockerClass = EtabsApiDiagnosticFormatter.Bounded(blocker.ClassName)
+                        },
+                        null);
+                }
+
                 return ScanOutcome.Clean;
             }
 

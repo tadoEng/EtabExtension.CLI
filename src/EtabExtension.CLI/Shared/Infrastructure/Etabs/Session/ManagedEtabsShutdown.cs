@@ -46,6 +46,15 @@ public interface IManagedEtabsShutdownMachine
     /// is then killed through its authoritative handle.
     /// </summary>
     ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(IManagedEtabsApplication owned);
+
+    /// <summary>
+    /// <see cref="ShutdownWhileWorkerBlocked(IManagedEtabsApplication)"/> held to ONE shared
+    /// deadline: the graceful and forced waits are capped by what is left of
+    /// <paramref name="budget"/>, never added on top of the phases that came before it.
+    /// </summary>
+    ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(
+        IManagedEtabsApplication owned,
+        TimeSpan budget);
 }
 
 public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
@@ -101,12 +110,30 @@ public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
     public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(IManagedEtabsApplication owned)
         => ShutdownCore(owned, ShutdownAuthority.RequireMatchingRecoveryRecord, ExitAttempt.BoundedOnDedicatedSta);
 
+    public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked(
+        IManagedEtabsApplication owned,
+        TimeSpan budget)
+        => ShutdownCore(
+            owned,
+            ShutdownAuthority.RequireMatchingRecoveryRecord,
+            ExitAttempt.BoundedOnDedicatedSta,
+            budget);
+
     private ManagedEtabsShutdownResult ShutdownCore(
         IManagedEtabsApplication owned,
         ShutdownAuthority authority,
-        ExitAttempt exitAttempt)
+        ExitAttempt exitAttempt,
+        TimeSpan? budget = null)
     {
         ArgumentNullException.ThrowIfNull(owned);
+        var budgetClock = System.Diagnostics.Stopwatch.StartNew();
+
+        // One shared deadline: a phase gets at most what is left of the budget.
+        TimeSpan Cap(TimeSpan phase) => budget is null
+            ? phase
+            : TimeSpan.FromTicks(Math.Min(
+                phase.Ticks,
+                Math.Max(0, (budget.Value - budgetClock.Elapsed).Ticks)));
 
         // Deterministic, unconditional, and first. Every route into shutdown — graceful,
         // forced, identity-mismatched, or a session that had already exited — retires the
@@ -154,14 +181,14 @@ public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
         if (exitAttempt == ExitAttempt.BoundedOnDedicatedSta)
         {
             var started = System.Diagnostics.Stopwatch.StartNew();
-            var attempt = AttemptExitOnDedicatedSta(owned, _blockedGracefulExitTimeout);
+            var attempt = AttemptExitOnDedicatedSta(owned, Cap(_blockedGracefulExitTimeout));
             if (attempt.Returned && attempt.Failure is null)
             {
                 applicationExitReturnCode = attempt.ReturnCode;
                 applicationExitError = applicationExitReturnCode is { } code and not 0
                     ? EtabsApiDiagnosticFormatter.ApiReturn("cOAPI.ApplicationExit(false)", code)
                     : null;
-                var remaining = _blockedGracefulExitTimeout - started.Elapsed;
+                var remaining = Cap(_blockedGracefulExitTimeout) - started.Elapsed;
                 gracefulWait = remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
             }
             else if (attempt.Failure is not null)
@@ -226,7 +253,7 @@ public sealed class ManagedEtabsShutdownMachine : IManagedEtabsShutdownMachine
                     exception);
             }
 
-            processExitConfirmed = TryWait(owned, ForcedExitTimeout);
+            processExitConfirmed = TryWait(owned, Cap(ForcedExitTimeout));
         }
 
         if (!processExitConfirmed)

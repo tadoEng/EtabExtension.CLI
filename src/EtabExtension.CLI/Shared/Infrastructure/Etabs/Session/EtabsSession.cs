@@ -48,6 +48,25 @@ public sealed class EtabsSession : IEtabsSession
     /// <summary>How long a blocked-worker shutdown waits for the session gate (card I6).</summary>
     public static readonly TimeSpan BlockedShutdownGateWait = TimeSpan.FromSeconds(2);
 
+    /// <summary>Window-guard teardown joins its monitor for at most this long.</summary>
+    public static readonly TimeSpan GuardTeardownBudget = TimeSpan.FromSeconds(2);
+
+    /// <summary>Record operations and reference cleanup inside the blocked sequence.</summary>
+    public static readonly TimeSpan BlockedRecordOperationsMargin = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// The ONE deadline of a blocked shutdown inside the session (card P3-D): the commit
+    /// wait, the gate wait, the bounded graceful exit, the forced-exit confirmation, the
+    /// guard teardown and record operations all draw from it and are never added on top of
+    /// each other.
+    /// </summary>
+    public static readonly TimeSpan BlockedShutdownBudget =
+        BlockedShutdownGateWait
+        + ManagedEtabsShutdownMachine.BlockedGracefulExitTimeout
+        + ManagedEtabsShutdownMachine.ForcedExitTimeout
+        + GuardTeardownBudget
+        + BlockedRecordOperationsMargin;
+
     private readonly IManagedEtabsLauncher _launcher;
     private readonly IProcessInspector _processes;
     private readonly ISessionRecordStore _records;
@@ -55,6 +74,7 @@ public sealed class EtabsSession : IEtabsSession
     private readonly IEtabsWorkScope _work;
     private readonly LaunchPublicationCell _cell;
     private readonly TimeSpan _gateWait;
+    private readonly TimeSpan _blockedBudget;
     private string? _commandStage;
 
     // Borrowed, never owned: this is Console.Error in production and a test's buffer under
@@ -139,8 +159,10 @@ public sealed class EtabsSession : IEtabsSession
         IEtabsWorkScope work,
         TextWriter diagnostics,
         LaunchPublicationCell cell,
-        TimeSpan gateWait)
+        TimeSpan gateWait,
+        TimeSpan? blockedBudget = null)
     {
+        _blockedBudget = blockedBudget ?? BlockedShutdownBudget;
         _launcher = launcher;
         _processes = processes;
         _records = records;
@@ -310,6 +332,10 @@ public sealed class EtabsSession : IEtabsSession
             _ = state.ClearRecordAfterConfirmedExit(() => launched.HasExited);
             throw AbortedWhileLaunching(state);
         }
+
+        // Ready. A licence window was seen live ~13 s after the attach, so the startup
+        // blocker stays armed (watched by the watchdog) until the first command completes.
+        state.ArmStartupBlocker();
     }
 
     private EtabsLaunchException FailRecordWrite(
@@ -768,17 +794,28 @@ public sealed class EtabsSession : IEtabsSession
     }
 
     public ManagedEtabsShutdownResult Shutdown() =>
-        ShutdownWith(_shutdownMachine.Shutdown, workerBlocked: false);
+        ShutdownWith((owned, _) => _shutdownMachine.Shutdown(owned), workerBlocked: false);
 
     /// <inheritdoc />
     public ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked() =>
         ShutdownWith(_shutdownMachine.ShutdownWhileWorkerBlocked, workerBlocked: true);
 
     private ManagedEtabsShutdownResult ShutdownWith(
-        Func<IManagedEtabsApplication, ManagedEtabsShutdownResult> shutdown,
+        Func<IManagedEtabsApplication, TimeSpan, ManagedEtabsShutdownResult> shutdownWithin,
         bool workerBlocked)
     {
         var launch = Volatile.Read(ref _launch);
+
+        // ONE shared deadline for a blocked shutdown (card P3-D): every phase is capped by
+        // what is left of it. The normal path keeps its per-phase bounds.
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        TimeSpan Left(TimeSpan phase) => !workerBlocked
+            ? phase
+            : TimeSpan.FromTicks(Math.Min(
+                phase.Ticks,
+                Math.Max(0, (_blockedBudget - clock.Elapsed).Ticks)));
+        Func<IManagedEtabsApplication, ManagedEtabsShutdownResult> shutdown =
+            owned => shutdownWithin(owned, Left(_blockedBudget));
 
         // 1. A launch that has not reached Ready is arbitrated by the lifecycle alone, with
         //    no gate: the launching thread holds the gate for its whole duration (card W1).
@@ -788,12 +825,12 @@ public sealed class EtabsSession : IEtabsSession
             {
                 // The commit is short: give it the bounded window (card X1). If it is
                 // stalled, TerminateLaunch wins Committing -> Terminating below.
-                _ = launch.WaitForCommitOrRelease(EtabsLaunchState.CommitWait);
+                _ = launch.WaitForCommitOrRelease(Left(EtabsLaunchState.CommitWait));
             }
 
             if (launch.Lifecycle is LaunchLifecycle.Launching or LaunchLifecycle.Committing)
             {
-                var early = launch.TerminateLaunch(ManagedEtabsLauncher.ForcedExitTimeout);
+                var early = launch.TerminateLaunch(Left(ManagedEtabsLauncher.ForcedExitTimeout));
                 if (early is not null)
                 {
                     _diagnostics.WriteLine("ℹ Shared ETABS session shut down during its launch.");
@@ -806,9 +843,9 @@ public sealed class EtabsSession : IEtabsSession
         if (workerBlocked)
         {
             // Never wait on a gate a stuck command may hold for ever (card I6).
-            if (!Monitor.TryEnter(_gate, _gateWait))
+            if (!Monitor.TryEnter(_gate, Left(_gateWait)))
             {
-                return ShutdownThroughTheHandle(launch);
+                return ShutdownThroughTheHandle(launch, Left(ManagedEtabsShutdownMachine.ForcedExitTimeout));
             }
 
             try
@@ -875,7 +912,7 @@ public sealed class EtabsSession : IEtabsSession
     /// of the gate-guarded fields (card I6, A4). The exit is bounded, the record is cleared
     /// only after a confirmed exit, and the publication likewise.
     /// </summary>
-    private ManagedEtabsShutdownResult ShutdownThroughTheHandle(EtabsLaunchState? launch)
+    private ManagedEtabsShutdownResult ShutdownThroughTheHandle(EtabsLaunchState? launch, TimeSpan killWait)
     {
         _ = launch?.TryBeginReadyTermination();
         var owned = Volatile.Read(ref _owned);
@@ -904,7 +941,7 @@ public sealed class EtabsSession : IEtabsSession
                 owned.Kill();
             }
 
-            confirmed = owned.HasExited || owned.WaitForExit(ManagedEtabsShutdownMachine.ForcedExitTimeout);
+            confirmed = owned.HasExited || owned.WaitForExit(killWait);
         }
 #pragma warning disable CA1031 // an unconfirmed exit is reported, never thrown
         catch (Exception exception)

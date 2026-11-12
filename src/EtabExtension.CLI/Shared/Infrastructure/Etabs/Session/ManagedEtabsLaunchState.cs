@@ -39,10 +39,37 @@ public sealed class LaunchPublicationCell
 
     public ManagedProcessIdentity? Identity => Current.Identity;
 
+    private nint _mainWindow;
+    private int _blockerArmed;
+
     internal void Set(LaunchPublication publication) => Volatile.Write(ref _current, publication);
 
-    internal void Clear() => Volatile.Write(ref _current, LaunchPublication.None);
+    internal void Clear()
+    {
+        Volatile.Write(ref _current, LaunchPublication.None);
+        Volatile.Write(ref _mainWindow, nint.Zero);
+        Volatile.Write(ref _blockerArmed, 0);
+    }
+
+    /// <summary>The main window of the launching or running ETABS; zero until it exists.</summary>
+    public nint MainWindow => Volatile.Read(ref _mainWindow);
+
+    internal void SetMainWindow(nint window) => Volatile.Write(ref _mainWindow, window);
+
+    /// <summary>
+    /// True from Ready until the first watched command completes cleanly (card P2-3): the
+    /// startup-blocker rule stays armed because the ETABS licence sign-in window was seen
+    /// live about 13 s AFTER the attach, when nothing else was watching.
+    /// </summary>
+    public bool StartupBlockerArmed => Volatile.Read(ref _blockerArmed) == 1;
+
+    internal void ArmStartupBlocker() => Volatile.Write(ref _blockerArmed, 1);
+
+    internal void DisarmStartupBlocker() => Volatile.Write(ref _blockerArmed, 0);
 }
+
+/// <summary>The first visible non-main window that was blocking a startup.</summary>
+public sealed record StartupBlockerEvidence(string Title, string ClassName);
 
 /// <summary>The cleanup-relevant surface of an authoritative process handle.</summary>
 public interface IProcessHandle : IDisposable
@@ -62,6 +89,7 @@ public sealed class HandleLease
     private readonly IProcessHandle _process;
     private int _refs = 1;
     private int _ownerReleased;
+    private int _exitConfirmed;
 
     public HandleLease(IProcessHandle process)
     {
@@ -111,19 +139,32 @@ public sealed class HandleLease
         }
     }
 
-    /// <summary>A gone handle means the exit was confirmed before it was released.</summary>
+    /// <summary>
+    /// True only after an exit was actually OBSERVED through this lease (<c>HasExited</c> or
+    /// <c>WaitForExit</c> returned true). A disposed handle is not evidence: record clearing
+    /// and the retained-record rule depend on this flag, never on a convention.
+    /// </summary>
+    public bool ExitConfirmed => Volatile.Read(ref _exitConfirmed) == 1;
+
+    /// <summary>Whether the process is known to have exited; a gone handle answers the flag.</summary>
     public bool HasExited
     {
         get
         {
             if (!TryAcquire())
             {
-                return true;
+                return ExitConfirmed;
             }
 
             try
             {
-                return _process.HasExited;
+                var exited = _process.HasExited;
+                if (exited)
+                {
+                    Volatile.Write(ref _exitConfirmed, 1);
+                }
+
+                return exited;
             }
             finally
             {
@@ -153,12 +194,18 @@ public sealed class HandleLease
     {
         if (!TryAcquire())
         {
-            return true;
+            return ExitConfirmed;
         }
 
         try
         {
-            return _process.WaitForExit(timeout);
+            var exited = _process.WaitForExit(timeout);
+            if (exited)
+            {
+                Volatile.Write(ref _exitConfirmed, 1);
+            }
+
+            return exited;
         }
         finally
         {
@@ -212,6 +259,10 @@ public sealed class EtabsLaunchState
     private int _launchPhaseTermination;
     private int _timedOut;
     private int _began;
+    private int _workerStarted;
+    private readonly TaskCompletionSource<WorkerOutcome> _worker =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private StartupBlockerEvidence? _blockerEvidence;
     private object? _slot;
 
     public EtabsLaunchState(ISessionRecordStore records, LaunchPublicationCell cell)
@@ -258,7 +309,12 @@ public sealed class EtabsLaunchState
         Interlocked.CompareExchange(ref _slot, lease, null) is null;
 
     /// <summary>Taker side: closes the slot and returns the lease it held, if any.</summary>
-    public HandleLease? CloseSlot() => Interlocked.Exchange(ref _slot, Closed) as HandleLease;
+    public HandleLease? CloseSlot()
+    {
+        var lease = Interlocked.Exchange(ref _slot, Closed) as HandleLease;
+        SlotClosedHook?.Invoke();
+        return lease;
+    }
 
     /// <summary>The lease currently held by the slot, without closing it.</summary>
     public HandleLease? SlotLease => Volatile.Read(ref _slot) as HandleLease;
@@ -276,6 +332,36 @@ public sealed class EtabsLaunchState
             _cell.Set(new LaunchPublication(identity, null));
         }
     }
+
+    /// <summary>What the startup worker did with a process it created after the slot was CLOSED.</summary>
+    public enum WorkerOutcome
+    {
+        NoProcess,
+        KilledConfirmed,
+        KillUnconfirmed
+    }
+
+    /// <summary>The launcher started a startup worker; a terminator that finds the slot empty awaits it.</summary>
+    public void MarkWorkerStarted() => Volatile.Write(ref _workerStarted, 1);
+
+    /// <summary>The worker's report once the slot was CLOSED (or nothing started) - card P2-1.</summary>
+    public void ReportWorkerOutcome(WorkerOutcome outcome) => _ = _worker.TrySetResult(outcome);
+
+    /// <summary>Hook for tests: runs right after <see cref="CloseSlot"/> closed the slot.</summary>
+    internal Action? SlotClosedHook { get; set; }
+
+    /// <summary>The blocking window seen before the main window existed, captured before any kill.</summary>
+    public StartupBlockerEvidence? BlockerEvidence => Volatile.Read(ref _blockerEvidence);
+
+    public void RecordBlockerEvidence(StartupBlockerEvidence evidence) =>
+        Volatile.Write(ref _blockerEvidence, evidence);
+
+    public void SetMainWindow(nint window) => _cell.SetMainWindow(window);
+
+    public nint MainWindow => _cell.MainWindow;
+
+    /// <summary>Arms the post-Ready startup-blocker watch (card P2-3).</summary>
+    public void ArmStartupBlocker() => _cell.ArmStartupBlocker();
 
     /// <summary>True once the session started the launch this state describes.</summary>
     public bool Began => Volatile.Read(ref _began) == 1;
@@ -321,7 +407,7 @@ public sealed class EtabsLaunchState
     /// record is still retained.
     /// </summary>
     public bool ClearRecordAfterConfirmedExit(HandleLease? lease) =>
-        ClearRecordAfterConfirmedExit(() => lease is not null && lease.HasExited);
+        ClearRecordAfterConfirmedExit(() => lease is not null && lease.ExitConfirmed);
 
     /// <inheritdoc cref="ClearRecordAfterConfirmedExit(HandleLease?)" />
     public bool ClearRecordAfterConfirmedExit(Func<bool> exitConfirmed)
@@ -455,7 +541,7 @@ public sealed class EtabsLaunchState
             return null;
         }
 
-        return _termination.Task.Wait(killWait + killWait)
+        return _termination.Task.Wait(killWait)
             ? _termination.Task.Result
             : Failed(
                 ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
@@ -470,18 +556,7 @@ public sealed class EtabsLaunchState
         var lease = CloseSlot();
         if (lease is null)
         {
-            // Nothing was handed over yet: a worker whose store sees CLOSED owns its own
-            // cleanup. Whatever record exists is retained, never assumed clear.
-            var retained = _records.Read() is not null;
-            return retained
-                ? Failed(
-                    ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
-                    "The launch ended before its process handle was handed over; the worker " +
-                    "owns that handle and any record is retained.",
-                    Publication.Identity?.Pid,
-                    forced: false,
-                    recordRetained: true)
-                : Succeeded(null, forced: false, recordRetained: false);
+            return AnswerForAnEmptySlot(killWait);
         }
 
         var pid = Publication.Identity?.Pid;
@@ -521,7 +596,7 @@ public sealed class EtabsLaunchState
         }
         else
         {
-            confirmed = true; // the handle was only released after a confirmed exit
+            confirmed = lease.ExitConfirmed;
         }
 
         if (!confirmed)
@@ -539,6 +614,49 @@ public sealed class EtabsLaunchState
         lease.ReleaseOwner();
         MarkEnded();
         return Succeeded(pid, forced, recordRetained);
+    }
+
+    /// <summary>
+    /// The slot was empty at termination. If a startup worker is running it owns the cleanup
+    /// of any process it creates, and nothing here is proof that no process exists, so the
+    /// answer is UNCONFIRMED unless the worker reports - within <paramref name="killWait"/> -
+    /// that it killed a late handle with a confirmed exit, or that it created none (card
+    /// P2-1). A late kill that is not confirmed makes the worker write the provisional
+    /// record, so the orphan stays described.
+    /// </summary>
+    private ManagedEtabsShutdownResult AnswerForAnEmptySlot(TimeSpan killWait)
+    {
+        var retained = _records.Read() is not null;
+        if (Volatile.Read(ref _workerStarted) == 0)
+        {
+            return retained
+                ? Failed(
+                    ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                    "The launch ended with no process of its own, but a record exists and is retained.",
+                    Publication.Identity?.Pid,
+                    forced: false,
+                    recordRetained: true)
+                : Succeeded(null, forced: false, recordRetained: false);
+        }
+
+        if (_worker.Task.Wait(killWait))
+        {
+            switch (_worker.Task.Result)
+            {
+                case WorkerOutcome.NoProcess:
+                    return Succeeded(null, forced: false, recordRetained: _records.Read() is not null);
+                case WorkerOutcome.KilledConfirmed:
+                    return Succeeded(null, forced: true, recordRetained: _records.Read() is not null);
+            }
+        }
+
+        return Failed(
+            ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+            "The launch was ended before its process handle was handed over; the startup worker " +
+            "owns that handle and its exit is unconfirmed.",
+            Publication.Identity?.Pid,
+            forced: false,
+            recordRetained: _records.Read() is not null);
     }
 
     private static bool SafeHasExited(HandleLease lease)
