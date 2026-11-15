@@ -466,6 +466,139 @@ public sealed class AnalyzeVersionTests : IDisposable
 
     // ------------------------------------------------------------ helpers
 
+    // ---------------------------------------------------------------- AV-L4
+
+    /// <summary>
+    /// Catches: ConfigureAwait(false) on an await that precedes COM work or the restore, which
+    /// lets the unit set, the restore and the read-back run off the daemon's owning thread.
+    /// Every call below is examined (11 for set-and-restore with a different present).
+    /// </summary>
+    [Fact]
+    public async Task Every_com_call_including_the_restore_runs_on_the_owning_thread()
+    {
+        using var worker = new SingleThreadWorker();
+        var api = new FakeApi { Present = KnM, Yield = true };
+
+        var result = await worker.RunAsync(() => Service().AnalyzeOnApiAsync(api, Request(Policy.SetAndRestore)));
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(11, api.Threads.Count);
+        Assert.Equal("SetPresentUnits(4,6,2)", api.Log[^2]);
+        Assert.Equal("GetPresentUnits", api.Log[^1]);
+        Assert.All(api.Threads, id => Assert.Equal(worker.ThreadId, id));
+    }
+
+    /// <summary>
+    /// Catches: two detail objects (the earlier error text embedded before the restore detail),
+    /// which the first-delimiter parser cannot read; losing the prior failure's token or fields.
+    /// </summary>
+    [Fact]
+    public async Task A_restore_failure_after_an_earlier_failure_has_one_detail_object()
+    {
+        var cases = 0;
+
+        // Set read-back mismatch, then the restore fails: the prior token and fields survive.
+        var api = new FakeApi { Present = KnM };
+        api.Setter = (n, f, l, t) =>
+        {
+            // call 1 lands on the wrong temperature; the restore (call 2) changes nothing
+            api.Present = n == 1 ? new Units(f, l, t == 1 ? 2 : 1) : api.Present;
+            return 0;
+        };
+        var result = await Service().AnalyzeOnApiAsync(api, Request(Policy.SetAndRestore));
+        AssertFailure(result, "ANALYSIS_UNITS_RESTORE_UNVERIFIED");
+        Assert.Equal(1, Occurrences(result.Error!, " detail="));
+        var detail = Detail(result.Error!);
+        Assert.False(detail.GetProperty("restored").GetBoolean());
+        var prior = detail.GetProperty("prior");
+        Assert.Equal("ANALYSIS_UNITS_SET_FAILED", prior.GetProperty("code").GetString());
+        Assert.True(prior.GetProperty("detail").TryGetProperty("database", out _));
+        Assert.True(prior.GetProperty("detail").TryGetProperty("present", out _));
+        cases++;
+
+        // Cancellation, then the restore fails: the prior message survives, still one detail.
+        var cancelled = new FakeApi { Present = KnM, Extract = () => throw new OperationCanceledException() };
+        cancelled.Setter = (n, f, l, t) =>
+        {
+            cancelled.Present = n == 1 ? new Units(f, l, t) : cancelled.Present;
+            return 0;
+        };
+        var rCancelled = await Service().AnalyzeOnApiAsync(cancelled, Request(Policy.SetAndRestore));
+        AssertFailure(rCancelled, "ANALYSIS_UNITS_RESTORE_UNVERIFIED");
+        Assert.Equal(1, Occurrences(rCancelled.Error!, " detail="));
+        Assert.Contains("stopped on", Detail(rCancelled.Error!).GetProperty("prior").GetProperty("message").GetString());
+        cases++;
+
+        Assert.Equal(2, cases);
+    }
+
+    private static int Occurrences(string text, string needle) =>
+        text.Split(needle, StringSplitOptions.None).Length - 1;
+
+    private sealed class SingleThreadWorker : IDisposable
+    {
+        private readonly System.Collections.Concurrent.BlockingCollection<(SendOrPostCallback, object?)> _queue = [];
+        private readonly Thread _thread;
+
+        public SingleThreadWorker()
+        {
+            _thread = new Thread(Loop) { IsBackground = true };
+            _thread.Start();
+            ThreadId = _thread.ManagedThreadId;
+        }
+
+        public int ThreadId { get; }
+
+        public Task<T> RunAsync<T>(Func<Task<T>> work)
+        {
+            var completion = new TaskCompletionSource<T>();
+            _queue.Add((_ =>
+            {
+                try
+                {
+                    work().ContinueWith(
+                        t =>
+                        {
+                            if (t.IsFaulted)
+                            {
+                                completion.SetException(t.Exception!.InnerExceptions);
+                            }
+                            else
+                            {
+                                completion.SetResult(t.Result);
+                            }
+                        },
+                        TaskScheduler.Default);
+                }
+                catch (Exception exception)
+                {
+                    completion.SetException(exception);
+                }
+            }, null));
+            return completion.Task;
+        }
+
+        public void Dispose()
+        {
+            _queue.CompleteAdding();
+            _thread.Join();
+        }
+
+        private void Loop()
+        {
+            SynchronizationContext.SetSynchronizationContext(new Context(_queue));
+            foreach (var (callback, state) in _queue.GetConsumingEnumerable())
+            {
+                callback(state);
+            }
+        }
+
+        private sealed class Context(System.Collections.Concurrent.BlockingCollection<(SendOrPostCallback, object?)> queue) : SynchronizationContext
+        {
+            public override void Post(SendOrPostCallback d, object? state) => queue.Add((d, state));
+        }
+    }
+
     private enum Policy { CheckOnly, SetAndRestore }
 
     private readonly record struct Units(int Force, int Length, int Temperature)
@@ -535,6 +668,29 @@ public sealed class AnalyzeVersionTests : IDisposable
         private int _sets;
 
         public List<string> Log { get; } = [];
+
+        /// <summary>The managed thread id of every recorded call, in call order.</summary>
+        public List<int> Threads { get; } = [];
+
+        /// <summary>When set, the async members really leave the calling thread (as real I/O does).</summary>
+        public bool Yield { get; set; }
+
+        private void Record(string name)
+        {
+            Log.Add(name);
+            Threads.Add(Environment.CurrentManagedThreadId);
+        }
+
+        private async Task<T> Hop<T>(Func<T> work)
+        {
+            if (Yield)
+            {
+                await Task.Delay(5).ConfigureAwait(false);
+            }
+
+            return work();
+        }
+
         public string? ModelFile { get; set; } = Scratch;
         public Units Database { get; set; } = KipFt;
         public Units Present { get; set; } = KipFt;
@@ -552,13 +708,13 @@ public sealed class AnalyzeVersionTests : IDisposable
 
         public string? GetModelFilename()
         {
-            Log.Add("GetModelFilename");
+            Record("GetModelFilename");
             return ModelFile;
         }
 
         public int GetDatabaseUnits(out int force, out int length, out int temperature)
         {
-            Log.Add("GetDatabaseUnits");
+            Record("GetDatabaseUnits");
             var (code, f, l, t) = DatabaseReader?.Invoke(++_databaseReads)
                 ?? (0, Database.Force, Database.Length, Database.Temperature);
             (force, length, temperature) = (f, l, t);
@@ -567,7 +723,7 @@ public sealed class AnalyzeVersionTests : IDisposable
 
         public int GetPresentUnits(out int force, out int length, out int temperature)
         {
-            Log.Add("GetPresentUnits");
+            Record("GetPresentUnits");
             var (code, f, l, t) = PresentReader?.Invoke(++_presentReads)
                 ?? (0, Present.Force, Present.Length, Present.Temperature);
             (force, length, temperature) = (f, l, t);
@@ -576,7 +732,7 @@ public sealed class AnalyzeVersionTests : IDisposable
 
         public int SetPresentUnits(int force, int length, int temperature)
         {
-            Log.Add($"SetPresentUnits({force},{length},{temperature})");
+            Record($"SetPresentUnits({force},{length},{temperature})");
             if (Setter is not null)
             {
                 return Setter(++_sets, force, length, temperature);
@@ -590,8 +746,8 @@ public sealed class AnalyzeVersionTests : IDisposable
 
         public Task<Result<RunAnalysisData>> RunAnalysisAsync(string filePath, List<string>? cases, UnitInfo units)
         {
-            Log.Add("RunAnalysis");
-            return Task.FromResult(Analysis?.Invoke() ?? Result.Ok(new RunAnalysisData
+            Record("RunAnalysis");
+            return Hop(() => Analysis?.Invoke() ?? Result.Ok(new RunAnalysisData
             {
                 FilePath = filePath,
                 CaseCount = 3,
@@ -601,15 +757,15 @@ public sealed class AnalyzeVersionTests : IDisposable
 
         public (bool IsAnalyzed, bool IsLocked) ReadModelState()
         {
-            Log.Add("ReadModelState");
+            Record("ReadModelState");
             return (true, true);
         }
 
         public Task<Dictionary<string, TableExtractionOutcome>> ExtractTablesAsync(
             TableSelections tables, string outputDir, bool isAnalyzed, bool isLocked)
         {
-            Log.Add("ExtractTables");
-            return Task.FromResult(Extract?.Invoke() ?? new Dictionary<string, TableExtractionOutcome>
+            Record("ExtractTables");
+            return Hop(() => Extract?.Invoke() ?? new Dictionary<string, TableExtractionOutcome>
             {
                 ["baseReactions"] = new TableExtractionOutcome { Success = true, RowCount = 3 }
             });
@@ -617,8 +773,8 @@ public sealed class AnalyzeVersionTests : IDisposable
 
         public Task<ModelMetadata> CollectMetadataAsync(string filePath, UnitSnapshot units)
         {
-            Log.Add("CollectMetadata");
-            return Task.FromResult(new ModelMetadata());
+            Record("CollectMetadata");
+            return Hop(() => new ModelMetadata());
         }
 
         public int OpenFile(string filePath)

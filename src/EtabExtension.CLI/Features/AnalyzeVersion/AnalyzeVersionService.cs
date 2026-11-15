@@ -101,7 +101,9 @@ public sealed class AnalyzeVersionService : IAnalyzeVersionService
         Exception? thrown = null;
         try
         {
-            body = await BodyAsync(api, run).ConfigureAwait(false);
+            // No ConfigureAwait(false) here or in the body: the restore below is COM work and
+            // must resume on the daemon's owning STA worker (AV-L4 item 1).
+            body = await BodyAsync(api, run);
         }
 #pragma warning disable CA1031 // every exit, cancellation included, must reach the restore below
         catch (Exception exception)
@@ -120,13 +122,15 @@ public sealed class AnalyzeVersionService : IAnalyzeVersionService
 
         if (run.Restore is { Verified: false } unverified)
         {
-            var prior = thrown is not null
-                ? $" The operation had stopped on: {thrown.Message}"
-                : body is { Success: false } ? $" The operation had already failed: {body.Error}" : string.Empty;
+            // ONE detail object: the restore result plus the earlier failure (token and fields),
+            // so the first-delimiter parser reads a single JSON value (AV-L4 item 2).
+            object? prior = thrown is not null
+                ? new { message = $"The operation had stopped on: {thrown.Message}" }
+                : body is { Success: false } ? SplitPrior(body.Error) : null;
             return Result.Fail<AnalyzeVersionData>(Fail(
                 AnalyzeVersionCodes.UnitsRestoreUnverified,
-                "The present units could not be verified as restored; the ETABS instance must not be reused." + prior,
-                new { restored = unverified.Unknown ? "unknown" : (object)false }));
+                "The present units could not be verified as restored; the ETABS instance must not be reused.",
+                new { restored = unverified.Unknown ? "unknown" : (object)false, prior }));
         }
 
         if (thrown is not null)
@@ -534,6 +538,35 @@ public sealed class AnalyzeVersionService : IAnalyzeVersionService
         detail is null
             ? $"[{code}] {prose}"
             : $"[{code}] {prose} detail={JsonSerializer.Serialize(detail, DetailJson)}";
+
+    // "[CODE] prose detail={json}" -> { code, message, detail }, detail kept as parsed JSON.
+    private static object SplitPrior(string? error)
+    {
+        var text = error ?? string.Empty;
+        string? code = null;
+        if (text.StartsWith('[') && text.IndexOf(']') is var close and > 0)
+        {
+            code = text[1..close];
+            text = text[(close + 1)..].TrimStart();
+        }
+
+        JsonElement? detail = null;
+        var at = text.IndexOf(" detail=", StringComparison.Ordinal);
+        if (at >= 0)
+        {
+            try
+            {
+                detail = JsonDocument.Parse(text[(at + " detail=".Length)..]).RootElement.Clone();
+                text = text[..at];
+            }
+            catch (JsonException)
+            {
+                // not a detail object after all: keep the whole text as the message
+            }
+        }
+
+        return new { code, message = text, detail };
+    }
 
     private const int TotalSteps = 7;
 
