@@ -26,6 +26,7 @@ public sealed class ServeOperationDispatcherTests : IDisposable
     private static readonly string[] ExpectedCapabilities =
     [
         "analyze-and-extract",
+        "analyze-version",
         "cancel-operation",
         "close-model",
         "extract-materials",
@@ -1426,6 +1427,47 @@ esults"
             TestContext.Current.CancellationToken));
         Assert.False(unsupported.Success);
         Assert.Contains("not supported", unsupported.Error, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// analyze-version card C-9 / AV-R11. Catches: dropping the dispatcher's
+    /// <c>analyze-version</c> key, dropping the operation's DI registration, or touching the old
+    /// kind: 23 dispatcher handlers become 25 handshake capabilities (plus shutdown, detach).
+    /// </summary>
+    [Fact]
+    public void The_handshake_advertises_analyze_version_and_the_old_kind_is_unchanged()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var dispatcher = CreateDispatcher(_manager);
+        IReadOnlyList<string>? advertised = null;
+        _ = new ServeLoop(
+            dispatcher,
+            null!,
+            new ManagedEtabsStartIntentScope(),
+            capabilities =>
+            {
+                advertised = capabilities;
+                return new ServeHandshake("etab-cli-serve", 1, "0.1.0", "0.1.0+gtest", 1, "exe", capabilities);
+            },
+            TextWriter.Null);
+
+        Assert.Equal(23, dispatcher.Capabilities.Count);
+        Assert.NotNull(advertised);
+        Assert.Equal(25, advertised.Count);
+        Assert.Contains("analyze-version", advertised);
+        Assert.Contains("analyze-and-extract", advertised);
+
+        // The DI side: both operation kinds are registered, so the dispatcher's key has a
+        // definition behind it.
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        Features.Serve.ServeExtensions.AddServeFeature(services);
+        var operations = services
+            .Where(item => item.ServiceType == typeof(IOperationDefinition))
+            .Select(item => item.ImplementationType)
+            .ToArray();
+        Assert.Contains(typeof(AnalyzeAndExtractOperation), operations);
+        Assert.Contains(typeof(AnalyzeVersionOperation), operations);
+        Assert.Equal(2, operations.Length);
     }
 
     private static ServeDispatcher CreateDispatcher(

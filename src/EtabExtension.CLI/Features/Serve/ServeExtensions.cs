@@ -1,5 +1,6 @@
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
+using EtabExtension.CLI.Features.AnalyzeVersion;
 using EtabExtension.CLI.Features.SaveModel;
 using EtabExtension.CLI.Features.ReadModelMetadata;
 using EtabExtension.CLI.Features.Serve.Operations;
@@ -59,6 +60,7 @@ public static class ServeExtensions
         services.AddScoped<IOperationClock, SystemOperationClock>();
         services.AddScoped<ICachedSessionStatus, CachedSessionStatus>();
         services.AddScoped<IOperationDefinition, AnalyzeAndExtractOperation>();
+        services.AddAnalyzeVersionOperation();
         services.AddScoped<IOperationManager, OperationManager>();
         services.AddScoped<IServeInspectionService, ServeInspectionService>();
         services.AddScoped<IEtabsInspectionApiFactory, EtabsInspectionApiFactory>();
