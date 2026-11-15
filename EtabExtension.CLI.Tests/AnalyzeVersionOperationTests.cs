@@ -160,6 +160,9 @@ public sealed class AnalyzeVersionOperationTests : IDisposable
         Assert.NotNull(AnalyzeVersionRequestValidator.Validate(
             Valid() with { UnitPolicy = "setAndRestore" }, out _));
 
+        // The same file spelled differently (case) is still the expected document.
+        Assert.NotNull(AnalyzeVersionRequestValidator.Validate(Valid() with { FilePath = "A.EDB" }, out _));
+
         var refused = new[]
         {
             Valid() with { UnitPolicy = "verifyOnly" },
@@ -168,7 +171,9 @@ public sealed class AnalyzeVersionOperationTests : IDisposable
             Valid() with { ExpectedUnits = new AnalyzeVersionExpectedUnits { Force = "kN", Length = "micron" } },
             Valid() with { ExpectedUnits = new AnalyzeVersionExpectedUnits { Force = "kN", Length = "m", Temperature = "K" } },
             Valid() with { ExpectedDocument = new AnalyzeVersionExpectedDocument { Path = "a.edb" } },
-            Valid() with { OutputDir = " " }
+            Valid() with { OutputDir = " " },
+            // AV-L7 SF3: the analysed file must be the expected document.
+            Valid() with { FilePath = "b.edb" }
         };
         foreach (var request in refused)
         {
@@ -176,7 +181,50 @@ public sealed class AnalyzeVersionOperationTests : IDisposable
             Assert.NotNull(error);
         }
 
-        Assert.Equal(7, refused.Length);
+        Assert.Equal(8, refused.Length);
+    }
+
+    /// <summary>
+    /// Catches (AV-L7 SF1): running against an instance the user can see, under either policy;
+    /// touching the service or the seam before refusing. Two policies, zero COM-side calls.
+    /// </summary>
+    [Fact]
+    public async Task A_user_visible_instance_is_refused_before_any_com_call()
+    {
+        var file = CreateScratchFile();
+        var cases = 0;
+        foreach (var policy in new[] { "checkOnly", "setAndRestore" })
+        {
+            var session = new FakeSession { IsUserVisible = true };
+            var factory = new CountingFactory();
+            var service = new RecordingService();
+            var manager = CreateManager(session, service, factory);
+            var payload = JsonSerializer.SerializeToElement(new
+            {
+                filePath = file,
+                outputDir = _directory,
+                expectedDocument = new { path = file, fileId = "id" },
+                expectedUnits = new { force = "kip", length = "ft" },
+                unitPolicy = policy,
+                extractionProfile = "full"
+            });
+
+            var started = manager.Start("analyze-version", payload);
+            var result = Assert.IsType<Result<AnalyzeVersionData>>(await manager.WaitAsync(
+                started.Data!.OperationId, TestContext.Current.CancellationToken));
+
+            Assert.False(result.Success, policy);
+            Assert.StartsWith("Invalid analyze-version request:", result.Error, StringComparison.Ordinal);
+            Assert.Contains("visible", result.Error, StringComparison.Ordinal);
+            Assert.Equal(0, session.GetOrStartCalls);
+            Assert.Equal(0, factory.Created);
+            Assert.Equal(0, service.Calls);
+            cases++;
+            manager.Dispose();
+            _manager = null;
+        }
+
+        Assert.Equal(2, cases);
     }
 
     /// <summary>Catches: cold-starting ETABS (or touching the session) when none is running.</summary>
@@ -327,6 +375,7 @@ public sealed class AnalyzeVersionOperationTests : IDisposable
         public void MarkVisibilityStage(string stage) { }
         public int GetOrStartCalls { get; private set; }
         public bool IsStarted => isStarted;
+        public bool IsUserVisible { get; init; }
         public int? ProcessId => 42;
         public ETABSApplication GetOrStart()
         {

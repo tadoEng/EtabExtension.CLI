@@ -8,6 +8,13 @@ using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Metadata;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
+using EtabExtension.CLI.Features.AnalyzeAndExtract;
+using EtabExtension.CLI.Features.ExtractResults;
+using EtabExtension.CLI.Features.GetStatus;
+using EtabExtension.CLI.Features.RunAnalysis;
+using EtabExtension.CLI.Features.Serve;
+using EtabExtension.CLI.Features.Serve.Operations;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace EtabExtension.CLI.Tests;
@@ -56,7 +63,7 @@ public sealed class AnalyzeVersionTests : IDisposable
         Assert.Equal(
             [
                 "GetModelFilename", "GetDatabaseUnits", "RunAnalysis", "GetPresentUnits",
-                "GetPresentUnits", "ReadModelState", "ExtractTables", "CollectMetadata"
+                "GetPresentUnits", "ReadModelState", "ExtractTables", "CollectMetadata", "GetPresentUnits"
             ],
             logs[0].Log);
         Assert.False(equalSet.Data!.Units.Changed);
@@ -69,7 +76,7 @@ public sealed class AnalyzeVersionTests : IDisposable
             [
                 "GetModelFilename", "GetDatabaseUnits", "RunAnalysis", "GetPresentUnits",
                 "SetPresentUnits(2,2,1)", "GetPresentUnits", "ReadModelState", "ExtractTables",
-                "CollectMetadata", "SetPresentUnits(4,6,2)", "GetPresentUnits"
+                "CollectMetadata", "GetPresentUnits", "SetPresentUnits(4,6,2)", "GetPresentUnits"
             ],
             logs[1].Log);
         Assert.True(differentSet.Data!.Units.Changed);
@@ -82,7 +89,7 @@ public sealed class AnalyzeVersionTests : IDisposable
         Assert.Equal(
             [
                 "GetModelFilename", "GetDatabaseUnits", "RunAnalysis", "GetPresentUnits",
-                "GetPresentUnits", "ReadModelState", "ExtractTables", "CollectMetadata"
+                "GetPresentUnits", "ReadModelState", "ExtractTables", "CollectMetadata", "GetPresentUnits"
             ],
             logs[2].Log);
 
@@ -290,9 +297,9 @@ public sealed class AnalyzeVersionTests : IDisposable
         Assert.False(Detail(rDiffers.Error!).GetProperty("restored").GetBoolean());
         cases.Add("differs");
 
-        // restored:"unknown" - the restore read-back cannot be read (the third present read).
+        // restored:"unknown" - the restore read-back cannot be read (the fourth present read).
         var unknown = new FakeApi { Present = KnM };
-        unknown.PresentReader = n => n == 3 ? (1, 0, 0, 0) : (0, unknown.Present.Force, unknown.Present.Length, unknown.Present.Temperature);
+        unknown.PresentReader = n => n == 4 ? (1, 0, 0, 0) : (0, unknown.Present.Force, unknown.Present.Length, unknown.Present.Temperature);
         var rUnknown = await Service().AnalyzeOnApiAsync(unknown, Request(Policy.SetAndRestore));
         AssertFailure(rUnknown, "ANALYSIS_UNITS_RESTORE_UNVERIFIED");
         Assert.Equal("unknown", Detail(rUnknown.Error!).GetProperty("restored").GetString());
@@ -471,7 +478,7 @@ public sealed class AnalyzeVersionTests : IDisposable
     /// <summary>
     /// Catches: ConfigureAwait(false) on an await that precedes COM work or the restore, which
     /// lets the unit set, the restore and the read-back run off the daemon's owning thread.
-    /// Every call below is examined (11 for set-and-restore with a different present).
+    /// Every call below is examined (12 for set-and-restore with a different present).
     /// </summary>
     [Fact]
     public async Task Every_com_call_including_the_restore_runs_on_the_owning_thread()
@@ -482,7 +489,7 @@ public sealed class AnalyzeVersionTests : IDisposable
         var result = await worker.RunAsync(() => Service().AnalyzeOnApiAsync(api, Request(Policy.SetAndRestore)));
 
         Assert.True(result.Success, result.Error);
-        Assert.Equal(11, api.Threads.Count);
+        Assert.Equal(12, api.Threads.Count);
         Assert.Equal("SetPresentUnits(4,6,2)", api.Log[^2]);
         Assert.Equal("GetPresentUnits", api.Log[^1]);
         Assert.All(api.Threads, id => Assert.Equal(worker.ThreadId, id));
@@ -530,6 +537,378 @@ public sealed class AnalyzeVersionTests : IDisposable
         cases++;
 
         Assert.Equal(2, cases);
+    }
+
+    // ---------------------------------------------------------------- AV-L7
+
+    /// <summary>
+    /// Catches (SF2): trusting the cached pre-extraction read; reporting presentAfter from the
+    /// cached tables read; accepting a unit change (force or length) during extraction; not
+    /// restoring after that failure. Four cases examined.
+    /// </summary>
+    [Fact]
+    public async Task Units_that_change_during_extraction_fail_the_run_and_presentAfter_is_a_fresh_read()
+    {
+        var cases = 0;
+
+        // 1. checkOnly: the present units change inside ExtractTables -> mismatch, nothing set.
+        var check = new FakeApi { Present = KipFt };
+        check.Extract = () =>
+        {
+            check.Present = KnM;
+            return OneTable();
+        };
+        var rCheck = await Service().AnalyzeOnApiAsync(check, Request(Policy.CheckOnly));
+        AssertFailure(rCheck, "ANALYSIS_UNITS_MISMATCH");
+        var detail = Detail(rCheck.Error!);
+        Assert.Equal(2, detail.GetProperty("tables").GetProperty("rawForce").GetInt32());
+        Assert.Equal(4, detail.GetProperty("present").GetProperty("rawForce").GetInt32());
+        Assert.Equal(0, check.Log.Count(call => call.StartsWith("SetPresentUnits", StringComparison.Ordinal)));
+        cases++;
+
+        // 2. setAndRestore: the units change again during extraction -> mismatch AND the
+        // restore still puts the original units back.
+        var set = new FakeApi { Present = KnM };
+        set.Extract = () =>
+        {
+            set.Present = new Units(1, 1, 1);
+            return OneTable();
+        };
+        var rSet = await Service().AnalyzeOnApiAsync(set, Request(Policy.SetAndRestore));
+        AssertFailure(rSet, "ANALYSIS_UNITS_MISMATCH");
+        Assert.Equal(KnM, set.Present);
+        Assert.Equal(1, set.Log.Count(call => call == "SetPresentUnits(4,6,2)"));
+        cases++;
+
+        // 3. only the length changes during extraction (force alone must not be the check).
+        var length = new FakeApi { Present = KipFt };
+        length.Extract = () =>
+        {
+            length.Present = new Units(2, 6, 1);
+            return OneTable();
+        };
+        AssertFailure(await Service().AnalyzeOnApiAsync(length, Request(Policy.CheckOnly)), "ANALYSIS_UNITS_MISMATCH");
+        cases++;
+
+        // 4. nothing set, a harmless temperature-only change during extraction: success, and
+        // presentAfter is that FRESH read (temperature C), not the cached tables read (F).
+        var fresh = new FakeApi { Present = KipFt };
+        fresh.Extract = () =>
+        {
+            fresh.Present = new Units(2, 2, 2);
+            return OneTable();
+        };
+        var rFresh = await Service().AnalyzeOnApiAsync(fresh, Request(Policy.CheckOnly));
+        Assert.True(rFresh.Success, rFresh.Error);
+        Assert.Equal((2, 2, 1), Raw(rFresh.Data!.Units.Tables));
+        Assert.Equal((2, 2, 2), Raw(rFresh.Data.Units.PresentAfter));
+        Assert.Null(rFresh.Data.Units.Restored);
+        cases++;
+
+        Assert.Equal(4, cases);
+    }
+
+    /// <summary>Catches (SF2): an unreadable or out-of-range post-extraction read being accepted. Eight bad answers.</summary>
+    [Fact]
+    public async Task A_bad_read_after_extraction_is_an_unread_answer()
+    {
+        var bad = new (int Force, int Length, int Temperature)[]
+        {
+            (0, 2, 1), (99, 2, 1), (2, 0, 1), (2, 99, 1), (2, 3, 1), (2, 2, 0), (2, 2, 99)
+        };
+        var examined = 0;
+        foreach (var (force, length, temperature) in bad)
+        {
+            var api = new FakeApi { Present = KipFt };
+            api.PresentReader = n => n == 3
+                ? (0, force, length, temperature)
+                : (0, api.Present.Force, api.Present.Length, api.Present.Temperature);
+            AssertFailure(await Service().AnalyzeOnApiAsync(api, Request(Policy.CheckOnly)), "ANALYSIS_UNITS_READ_FAILED");
+            examined++;
+        }
+
+        var unreadable = new FakeApi { Present = KipFt };
+        unreadable.PresentReader = n => n == 3
+            ? (1, 0, 0, 0)
+            : (0, unreadable.Present.Force, unreadable.Present.Length, unreadable.Present.Temperature);
+        AssertFailure(await Service().AnalyzeOnApiAsync(unreadable, Request(Policy.CheckOnly)), "ANALYSIS_UNITS_READ_FAILED");
+        examined++;
+
+        Assert.Equal(8, examined);
+    }
+
+    /// <summary>
+    /// Catches (SF4): the two restore branches nothing covered - a setter that throws after
+    /// landing the right units must be "unknown"; a nonzero code after landing them is false.
+    /// </summary>
+    [Fact]
+    public async Task A_restore_setter_that_lands_the_units_but_complains_is_not_a_verified_restore()
+    {
+        var cases = 0;
+
+        // The restore setter (call 2) applies the units and THROWS: read-back equal -> "unknown".
+        var throws = new FakeApi { Present = KnM };
+        throws.Setter = (n, f, l, t) =>
+        {
+            throws.Present = new Units(f, l, t);
+            return n == 2 ? throw new InvalidOperationException("com fault") : 0;
+        };
+        var rThrows = await Service().AnalyzeOnApiAsync(throws, Request(Policy.SetAndRestore));
+        AssertFailure(rThrows, "ANALYSIS_UNITS_RESTORE_UNVERIFIED");
+        Assert.Equal("unknown", Detail(rThrows.Error!).GetProperty("restored").GetString());
+        Assert.Equal(KnM, throws.Present);
+        cases++;
+
+        // The restore setter applies the units and returns nonzero: read-back equal -> false.
+        var nonzero = new FakeApi { Present = KnM };
+        nonzero.Setter = (n, f, l, t) =>
+        {
+            nonzero.Present = new Units(f, l, t);
+            return n == 2 ? 5 : 0;
+        };
+        var rNonzero = await Service().AnalyzeOnApiAsync(nonzero, Request(Policy.SetAndRestore));
+        AssertFailure(rNonzero, "ANALYSIS_UNITS_RESTORE_UNVERIFIED");
+        Assert.False(Detail(rNonzero.Error!).GetProperty("restored").GetBoolean());
+        Assert.Equal(KnM, nonzero.Present);
+        cases++;
+
+        Assert.Equal(2, cases);
+    }
+
+    /// <summary>
+    /// Catches (SF4, C-13): a zero, unknown or micron value accepted on the SET read-back or
+    /// on the RESTORE read-back. Seven bad answers at each of the two reads.
+    /// </summary>
+    [Fact]
+    public async Task A_bad_enum_value_on_the_set_or_restore_read_back_is_an_unread_answer()
+    {
+        var bad = new (int Force, int Length, int Temperature)[]
+        {
+            (0, 4, 2), (99, 4, 2), (4, 0, 2), (4, 99, 2), (4, 3, 2), (4, 6, 0), (4, 6, 99)
+        };
+        var examined = 0;
+
+        foreach (var (force, length, temperature) in bad)
+        {
+            // The set read-back is the second present read.
+            var set = new FakeApi { Present = KnM };
+            set.PresentReader = n => n == 2
+                ? (0, force, length, temperature)
+                : (0, set.Present.Force, set.Present.Length, set.Present.Temperature);
+            AssertFailure(await Service().AnalyzeOnApiAsync(set, Request(Policy.SetAndRestore)), "ANALYSIS_UNITS_SET_FAILED");
+            Assert.DoesNotContain("ExtractTables", set.Log);
+            Assert.Equal(KnM, set.Present);
+            examined++;
+
+            // The restore read-back is the fourth present read (before, set read-back, after
+            // extraction, restore read-back): an unread answer is "unknown".
+            var restore = new FakeApi { Present = KnM };
+            restore.PresentReader = n => n == 4
+                ? (0, force, length, temperature)
+                : (0, restore.Present.Force, restore.Present.Length, restore.Present.Temperature);
+            var rRestore = await Service().AnalyzeOnApiAsync(restore, Request(Policy.SetAndRestore));
+            AssertFailure(rRestore, "ANALYSIS_UNITS_RESTORE_UNVERIFIED");
+            Assert.Equal("unknown", Detail(rRestore.Error!).GetProperty("restored").GetString());
+            examined++;
+        }
+
+        Assert.Equal(14, examined);
+    }
+
+    /// <summary>
+    /// Catches (SF4): a restore that runs off the daemon's owning thread when extraction
+    /// THROWS or the operation is CANCELLED (the success path is covered above). Both paths
+    /// make ten recorded calls, restore included.
+    /// </summary>
+    [Fact]
+    public async Task The_restore_stays_on_the_owning_thread_when_extraction_throws_or_is_cancelled()
+    {
+        var paths = 0;
+        using var worker = new SingleThreadWorker();
+
+        var thrown = new FakeApi { Present = KnM, Yield = true, Extract = () => throw new InvalidOperationException("boom") };
+        var rThrown = await worker.RunAsync(() => Service().AnalyzeOnApiAsync(thrown, Request(Policy.SetAndRestore)));
+        AssertFailure(rThrown, "ANALYSIS_EXTRACT_FAILED");
+        Assert.Equal(10, thrown.Threads.Count);
+        Assert.Equal("SetPresentUnits(4,6,2)", thrown.Log[^2]);
+        Assert.All(thrown.Threads, id => Assert.Equal(worker.ThreadId, id));
+        Assert.Equal(KnM, thrown.Present);
+        paths++;
+
+        var cancelled = new FakeApi { Present = KnM, Yield = true, Extract = () => throw new OperationCanceledException() };
+        var rCancelled = await worker.RunAsync(async () =>
+        {
+            try
+            {
+                return await Service().AnalyzeOnApiAsync(cancelled, Request(Policy.SetAndRestore));
+            }
+            catch (OperationCanceledException)
+            {
+                return null;
+            }
+        });
+        Assert.Null(rCancelled);
+        Assert.Equal(10, cancelled.Threads.Count);
+        Assert.Equal("SetPresentUnits(4,6,2)", cancelled.Log[^2]);
+        Assert.All(cancelled.Threads, id => Assert.Equal(worker.ThreadId, id));
+        Assert.Equal(KnM, cancelled.Present);
+        paths++;
+
+        Assert.Equal(2, paths);
+    }
+
+    /// <summary>
+    /// Catches (SF4): a cancel through the real OperationManager and the real service that
+    /// skips the restore, or that reports Cancelled although the restore failed (that must be
+    /// Failed with the unverified token). Two cases, each through the manager.
+    /// </summary>
+    [Fact]
+    public async Task A_real_cancel_restores_then_is_cancelled_and_a_failed_restore_is_failed()
+    {
+        var cases = 0;
+
+        // 1. cancel requested during extraction: restore runs and is verified; phase Cancelled.
+        var ok = new FakeApi { Present = KnM };
+        var (manager1, id1) = StartOverRealService(ok);
+        using (manager1)
+        {
+            var result = await manager1.WaitAsync(id1, TestContext.Current.CancellationToken);
+            Assert.False(((Result)result).Success);
+            Assert.Equal(OperationPhase.Cancelled, manager1.GetStatus(id1).Data!.Phase);
+            Assert.Equal(KnM, ok.Present);
+            Assert.Equal(1, ok.Log.Count(call => call == "SetPresentUnits(4,6,2)"));
+            cases++;
+        }
+
+        // 2. cancel requested, then the restore cannot be verified: Failed, token and detail.
+        var broken = new FakeApi { Present = KnM };
+        broken.Setter = (n, f, l, t) =>
+        {
+            broken.Present = n == 1 ? new Units(f, l, t) : broken.Present; // the restore changes nothing
+            return 0;
+        };
+        var (manager2, id2) = StartOverRealService(broken);
+        using (manager2)
+        {
+            var result = Assert.IsType<Result<AnalyzeVersionData>>(
+                await manager2.WaitAsync(id2, TestContext.Current.CancellationToken));
+            AssertFailure(result, "ANALYSIS_UNITS_RESTORE_UNVERIFIED");
+            Assert.False(Detail(result.Error!).GetProperty("restored").GetBoolean());
+            Assert.Equal(OperationPhase.Failed, manager2.GetStatus(id2).Data!.Phase);
+            cases++;
+        }
+
+        Assert.Equal(2, cases);
+    }
+
+    /// <summary>
+    /// Catches (SF4): an operation that cannot be built from the real container (a scoped
+    /// dependency captured by a singleton, a missing registration). One resolution under
+    /// scope validation, two operations of the right kinds.
+    /// </summary>
+    [Fact]
+    public void The_real_container_resolves_the_operation_definitions_with_scope_validation()
+    {
+        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder([]);
+        builder.Services
+            .AddEtabsInfrastructure()
+            .AddGetStatusFeature()
+            .AddRunAnalysisFeature()
+            .AddExtractResultsFeature()
+            .AddAnalyzeAndExtractFeature()
+            .AddServeFeature();
+        using var provider = builder.Services.BuildServiceProvider(
+            new ServiceProviderOptions { ValidateScopes = true });
+        using var scope = provider.CreateScope();
+
+        var definitions = scope.ServiceProvider
+            .GetRequiredService<IEnumerable<IOperationDefinition>>().ToList();
+
+        Assert.Equal(1, definitions.Count(item => item.Kind == "analyze-version"));
+        Assert.Equal(1, definitions.Count(item => item.Kind == "analyze-and-extract"));
+        Assert.Equal(2, definitions.Count);
+    }
+
+    private static Dictionary<string, TableExtractionOutcome> OneTable() => new()
+    {
+        ["baseReactions"] = new TableExtractionOutcome { Success = true, RowCount = 3 }
+    };
+
+    // The real service over the fake seam, driven through a real OperationManager. The seam's
+    // extraction asks the manager to cancel the very operation that is running it, which the
+    // manager honours at the end of that step, exactly as a host's cancel-operation would.
+    private (OperationManager Manager, string Id) StartOverRealService(FakeApi api)
+    {
+        Directory.CreateDirectory(_directory);
+        var file = Path.Combine(_directory, "model.edb");
+        File.WriteAllText(file, "x");
+        api.ModelFile = file;
+
+        string? operationId = null;
+        var known = new ManualResetEventSlim();
+        OperationManager? manager = null;
+        api.Extract = () =>
+        {
+            Assert.True(known.Wait(TimeSpan.FromSeconds(10)));
+            manager!.Cancel(operationId!);
+            return OneTable();
+        };
+
+        var session = new OperationSession();
+        var definition = new AnalyzeVersionOperation(
+            session, Service(), new FixedFactory(api), new OperationStatus(), new CachedSessionStatus());
+        manager = new OperationManager(
+            new StaExecutionWorker(),
+            new OperationEventJournalFactory(_directory),
+            new SystemOperationClock(),
+            WorkEnvelopeFixtures.Consented(session),
+            [definition]);
+
+        var payload = JsonSerializer.SerializeToElement(new
+        {
+            filePath = file,
+            outputDir = _directory,
+            expectedDocument = new { path = file, fileId = FileId },
+            expectedUnits = new { force = "kip", length = "ft", temperature = "F" },
+            unitPolicy = "setAndRestore",
+            extractionProfile = "full"
+        });
+        var started = manager.Start("analyze-version", payload);
+        operationId = started.Data!.OperationId;
+        known.Set();
+        return (manager, operationId);
+    }
+
+    private sealed class FixedFactory(IAnalyzeVersionApi api) : IAnalyzeVersionApiFactory
+    {
+        public IAnalyzeVersionApi Create(EtabSharp.Core.ETABSApplication application) => api;
+    }
+
+    private sealed class OperationStatus : IGetStatusService
+    {
+        public Task<Result<EtabExtension.CLI.Features.GetStatus.Models.GetStatusData>> GetStatusAsync() =>
+            throw new NotSupportedException();
+
+        public Result<EtabExtension.CLI.Features.GetStatus.Models.GetStatusData> GetStatusOnApp(
+            EtabSharp.Core.ETABSApplication app, int? pid = null) =>
+            Result.Ok(new EtabExtension.CLI.Features.GetStatus.Models.GetStatusData { IsRunning = true, Pid = pid });
+    }
+
+    private sealed class OperationSession : EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.IEtabsSession
+    {
+        public Result CertifyNoUnconsentedExposure() => Result.Ok();
+        public void MarkVisibilityStage(string stage) { }
+        public bool IsStarted => true;
+        public int? ProcessId => 42;
+        public EtabSharp.Core.ETABSApplication GetOrStart() => null!;
+        public EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.IManagedEtabsApplication GetOrStartOwned() =>
+            throw new NotSupportedException();
+        public Result RevealForExplicitUserRequest() => Result.Ok();
+        public EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsShutdownResult Shutdown() =>
+            throw new NotSupportedException();
+        public EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsShutdownResult ShutdownWhileWorkerBlocked() =>
+            throw new NotSupportedException();
+        public void Dispose() { }
     }
 
     private static int Occurrences(string text, string needle) =>

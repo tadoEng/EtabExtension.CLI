@@ -43,6 +43,15 @@ public sealed class AnalyzeVersionOperation(
             return Result.Fail<AnalyzeVersionData>(invalid!);
         }
 
+        // A visible instance belongs to the user (card A1): refused here, before any COM call
+        // and whatever the policy, so the daemon enforces it rather than trusting the host.
+        if (session.IsUserVisible)
+        {
+            return Result.Fail<AnalyzeVersionData>(
+                "Invalid analyze-version request: the ETABS instance is visible to the user; " +
+                "analyze-version only runs against a hidden, daemon-owned instance.");
+        }
+
         if (!File.Exists(valid.FilePath))
         {
             return Result.Fail<AnalyzeVersionData>($"File not found: {valid.FilePath}");

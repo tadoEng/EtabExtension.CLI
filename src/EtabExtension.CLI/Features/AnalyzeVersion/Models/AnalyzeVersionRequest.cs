@@ -107,6 +107,26 @@ public static class AnalyzeVersionRequestValidator
             return null;
         }
 
+        // The label must describe the file that is analysed: an unverified path is refused.
+        string fullFilePath;
+        string fullExpectedPath;
+        try
+        {
+            fullFilePath = System.IO.Path.GetFullPath(request.FilePath);
+            fullExpectedPath = System.IO.Path.GetFullPath(request.ExpectedDocument.Path);
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or System.IO.PathTooLongException)
+        {
+            error = Invalid($"filePath or expectedDocument.path is not a usable path ({exception.Message})");
+            return null;
+        }
+
+        if (!string.Equals(fullFilePath, fullExpectedPath, StringComparison.OrdinalIgnoreCase))
+        {
+            error = Invalid("filePath must be the expectedDocument.path (the analysed file is the expected document)");
+            return null;
+        }
+
         bool setAndRestore;
         switch (request.UnitPolicy)
         {

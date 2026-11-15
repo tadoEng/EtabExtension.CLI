@@ -286,6 +286,25 @@ public sealed class AnalyzeVersionService : IAnalyzeVersionService
             metadataPath = null;
         }
 
+        // 7b. The units the tables were produced in are checked once more, AFTER the reads: a
+        // change during extraction would otherwise leave tables in the wrong units unnoticed.
+        var afterRead = CheckedUnits.Read(api.GetPresentUnits, "cSapModel.GetPresentUnits_2 (after extraction)");
+        if (!afterRead.Success || afterRead.Data is null)
+        {
+            return Result.Fail<AnalyzeVersionData>(Fail(
+                AnalyzeVersionCodes.UnitsReadFailed,
+                afterRead.Error ?? "The present units could not be read after extraction."));
+        }
+
+        var presentAfterExtraction = afterRead.Data;
+        if (!presentAfterExtraction.SameForceAndLength(tablesUnits))
+        {
+            return Result.Fail<AnalyzeVersionData>(Fail(
+                AnalyzeVersionCodes.UnitsMismatch,
+                "ETABS's present units changed while the tables were being extracted; the tables cannot be trusted.",
+                new { tables = tablesUnits, present = presentAfterExtraction }));
+        }
+
         run.TotalStopwatch.Stop();
         var metrics = run.Metrics.Build(run.TotalStopwatch.ElapsedMilliseconds);
         var metricsPath = string.IsNullOrWhiteSpace(valid.Request.MetricsOutputPath)
@@ -321,7 +340,7 @@ public sealed class AnalyzeVersionService : IAnalyzeVersionService
                 Expected = valid.ExpectedUnits,
                 PresentBefore = run.PresentBefore!,
                 Tables = tablesUnits,
-                PresentAfter = tablesUnits,
+                PresentAfter = presentAfterExtraction,
                 Changed = run.Armed,
                 Restored = null,
                 Policy = valid.SetAndRestore
