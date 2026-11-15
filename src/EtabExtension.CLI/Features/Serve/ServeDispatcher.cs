@@ -1,6 +1,7 @@
 using System.Text.Json;
 using EtabExtension.CLI.Features.AnalyzeAndExtract;
 using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
+using EtabExtension.CLI.Features.AnalyzeVersion.Models;
 using EtabExtension.CLI.Features.CloseModel;
 using EtabExtension.CLI.Features.ExtractMaterials;
 using EtabExtension.CLI.Features.ExtractMaterials.Models;
@@ -135,6 +136,7 @@ public sealed class ServeDispatcher : IServeDispatcher
             Func<JsonElement?, CancellationToken, Task<object>>>(StringComparer.Ordinal)
         {
             ["analyze-and-extract"] = DispatchAnalyzeAndExtractAsync,
+            ["analyze-version"] = DispatchAnalyzeVersionAsync,
             ["cancel-operation"] = DispatchCancelOperationAsync,
             ["close-model"] = DispatchCloseModelAsync,
             ["extract-materials"] = DispatchExtractMaterialsAsync,
@@ -490,6 +492,38 @@ public sealed class ServeDispatcher : IServeDispatcher
         var snapReq = Deserialize<SnapshotExportRequest>(request);
         return await ExecuteComAsync(async () => await _snapshot.SnapshotExportOnAppAsync(
             _session.GetOrStart(), loc.FilePath, loc.OutputDir, snapReq));
+    }
+
+    /// <summary>
+    /// <c>analyze-version</c> (analyze-version card M3): the same accept-and-defer shape as
+    /// <see cref="DispatchAnalyzeAndExtractAsync"/>, for the new operation kind. The old
+    /// command is untouched.
+    /// </summary>
+    private Task<object> DispatchAnalyzeVersionAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        var payload = RequirePayload(request);
+        if (_watchdog.IsBlocked)
+        {
+            return Task.FromResult<object>(_watchdog.BlockedFailure());
+        }
+
+        var started = _operations.Start("analyze-version", payload);
+        if (!started.Success || started.Data is null)
+        {
+            return Task.FromResult<object>(Result.Fail<AnalyzeVersionData>(
+                started.Error ?? "Could not start analyze-version operation"));
+        }
+
+        var operationId = started.Data.OperationId;
+        var servedRequest = ServeRequestContext.Current;
+        return Task.FromResult<object>(new DeferredServeResponse(NoteAbandonedAfter(
+            _watchdog.GuardAsync(
+                () => _session.ProcessId,
+                () => _operations.WaitAsync(operationId, ct),
+                ct),
+            servedRequest)));
     }
 
     private async Task<object> DispatchCloseModelAsync(
