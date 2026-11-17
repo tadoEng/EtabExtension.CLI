@@ -223,7 +223,11 @@ internal static class WindowsFileIdentity
         SafeFileHandle file,
         out ByHandleFileInformation fileInformation);
 
-    [StructLayout(LayoutKind.Sequential)]
+    // Pack = 4: BY_HANDLE_FILE_INFORMATION is 52 bytes with its FILETIMEs on 4-byte
+    // boundaries (offsets 4/12/20, volume 28, index 44/48). Declaring the FILETIMEs as
+    // `long` without it 8-aligns them and shifts every later field, so the volume read
+    // FileSizeHigh and the index read the wrong words (F-LIVE-1).
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
     private struct ByHandleFileInformation
     {
         public uint FileAttributes;
